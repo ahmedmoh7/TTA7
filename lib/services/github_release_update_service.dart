@@ -1,7 +1,6 @@
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart' show kDebugMode, kReleaseMode;
-import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 
@@ -28,24 +27,13 @@ class GithubReleaseUpdateService {
   static final GithubReleaseUpdateService instance =
       GithubReleaseUpdateService._();
 
-  static const String _defaultRepo = 'ahmedmoh7/TTA7-Releases';
-
-  static String get _repo {
-    final fromEnv = dotenv.env['GITHUB_RELEASE_REPO']?.trim() ?? '';
-    return fromEnv.isNotEmpty ? fromEnv : _defaultRepo;
-  }
-
-  static String get _latestReleaseApi {
-    final fromEnv = dotenv.env['GITHUB_RELEASE_API_URL']?.trim() ?? '';
-    if (fromEnv.isNotEmpty) return fromEnv;
-    return 'https://api.github.com/repos/$_repo/releases/latest';
-  }
-
-  static String get _fallbackReleaseUrl {
-    final fromEnv = dotenv.env['GITHUB_RELEASE_PAGE_URL']?.trim() ?? '';
-    if (fromEnv.isNotEmpty) return fromEnv;
-    return 'https://github.com/$_repo/releases/latest';
-  }
+  // TTA7's public release repository. Keep this fixed so inherited
+  // environment values can never redirect users to the original Inzx repo.
+  static const String _repo = 'ahmedmoh7/TTA7-Releases';
+  static const String _latestReleaseApi =
+      'https://api.github.com/repos/ahmedmoh7/TTA7-Releases/releases/latest';
+  static const String _fallbackReleaseUrl =
+      'https://github.com/ahmedmoh7/TTA7-Releases/releases/latest';
 
   Future<GithubReleaseInfo?> checkForNewRelease({bool ignoreReleaseMode = true}) async {
     if (!kReleaseMode && !ignoreReleaseMode) return null;
