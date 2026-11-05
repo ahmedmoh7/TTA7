@@ -62,6 +62,11 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
+      - name: Generate TTA7 app icons and splash screen
+        run: |
+          dart run flutter_launcher_icons
+          dart run flutter_native_splash:create
+
       - name: Build TTA7 APK
         env:
           LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
