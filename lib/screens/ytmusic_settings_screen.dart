@@ -1139,23 +1139,6 @@ class _YTMusicSettingsScreenState extends ConsumerState<YTMusicSettingsScreen> {
       ),
       _SearchableItem(
         tags: [
-          'sponsor',
-          'support',
-          'donate',
-          'upi',
-          'github sponsors',
-          'contribute',
-          'donation',
-          'tip',
-          'support developer',
-        ],
-        title: 'Sponsor Inzx',
-        subtitle: 'Support the development via GitHub Sponsors or UPI',
-        icon: Iconsax.heart5,
-        onTap: _showSupportSheet,
-      ),
-      _SearchableItem(
-        tags: [
           'cleanup cache',
           'clear cache',
           'clean cache',
@@ -3510,184 +3493,6 @@ class _YTMusicSettingsScreenState extends ConsumerState<YTMusicSettingsScreen> {
 
   // ── OTA Debug ──────────────────────────────────────────────────────
 
-  /// Bottom sheet offering ways to support the project: GitHub Sponsors
-  /// and a UPI QR code for direct donations.
-  Future<void> _showSupportSheet() async {
-    final sheetBg = _isDark ? Colors.black : Colors.white;
-
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: sheetBg,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      builder: (sheetContext) {
-        return SafeArea(
-          top: false,
-          child: SingleChildScrollView(
-            physics: const BouncingScrollPhysics(),
-            padding: const EdgeInsets.fromLTRB(20, 10, 20, 24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Center(
-                  child: Container(
-                    width: 36,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: _isDark ? Colors.white24 : Colors.black12,
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 14),
-                Row(
-                  children: [
-                    Container(
-                      width: 38,
-                      height: 38,
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFF48FB1).withValues(alpha: 0.16),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: const Icon(
-                        Iconsax.heart5,
-                        color: Color(0xFFF06292),
-                        size: 20,
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Text(
-                      'Support Inzx',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                        color: _textPrimary,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  'Inzx is free and open source. Your support helps keep it '
-                  'alive and actively maintained. Every bit is appreciated!',
-                  style: TextStyle(
-                    fontSize: 13,
-                    height: 1.4,
-                    color: _textSecondary,
-                  ),
-                ),
-                const SizedBox(height: 18),
-
-                // GitHub Sponsors
-                Material(
-                  color: _isDark
-                      ? Colors.white.withValues(alpha: 0.05)
-                      : Colors.black.withValues(alpha: 0.03),
-                  borderRadius: BorderRadius.circular(14),
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(14),
-                    onTap: () {
-                      launchUrl(
-                        Uri.parse('https://github.com/sponsors/nirmaleeswar30'),
-                        mode: LaunchMode.externalApplication,
-                      );
-                    },
-                    child: Padding(
-                      padding: const EdgeInsets.all(14),
-                      child: Row(
-                        children: [
-                          Container(
-                            width: 40,
-                            height: 40,
-                            decoration: BoxDecoration(
-                              color: _accentColor.withValues(alpha: 0.12),
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                            child: Icon(Iconsax.card, color: _accentColor, size: 20),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  'GitHub Sponsors',
-                                  style: TextStyle(
-                                    fontSize: 14.5,
-                                    fontWeight: FontWeight.w600,
-                                    color: _textPrimary,
-                                  ),
-                                ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  'One-time or monthly on GitHub',
-                                  style: TextStyle(
-                                    fontSize: 12,
-                                    color: _textSecondary,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          Icon(Iconsax.export_3, size: 18, color: _textTertiary),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 20),
-
-                // UPI QR
-                Center(
-                  child: Text(
-                    'Or pay via UPI',
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                      color: _textSecondary,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Center(
-                  child: Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(16),
-                      border: Border.all(
-                        color: _accentColor.withValues(alpha: 0.2),
-                      ),
-                    ),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(8),
-                      child: Image.asset(
-                        'assets/upi.jpeg',
-                        width: 220,
-                        height: 220,
-                        fit: BoxFit.contain,
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 10),
-                Center(
-                  child: Text(
-                    'Scan with any UPI app to donate',
-                    style: TextStyle(fontSize: 12, color: _textTertiary),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
-  }
-
   Widget _buildOtaDebugSection() {
     final l10n = context.l10n;
     final updater = ShorebirdUpdater();
@@ -3840,42 +3645,6 @@ class _YTMusicSettingsScreenState extends ConsumerState<YTMusicSettingsScreen> {
           },
         ),
         Divider(color: _isDark ? Colors.white10 : Colors.black12, height: 16),
-        // Sponsor Inzx
-        ListTile(
-          contentPadding: EdgeInsets.zero,
-          leading: Container(
-            width: 38,
-            height: 38,
-            decoration: BoxDecoration(
-              color: const Color(0xFFF48FB1).withValues(alpha: 0.16),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: const Icon(
-              Iconsax.heart5,
-              color: Color(0xFFF06292), // Pastel pink
-              size: 18,
-            ),
-          ),
-          title: Text(
-            'Sponsor Inzx',
-            style: TextStyle(
-              fontSize: 14.5,
-              fontWeight: FontWeight.w600,
-              color: _textPrimary,
-            ),
-          ),
-          subtitle: Text(
-            'Support the development via GitHub Sponsors or UPI',
-            style: TextStyle(fontSize: 12, color: _textSecondary),
-          ),
-          trailing: Icon(
-            Icons.arrow_forward_ios_rounded,
-            size: 14,
-            color: _textSecondary,
-          ),
-          onTap: _showSupportSheet,
-        ),
-        Divider(color: _isDark ? Colors.white10 : Colors.black12, height: 24),
         _debugRow(l10n.releaseBuild, kReleaseMode ? l10n.yes : l10n.no),
         _debugRow(
           l10n.updater,
@@ -4109,7 +3878,7 @@ class _YTMusicSettingsScreenState extends ConsumerState<YTMusicSettingsScreen> {
                           child: OutlinedButton.icon(
                             onPressed: () {
                               launchUrl(
-                                Uri.parse('https://github.com/nirmaleeswar30/Inzx'),
+                                Uri.parse('https://github.com/ahmedmoh7'),
                                 mode: LaunchMode.externalApplication,
                               );
                             },
