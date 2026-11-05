@@ -28,7 +28,7 @@ class GithubReleaseUpdateService {
   static final GithubReleaseUpdateService instance =
       GithubReleaseUpdateService._();
 
-  static const String _defaultRepo = 'nirmaleeswar30/Inzx';
+  static const String _defaultRepo = 'ahmedmoh7/TTA7-Releases';
 
   static String get _repo {
     final fromEnv = dotenv.env['GITHUB_RELEASE_REPO']?.trim() ?? '';
@@ -62,7 +62,7 @@ class GithubReleaseUpdateService {
             headers: const {
               'Accept': 'application/vnd.github+json',
               'X-GitHub-Api-Version': '2022-11-28',
-              'User-Agent': 'Inzx-App-Update-Checker',
+              'User-Agent': 'TTA7-App-Update-Checker',
             },
           )
           .timeout(const Duration(seconds: 8));
@@ -84,7 +84,7 @@ class GithubReleaseUpdateService {
       final body = (decoded['body'] as String?)?.trim();
       final htmlUrl = (decoded['html_url'] as String?)?.trim();
       final latestVersion = _normalizeVersion(tag);
-      final apkDownloadUrl = _pickInzxApkDownloadUrl(decoded['assets']);
+      final apkDownloadUrl = _pickTTA7ApkDownloadUrl(decoded['assets']);
 
       if (latestVersion.isEmpty) return null;
 
@@ -116,7 +116,7 @@ class GithubReleaseUpdateService {
             headers: const {
               'Accept': 'application/vnd.github+json',
               'X-GitHub-Api-Version': '2022-11-28',
-              'User-Agent': 'Inzx-App-Update-Checker',
+              'User-Agent': 'TTA7-App-Update-Checker',
             },
           )
           .timeout(const Duration(seconds: 8));
@@ -131,7 +131,7 @@ class GithubReleaseUpdateService {
       final body = (decoded['body'] as String?)?.trim();
       final htmlUrl = (decoded['html_url'] as String?)?.trim();
       final latestVersion = _normalizeVersion(tag);
-      final apkDownloadUrl = _pickInzxApkDownloadUrl(decoded['assets']);
+      final apkDownloadUrl = _pickTTA7ApkDownloadUrl(decoded['assets']);
 
       return GithubReleaseInfo(
         latestVersion: latestVersion.isNotEmpty ? latestVersion : '1.0.0',
@@ -183,14 +183,14 @@ class GithubReleaseUpdateService {
     return 0;
   }
 
-  String? _pickInzxApkDownloadUrl(dynamic assetsRaw) {
+  String? _pickTTA7ApkDownloadUrl(dynamic assetsRaw) {
     if (assetsRaw is! List) return null;
 
     for (final item in assetsRaw) {
       if (item is! Map<String, dynamic>) continue;
       final name = (item['name'] as String?)?.trim() ?? '';
       final url = (item['browser_download_url'] as String?)?.trim() ?? '';
-      if (name.toLowerCase() == 'inzx.apk' && url.isNotEmpty) {
+      if (name.toLowerCase() == 'tta7.apk' && url.isNotEmpty) {
         return url;
       }
     }
