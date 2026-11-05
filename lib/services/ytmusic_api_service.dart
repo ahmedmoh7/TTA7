@@ -1,0 +1,8905 @@
+import 'dart:convert';
+import 'dart:math';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart' show compute, debugPrint, kDebugMode;
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+import '../core/providers/locale_provider.dart';
+import '../models/models.dart';
+import 'playback/yt_playback_client.dart' show InnerTubeApi;
+
+/// YouTube Music API Service (InnerTube API)
+/// Note: Handles both authenticated and unauthenticated requests.
+/// Some endpoints require authentication to work properly.
+
+/// Sorting options for library artists
+enum LibraryArtistSort {
+  recentlyAdded,
+  aToZ,
+  zToA,
+  mostSongs, // Local sort only, API doesn't support this
+}
+
+extension LibraryArtistSortExtension on LibraryArtistSort {
+  String? get params {
+    switch (this) {
+      case LibraryArtistSort.recentlyAdded:
+        return 'ggMGKgQIABAB';
+      case LibraryArtistSort.aToZ:
+        return 'ggMGKgQIARAA';
+      case LibraryArtistSort.zToA:
+        return 'ggMGKgQIARAB';
+      case LibraryArtistSort.mostSongs:
+        return null; // Handled locally
+    }
+  }
+}
+
+class InnerTubeService {
+  static const String _baseUrl = 'https://music.youtube.com/youtubei/v1';
+  static const String _apiKey = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30';
+
+  // Fixed fallback context used by a few low-level playback fallbacks.
+  static const Map<String, dynamic> _clientContext = {
+    'client': {
+      'clientName': 'WEB_REMIX',
+      'clientVersion': '1.20260114.03.00',
+      'hl': 'en',
+      'gl': 'US',
+      'experimentIds': [],
+      'experimentsToken': '',
+      'browserName': 'Chrome',
+      'browserVersion': '120.0.0.0',
+      'osName': 'Windows',
+      'osVersion': '10.0',
+      'platform': 'DESKTOP',
+      'utcOffsetMinutes': 0,
+    },
+    'user': {'lockedSafetyMode': false},
+  };
+
+  String? _sapisid;
+  Map<String, String> _cookies = {};
+
+  /// Whether the user is authenticated
+  bool get isAuthenticated => _sapisid != null && _sapisid!.isNotEmpty;
+
+  /// Set authentication cookies from WebView login
+  void setAuthCookies(Map<String, String> cookies) {
+    _cookies = cookies;
+    _sapisid = cookies['SAPISID'] ?? cookies['__Secure-3PAPISID'];
+    _resetSessionScope();
+    debugPrint('[YTM-Tracking] InnerTubeService.setAuthCookies: count=${cookies.length}, hasSAPISID=${_sapisid != null && _sapisid!.isNotEmpty}, isAuthenticated=$isAuthenticated');
+  }
+
+  /// Clear authentication
+  void clearAuth() {
+    _cookies.clear();
+    _sapisid = null;
+    _resetSessionScope();
+  }
+
+  void _resetSessionScope() {
+    _sessionVisitorData = null;
+    _sessionDataSyncId = null;
+    _sessionPageId = null;
+    _sessionAuthUser = '0';
+    _sessionScopeFetchedAt = null;
+  }
+
+  // ============ SESSION SCOPE (history attribution) ============
+
+  /// Values read from the signed-in music.youtube.com shell (`ytcfg`). The
+  /// stats pings that write listening history are attributed against these,
+  /// so a play reported under a random visitor id or the wrong account/brand
+  /// channel never shows up in the user's YT Music history.
+  String? _sessionVisitorData;
+  String? _sessionDataSyncId;
+  String? _sessionPageId;
+  String _sessionAuthUser = '0';
+  String? _sessionClientVersion;
+  int? _sessionSignatureTimestamp;
+  DateTime? _sessionScopeFetchedAt;
+  Future<void>? _sessionScopeInFlight;
+
+  /// Account the session is scoped to (brand channel when one is selected).
+  String? get sessionDataSyncId => _sessionDataSyncId;
+
+  /// Current signature timestamp for the session.
+  int? get sessionSignatureTimestamp => _sessionSignatureTimestamp;
+
+  static const String _webUserAgent =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
+
+  /// Client version reported to stats endpoints. Must match the version the
+  /// player request was made with or YouTube discards the ping.
+  String get _webRemixVersion =>
+      _sessionClientVersion ??
+      (_clientContext['client'] as Map<String, dynamic>)['clientVersion']
+          as String;
+
+  /// Reads the signed-in shell once per login (refreshed every 6h so the
+  /// signature timestamp follows YouTube's player rollouts).
+  Future<void> ensureSessionScope({bool refresh = false}) {
+    if (!isAuthenticated) return Future.value();
+    final fresh = _sessionScopeFetchedAt != null &&
+        DateTime.now().difference(_sessionScopeFetchedAt!) <
+            const Duration(hours: 6);
+    if (!refresh && fresh) return Future.value();
+    return _sessionScopeInFlight ??= _fetchSessionScope().whenComplete(() {
+      _sessionScopeInFlight = null;
+    });
+  }
+
+  Future<void> _fetchSessionScope() async {
+    try {
+      final headers = <String, String>{
+        'User-Agent': _webUserAgent,
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cookie': _cookies.entries.map((e) => '${e.key}=${e.value}').join('; '),
+      };
+      final hash = _generateSapisidHash();
+      if (hash != null) headers['Authorization'] = hash;
+
+      final response = await http
+          .get(Uri.parse('https://music.youtube.com/'), headers: headers)
+          .timeout(const Duration(seconds: 12));
+      if (response.statusCode != 200) return;
+      final html = response.body;
+
+      String? read(String key) =>
+          RegExp('"$key"\\s*:\\s*"([^"]+)"').firstMatch(html)?.group(1);
+
+      _sessionClientVersion =
+          read('INNERTUBE_CLIENT_VERSION') ?? _sessionClientVersion;
+      // Re-read the timestamp on every scope fetch: a refresh happens after a
+      // stale timestamp was refused, so keeping the old one would stick.
+      _sessionSignatureTimestamp = null;
+      // Try reading STS directly from the page HTML (older YTM builds).
+      final sts = RegExp(r'"STS"\s*:\s*(\d+)').firstMatch(html)?.group(1);
+      if (sts != null) {
+        _sessionSignatureTimestamp = int.tryParse(sts);
+      }
+
+      // BitChord / MetroList approach: YouTube no longer embeds STS in the
+      // page HTML on current builds. The page *does* reference the player
+      // script via `jsUrl`, so fetch that script and extract
+      // `signatureTimestamp: <number>` from it.
+      if (_sessionSignatureTimestamp == null) {
+        final jsUrlMatch =
+            RegExp(r'jsUrl":"([^"]+)"').firstMatch(html)?.group(1) ??
+            RegExp(r'"PLAYER_JS_URL":"([^"]+)"').firstMatch(html)?.group(1);
+        if (jsUrlMatch != null) {
+          final cleanJsUrl = jsUrlMatch.replaceAll(r'\/', '/');
+          final jsUrl = cleanJsUrl.startsWith('/')
+              ? 'https://music.youtube.com$cleanJsUrl'
+              : cleanJsUrl;
+          await _extractStsFromPlayerJs(jsUrl, headers);
+        }
+      }
+
+      // If page player JS didn't yield STS, resolve from InnerTubeApi
+      _sessionSignatureTimestamp ??=
+          await InnerTubeApi().getSignatureTimestamp('dQw4w9WgXcQ');
+
+      final loggedIn = RegExp(
+            r'"LOGGED_IN"\s*:\s*(true|false)',
+          ).firstMatch(html)?.group(1) ==
+          'true';
+      if (loggedIn) {
+        // DATASYNC_ID looks like `account||delegated`; the delegated half
+        // (brand channel) wins when present.
+        _sessionPageId = read('DELEGATED_SESSION_ID');
+        final rawDataSync = read('DATASYNC_ID');
+        String? dataSync;
+        if (rawDataSync != null) {
+          final parts = rawDataSync.split('||');
+          dataSync = parts.length > 1 && parts[1].isNotEmpty
+              ? parts[1]
+              : parts.first;
+        }
+        _sessionDataSyncId = _sessionPageId ?? dataSync;
+        _sessionAuthUser =
+            RegExp(r'"SESSION_INDEX"\s*:\s*"?(\d+)').firstMatch(html)?.group(1) ??
+            '0';
+        final visitor = read('VISITOR_DATA');
+        if (visitor != null && visitor.isNotEmpty) {
+          _sessionVisitorData = visitor;
+        }
+      }
+      _sessionScopeFetchedAt = DateTime.now();
+      debugPrint(
+        '[YTM-Tracking] Session scope: loggedIn=$loggedIn, '
+        'cver=$_sessionClientVersion, sts=$_sessionSignatureTimestamp, '
+        'authUser=$_sessionAuthUser, pageId=${_sessionPageId != null}, '
+        'dataSyncId=${_sessionDataSyncId != null}, '
+        'visitor=${_sessionVisitorData != null}',
+      );
+    } catch (e) {
+      debugPrint('[YTM-Tracking] Could not read session scope: $e');
+    }
+  }
+
+  /// Fetch the YouTube player JS and extract `signatureTimestamp` from it.
+  ///
+  /// This is the BitChord/MetroList approach: the page no longer carries
+  /// `"STS"` in the inline config, but the `jsUrl` (player script) still
+  /// contains `signatureTimestamp: <number>`. Fetching ~1 MB of JS is
+  /// heavier than a regex on the HTML, but it only runs once per 6-hour
+  /// session scope refresh and only when the HTML path misses.
+  Future<void> _extractStsFromPlayerJs(
+    String jsUrl,
+    Map<String, String> headers,
+  ) async {
+    try {
+      final jsResponse = await http
+          .get(Uri.parse(jsUrl), headers: {
+            'User-Agent': headers['User-Agent'] ?? _webUserAgent,
+          })
+          .timeout(const Duration(seconds: 15));
+      if (jsResponse.statusCode != 200) {
+        debugPrint(
+          '[YTM-Tracking] Player JS fetch failed: ${jsResponse.statusCode}',
+        );
+        return;
+      }
+      final jsBody = jsResponse.body;
+      final stsMatch =
+          RegExp(r'signatureTimestamp\s*[:=]\s*(\d+)').firstMatch(jsBody);
+      if (stsMatch != null) {
+        _sessionSignatureTimestamp = int.tryParse(stsMatch.group(1)!);
+        debugPrint(
+          '[YTM-Tracking] Extracted STS from player JS: '
+          '$_sessionSignatureTimestamp',
+        );
+      } else {
+        debugPrint('[YTM-Tracking] No signatureTimestamp found in player JS');
+      }
+    } catch (e) {
+      debugPrint('[YTM-Tracking] Player JS STS extraction failed: $e');
+    }
+  }
+
+  /// Generate SAPISIDHASH for authenticated requests
+  String? _generateSapisidHash({String origin = 'https://music.youtube.com'}) {
+    if (_sapisid == null) return null;
+
+    final timestamp = (DateTime.now().millisecondsSinceEpoch / 1000).floor();
+    final data = '$timestamp $_sapisid $origin';
+    final hash = sha1.convert(utf8.encode(data)).toString();
+    return 'SAPISIDHASH ${timestamp}_$hash';
+  }
+
+  /// Build headers for API requests
+  Map<String, String> _buildHeaders({
+    bool authenticated = false,
+    String acceptLanguage = 'en-US,en;q=0.9',
+    String origin = 'https://music.youtube.com',
+    String? referer,
+  }) {
+    final headers = <String, String>{
+      'Content-Type': 'application/json',
+      'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': '*/*',
+      'Accept-Language': acceptLanguage,
+      'Origin': origin,
+      'Referer': referer ?? '$origin/',
+      'X-Goog-Visitor-Id': _generateVisitorId(),
+    };
+
+    if (authenticated && isAuthenticated) {
+      final sapisidHash = _generateSapisidHash(origin: origin);
+      if (sapisidHash != null) {
+        headers['Authorization'] = sapisidHash;
+      }
+      headers['Cookie'] = _cookies.entries
+          .map((e) => '${e.key}=${e.value}')
+          .join('; ');
+      headers['X-Goog-AuthUser'] = '0';
+    }
+
+    return headers;
+  }
+
+  /// Fetch playback tracking URLs via an authenticated WEB_REMIX player request.
+  ///
+  /// The tracking URLs (videostatsPlaybackUrl, videostatsWatchtimeUrl, atrUrl)
+  /// returned by an authenticated request are bound to the user's session.
+  /// Hitting them during playback updates the user's YT Music play history.
+  ///
+  /// WEB_REMIX must quote the current player's signature timestamp: without
+  /// it (or with a stale one) YouTube answers 200 / UNPLAYABLE and silently
+  /// omits `playbackTracking` — no ping is ever sent, so history never moves.
+  Future<Map<String, dynamic>?> getAuthenticatedPlaybackTracking(
+    String videoId, {
+    String? playlistId,
+    int? signatureTimestamp,
+  }) async {
+    if (!isAuthenticated) return null;
+    await ensureSessionScope();
+
+    var sts = _sessionSignatureTimestamp ?? signatureTimestamp;
+    if (sts == null) {
+      sts = await InnerTubeApi().getSignatureTimestamp(videoId);
+      _sessionSignatureTimestamp ??= sts;
+    }
+    final context = _buildMusicContext(
+      languageCode: 'en',
+      countryCode: await _resolveRequestCountryCode(),
+    );
+    final client = context['client'] as Map<String, dynamic>;
+    client['clientVersion'] = _webRemixVersion;
+    if (_sessionVisitorData != null) {
+      client['visitorData'] = _sessionVisitorData;
+    }
+    if (_sessionDataSyncId != null) {
+      final user = Map<String, dynamic>.from(context['user'] as Map? ?? const {});
+      user['onBehalfOfUser'] = _sessionDataSyncId;
+      context['user'] = user;
+    }
+
+    Map<String, dynamic> buildBody(int? timestamp) => {
+      'context': context,
+      'videoId': videoId,
+      'racyCheckOk': true,
+      'contentCheckOk': true,
+      if (playlistId != null && playlistId.isNotEmpty) 'playlistId': playlistId,
+      'playbackContext': {
+        'contentPlaybackContext': {
+          'html5Preference': 'HTML5_PREF_WANTS',
+          'referer': 'https://music.youtube.com/watch?v=$videoId',
+          if (timestamp != null) 'signatureTimestamp': timestamp,
+        },
+      },
+    };
+
+    var response = await _trackingPlayerRequest(buildBody(sts));
+    var tracking = response?['playbackTracking'] as Map<String, dynamic>?;
+    if (tracking != null) return tracking;
+
+    final playability = response?['playabilityStatus'];
+    debugPrint(
+      '[YTM-Tracking] No playbackTracking for $videoId '
+      '(status=${playability?['status']}, reason=${playability?['reason']}, '
+      'sts=$sts) — refreshing session scope and retrying',
+    );
+    // Usually a stale timestamp after a player rollout.
+    await ensureSessionScope(refresh: true);
+    var retrySts = _sessionSignatureTimestamp ?? signatureTimestamp;
+    if (retrySts == null || retrySts == sts) {
+      retrySts =
+          await InnerTubeApi().getSignatureTimestamp(videoId, refresh: true);
+      _sessionSignatureTimestamp = retrySts;
+    }
+    // Only skip retry when we got the exact same non-null STS back.
+    if (retrySts == sts) return null;
+    response = await _trackingPlayerRequest(buildBody(retrySts));
+    tracking = response?['playbackTracking'] as Map<String, dynamic>?;
+    return tracking;
+  }
+
+  /// The authenticated WEB_REMIX `player` call that issues the tracking
+  /// block, signed the way the signed-in web client signs it (BitChord's
+  /// postMusic): the session's own visitor id (matching context.visitorData,
+  /// never a random one), its account slot and brand-channel page id, and
+  /// the client's name/version headers. No API key.
+  Future<Map<String, dynamic>?> _trackingPlayerRequest(
+    Map<String, dynamic> body,
+  ) async {
+    try {
+      final headers = {
+        ..._statsHeaders(),
+        'Content-Type': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'X-Goog-Api-Format-Version': '1',
+        'X-YouTube-Client-Name': '67',
+        'X-YouTube-Client-Version': _webRemixVersion,
+      };
+      final response = await http
+          .post(
+            Uri.parse('$_baseUrl/player?prettyPrint=false'),
+            headers: headers,
+            body: jsonEncode(body),
+          )
+          .timeout(const Duration(seconds: 15));
+      if (response.statusCode != 200) {
+        debugPrint(
+          '[YTM-Tracking] player HTTP ${response.statusCode}: '
+          '${response.body.length > 300 ? response.body.substring(0, 300) : response.body}',
+        );
+        return null;
+      }
+      return await compute(_jsonDecodeIsolate, response.body);
+    } catch (e) {
+      debugPrint('[YTM-Tracking] player request failed: $e');
+      return null;
+    }
+  }
+
+  /// Headers the tracking block asks for by name (USER_AUTH, VISITOR_ID,
+  /// PLUS_PAGE_ID). Sending fewer makes a ping land outside the listener's
+  /// own history.
+  Map<String, String> _statsHeaders() {
+    const origin = 'https://music.youtube.com';
+    final headers = <String, String>{
+      'User-Agent': _webUserAgent,
+      'Accept': '*/*',
+      'Origin': origin,
+      'X-Origin': origin,
+      'Referer': '$origin/',
+    };
+    if (_sessionVisitorData != null) {
+      headers['X-Goog-Visitor-Id'] = _sessionVisitorData!;
+    }
+    if (isAuthenticated) {
+      headers['Cookie'] =
+          _cookies.entries.map((e) => '${e.key}=${e.value}').join('; ');
+      headers['X-Goog-AuthUser'] = _sessionAuthUser;
+      if (_sessionPageId != null) headers['X-Goog-PageId'] = _sessionPageId!;
+      final hash = _generateSapisidHash(origin: origin);
+      if (hash != null) headers['Authorization'] = hash;
+    }
+    return headers;
+  }
+
+  /// Send one YouTube stats ping (playback / watchtime / atr).
+  ///
+  /// [baseUrl] is the URL straight from the player response. Playback and
+  /// watchtime pings get the client identity params a real WEB_REMIX client
+  /// sends; [extraParams] carry per-ping values (st/et/cmt/state/final).
+  /// ATR URLs already carry ver/c/cver, so they only get the `cpn`.
+  /// All pings of one play must share the same [cpn].
+  Future<bool> sendPlaybackStatsPing(
+    String baseUrl, {
+    required String cpn,
+    Map<String, String> extraParams = const {},
+    bool isAtr = false,
+  }) async {
+    try {
+      final uri = Uri.parse(baseUrl);
+      final params = Map<String, String>.from(uri.queryParameters);
+      params['cpn'] = cpn;
+      if (!isAtr) {
+        params.addAll({
+          'ver': '2',
+          'c': 'WEB_REMIX',
+          'cver': _webRemixVersion,
+          'cplayer': 'UNIPLAYER',
+          'cbr': 'Chrome',
+          'cbrver': '141.0.0.0',
+          'cos': 'Windows',
+          'cosver': '10.0',
+          'hl': 'en_US',
+          'cr': await _resolveRequestCountryCode(),
+        });
+      }
+      params.addAll(extraParams);
+      final url = uri.replace(queryParameters: params);
+
+      final response = await http
+          .get(url, headers: _statsHeaders())
+          .timeout(const Duration(seconds: 10));
+      final ok = response.statusCode >= 200 && response.statusCode < 400;
+      debugPrint(
+        '[YTM-Tracking] ${url.path} docid=${params['docid']} '
+        'state=${params['state']} et=${params['et']} -> ${response.statusCode}',
+      );
+      return ok;
+    } catch (e) {
+      debugPrint('[YTM-Tracking] Stats ping failed: $e');
+      return false;
+    }
+  }
+
+  String _generateVisitorId() {
+    final random = Random();
+    final chars =
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    return List.generate(11, (_) => chars[random.nextInt(chars.length)]).join();
+  }
+
+  /// Make an InnerTube API request
+  /// JSON decoding runs in background isolate for large responses
+  /// Includes retry logic with exponential backoff for network resilience
+  Future<Map<String, dynamic>?> _request(
+    String endpoint,
+    Map<String, dynamic> body, {
+    bool authenticated = false,
+    int maxRetries = 3,
+  }) async {
+    int attempt = 0;
+
+    while (attempt < maxRetries) {
+      try {
+        final url = Uri.parse(
+          '$_baseUrl/$endpoint?key=$_apiKey&prettyPrint=false',
+        );
+        final locale = await _resolveRequestLocale();
+        final languageCode = requestLanguageCodeForLocale(locale);
+        final countryCode = await _resolveRequestCountryCode();
+        final requestBody = body.containsKey('context')
+            ? body
+            : {
+                'context': _buildMusicContext(
+                  languageCode: languageCode,
+                  countryCode: countryCode,
+                ),
+                ...body,
+              };
+
+        final response = await http.post(
+          url,
+          headers: _buildHeaders(
+            authenticated: authenticated,
+            acceptLanguage: _acceptLanguageHeader(
+              languageCode: languageCode,
+              countryCode: countryCode,
+            ),
+          ),
+          body: jsonEncode(requestBody),
+        );
+
+        if (response.statusCode == 200) {
+          // Decode JSON in background isolate to avoid UI jank
+          // Large responses (home page, search) can cause stuttering
+          return await compute(_jsonDecodeIsolate, response.body);
+        } else if (response.statusCode >= 500) {
+          // Server error - retry with backoff
+          attempt++;
+          if (attempt < maxRetries) {
+            final delayMs = 100 * pow(2, attempt).toInt(); // 200, 400, 800ms
+            await Future.delayed(Duration(milliseconds: delayMs));
+            continue;
+          }
+        }
+
+        if (kDebugMode) {
+          print('InnerTube error ${response.statusCode}: ${response.body}');
+        }
+        return null;
+      } catch (e) {
+        attempt++;
+        if (attempt < maxRetries) {
+          // Network error - retry with exponential backoff
+          final delayMs = 100 * pow(2, attempt).toInt();
+          if (kDebugMode) {
+            print(
+              'InnerTube request failed (attempt $attempt/$maxRetries): $e',
+            );
+          }
+          await Future.delayed(Duration(milliseconds: delayMs));
+          continue;
+        }
+
+        if (kDebugMode) {
+          print('InnerTube request failed after $maxRetries attempts: $e');
+        }
+        return null;
+      }
+    }
+
+    return null;
+  }
+
+  // ============ ACCOUNT ============
+
+  /// Signed-in account details from `account/account_menu`.
+  ///
+  /// This is what lets the YT Music login double as the app's only login:
+  /// it returns the same name / handle / photo Google Sign-In used to, and
+  /// [sessionDataSyncId] gives a stable per-account id (used for Jams).
+  Future<Map<String, String?>?> getAccountInfo() async {
+    if (!isAuthenticated) return null;
+    await ensureSessionScope();
+    final response = await _request(
+      'account/account_menu',
+      {},
+      authenticated: true,
+    );
+    if (response == null) return null;
+
+    final header = _findFirstKey(response, 'activeAccountHeaderRenderer');
+    if (header is! Map) return null;
+
+    String? runsText(dynamic node) {
+      final runs = node is Map ? node['runs'] : null;
+      if (runs is List && runs.isNotEmpty) return runs.first['text'] as String?;
+      return node is Map ? node['simpleText'] as String? : null;
+    }
+
+    String? photo;
+    final thumbs = header['accountPhoto']?['thumbnails'];
+    if (thumbs is List && thumbs.isNotEmpty) {
+      photo = (thumbs.last['url'] as String?)?.replaceAll(
+        RegExp(r'=s\d+'),
+        '=s240',
+      );
+    }
+
+    String? channelId;
+    void findChannel(dynamic node) {
+      if (channelId != null) return;
+      if (node is Map) {
+        final id = node['browseEndpoint']?['browseId'];
+        if (id is String && id.startsWith('UC')) {
+          channelId = id;
+          return;
+        }
+        node.values.forEach(findChannel);
+      } else if (node is List) {
+        node.forEach(findChannel);
+      }
+    }
+
+    findChannel(response);
+
+    return {
+      'name': runsText(header['accountName']),
+      'email': runsText(header['email']),
+      'handle': runsText(header['channelHandle']),
+      'avatarUrl': photo,
+      'channelId': channelId,
+      'accountId': _sessionDataSyncId,
+    };
+  }
+
+  dynamic _findFirstKey(dynamic node, String key) {
+    if (node is Map) {
+      if (node.containsKey(key)) return node[key];
+      for (final value in node.values) {
+        final found = _findFirstKey(value, key);
+        if (found != null) return found;
+      }
+    } else if (node is List) {
+      for (final value in node) {
+        final found = _findFirstKey(value, key);
+        if (found != null) return found;
+      }
+    }
+    return null;
+  }
+
+  // ============ LIBRARY ENDPOINTS ============
+
+  /// Get user's liked songs (fetches all pages using playlist endpoint)
+  Future<List<Track>> getLikedSongs() async {
+    if (!isAuthenticated) return [];
+
+    // Use the special "LM" playlist ID for liked songs - this is more reliable
+    // than the FEmusic_liked_videos browse endpoint
+    final allTracks = <Track>[];
+    final seenTrackIds = <String>{};
+    final seenContinuations = <String>{};
+    String? continuation;
+
+    // First request - get playlist with VL prefix
+    final response = await _request('browse', {
+      'browseId': 'VLLM', // VL + LM (Liked Music)
+    }, authenticated: true);
+
+    if (response == null) {
+      if (kDebugMode) {
+        print('LikedSongs: Initial response is null, trying fallback...');
+      }
+      return _getLikedSongsFallback();
+    }
+
+    // Parse first page and get continuation
+    final (tracks, cont) = _parseLikedSongsPlaylist(response);
+    for (final track in tracks) {
+      if (seenTrackIds.add(track.id)) {
+        allTracks.add(track);
+      }
+    }
+    continuation = cont;
+    if (kDebugMode) {
+      print(
+        'LikedSongs: First page: ${tracks.length} songs (${allTracks.length} unique), continuation: ${cont != null}',
+      );
+    }
+
+    // Fetch remaining pages
+    int pageNum = 1;
+    while (continuation != null && seenContinuations.add(continuation)) {
+      pageNum++;
+      final contResponse = await _request('browse', {
+        'continuation': continuation,
+      }, authenticated: true);
+
+      if (contResponse == null) {
+        if (kDebugMode) {
+          print('LikedSongs: Page $pageNum: null response');
+        }
+        break;
+      }
+
+      final (moreTracks, nextCont) = _parseLikedSongsContinuation(contResponse);
+      var added = 0;
+      for (final track in moreTracks) {
+        if (seenTrackIds.add(track.id)) {
+          allTracks.add(track);
+          added++;
+        }
+      }
+      if (kDebugMode) {
+        print(
+          'LikedSongs: Page $pageNum: ${moreTracks.length} songs ($added new), continuation: ${nextCont != null}',
+        );
+      }
+      continuation = nextCont;
+
+      // Safety limit to prevent infinite loops
+      if (allTracks.length > 5000) break;
+    }
+
+    // Fallback path if the primary endpoint returned nothing useful.
+    if (allTracks.isEmpty) {
+      if (kDebugMode) {
+        print('LikedSongs: Primary path returned 0 tracks, trying fallback...');
+      }
+      return _getLikedSongsFallback();
+    }
+
+    if (kDebugMode) {
+      print('LikedSongs: Total fetched: ${allTracks.length} songs');
+    }
+    return allTracks;
+  }
+
+  /// Fallback method using FEmusic_liked_videos (old method)
+  Future<List<Track>> _getLikedSongsFallback() async {
+    final response = await _request('browse', {
+      'browseId': 'FEmusic_liked_videos',
+    }, authenticated: true);
+
+    if (response == null) return [];
+
+    final allTracks = <Track>[];
+    final seenTrackIds = <String>{};
+    final seenContinuations = <String>{};
+
+    final (tracks, initialContinuation) = _parseLibraryTracksWithContinuation(
+      response,
+    );
+    for (final track in tracks) {
+      if (seenTrackIds.add(track.id)) {
+        allTracks.add(track);
+      }
+    }
+
+    var continuation = initialContinuation;
+    while (continuation != null && seenContinuations.add(continuation)) {
+      final contResponse = await _request('browse', {
+        'continuation': continuation,
+      }, authenticated: true);
+      if (contResponse == null) break;
+
+      final (moreTracks, nextContinuation) = _parseLibraryContinuation(
+        contResponse,
+      );
+      for (final track in moreTracks) {
+        if (seenTrackIds.add(track.id)) {
+          allTracks.add(track);
+        }
+      }
+      continuation = nextContinuation;
+      if (allTracks.length > 5000) break;
+    }
+
+    if (kDebugMode) {
+      print('LikedSongs Fallback: Got ${allTracks.length} songs');
+    }
+    return allTracks;
+  }
+
+  /// Parse liked songs from VLLM playlist response
+  (List<Track>, String?) _parseLikedSongsPlaylist(
+    Map<String, dynamic> response,
+  ) {
+    final tracks = <Track>[];
+    String? continuation;
+
+    try {
+      // Debug: Print response structure
+      if (kDebugMode) {
+        print('LikedSongs: Response keys: ${response.keys.toList()}');
+      }
+      if (response['contents'] != null) {
+        final contents = response['contents'] as Map;
+        if (kDebugMode) {
+          print('LikedSongs: contents keys: ${contents.keys.toList()}');
+        }
+
+        // For two column layout
+        if (contents['twoColumnBrowseResultsRenderer'] != null) {
+          final tcbr = contents['twoColumnBrowseResultsRenderer'] as Map;
+          if (kDebugMode) {
+            print(
+              'LikedSongs: twoColumnBrowseResultsRenderer keys: ${tcbr.keys.toList()}',
+            );
+          }
+
+          if (tcbr['secondaryContents'] != null) {
+            final sc = tcbr['secondaryContents'] as Map;
+            if (kDebugMode) {
+              print('LikedSongs: secondaryContents keys: ${sc.keys.toList()}');
+            }
+
+            final sectionList = sc['sectionListRenderer'] as Map?;
+            if (sectionList != null) {
+              final sections = sectionList['contents'] as List?;
+              if (sections != null && sections.isNotEmpty) {
+                if (kDebugMode) {
+                  print(
+                    'LikedSongs: First section keys: ${(sections[0] as Map).keys.toList()}',
+                  );
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Try twoColumnBrowseResultsRenderer > secondaryContents first (VLLM playlist)
+      var contents =
+          _navigateJson(response, [
+                'contents',
+                'twoColumnBrowseResultsRenderer',
+                'secondaryContents',
+                'sectionListRenderer',
+                'contents',
+                0,
+                'musicPlaylistShelfRenderer',
+                'contents',
+              ])
+              as List?;
+
+      var shelf =
+          _navigateJson(response, [
+                'contents',
+                'twoColumnBrowseResultsRenderer',
+                'secondaryContents',
+                'sectionListRenderer',
+                'contents',
+                0,
+                'musicPlaylistShelfRenderer',
+              ])
+              as Map?;
+
+      // Check for continuation at sectionListRenderer level (twoColumn)
+      var sectionListRenderer =
+          _navigateJson(response, [
+                'contents',
+                'twoColumnBrowseResultsRenderer',
+                'secondaryContents',
+                'sectionListRenderer',
+              ])
+              as Map?;
+
+      if (sectionListRenderer != null) {
+        if (kDebugMode) {
+          print(
+            'LikedSongs: sectionListRenderer keys: ${sectionListRenderer.keys.toList()}',
+          );
+        }
+        final cont = _extractContinuationToken(
+          sectionListRenderer['continuations'],
+        );
+        if (cont != null) {
+          if (kDebugMode) {
+            print(
+              'LikedSongs: Found continuation at sectionListRenderer level',
+            );
+          }
+          continuation = cont;
+        }
+      }
+
+      // Also try musicShelfRenderer in twoColumn layout
+      if (contents == null) {
+        contents =
+            _navigateJson(response, [
+                  'contents',
+                  'twoColumnBrowseResultsRenderer',
+                  'secondaryContents',
+                  'sectionListRenderer',
+                  'contents',
+                  0,
+                  'musicShelfRenderer',
+                  'contents',
+                ])
+                as List?;
+
+        shelf =
+            _navigateJson(response, [
+                  'contents',
+                  'twoColumnBrowseResultsRenderer',
+                  'secondaryContents',
+                  'sectionListRenderer',
+                  'contents',
+                  0,
+                  'musicShelfRenderer',
+                ])
+                as Map?;
+      }
+
+      // Fallback: try singleColumnBrowseResultsRenderer
+      if (contents == null) {
+        contents =
+            _navigateJson(response, [
+                  'contents',
+                  'singleColumnBrowseResultsRenderer',
+                  'tabs',
+                  0,
+                  'tabRenderer',
+                  'content',
+                  'sectionListRenderer',
+                  'contents',
+                  0,
+                  'musicPlaylistShelfRenderer',
+                  'contents',
+                ])
+                as List?;
+
+        shelf =
+            _navigateJson(response, [
+                  'contents',
+                  'singleColumnBrowseResultsRenderer',
+                  'tabs',
+                  0,
+                  'tabRenderer',
+                  'content',
+                  'sectionListRenderer',
+                  'contents',
+                  0,
+                  'musicPlaylistShelfRenderer',
+                ])
+                as Map?;
+      }
+
+      // Try musicShelfRenderer in singleColumn
+      if (contents == null) {
+        contents =
+            _navigateJson(response, [
+                  'contents',
+                  'singleColumnBrowseResultsRenderer',
+                  'tabs',
+                  0,
+                  'tabRenderer',
+                  'content',
+                  'sectionListRenderer',
+                  'contents',
+                  0,
+                  'musicShelfRenderer',
+                  'contents',
+                ])
+                as List?;
+
+        shelf =
+            _navigateJson(response, [
+                  'contents',
+                  'singleColumnBrowseResultsRenderer',
+                  'tabs',
+                  0,
+                  'tabRenderer',
+                  'content',
+                  'sectionListRenderer',
+                  'contents',
+                  0,
+                  'musicShelfRenderer',
+                ])
+                as Map?;
+      }
+
+      // Get continuation from shelf
+      if (shelf != null) {
+        if (kDebugMode) {
+          print('LikedSongs: shelf keys: ${shelf.keys.toList()}');
+        }
+        final cont = _extractContinuationToken(shelf['continuations']);
+        if (cont != null) {
+          if (kDebugMode) {
+            final conts = shelf['continuations'] as List?;
+            if (conts != null && conts.isNotEmpty) {
+              print(
+                'LikedSongs: continuations[0] keys: ${(conts[0] as Map).keys.toList()}',
+              );
+            }
+          }
+          continuation = cont;
+        } else {
+          if (kDebugMode) {
+            print('LikedSongs: No continuations array in shelf');
+          }
+        }
+      }
+
+      // Some responses place continuation token as continuationItemRenderer.
+      continuation ??= _extractContinuationToken(contents);
+
+      if (contents != null) {
+        for (final item in contents) {
+          final track = _parseTrackItem(item);
+          if (track != null) tracks.add(track);
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing liked songs playlist: $e');
+      }
+    }
+
+    return (tracks, continuation);
+  }
+
+  /// Parse liked songs continuation response
+  (List<Track>, String?) _parseLikedSongsContinuation(
+    Map<String, dynamic> response,
+  ) {
+    final tracks = <Track>[];
+    String? continuation;
+
+    try {
+      List? items;
+
+      // Try musicPlaylistShelfContinuation
+      var continuationContents =
+          response['continuationContents']?['musicPlaylistShelfContinuation'];
+
+      // Fall back to musicShelfContinuation
+      continuationContents ??=
+          response['continuationContents']?['musicShelfContinuation'];
+
+      if (continuationContents != null) {
+        items = continuationContents['contents'] as List?;
+      }
+
+      // Some browse continuations return items via appendContinuationItemsAction.
+      items ??=
+          _navigateJson(response, [
+                'onResponseReceivedActions',
+                0,
+                'appendContinuationItemsAction',
+                'continuationItems',
+              ])
+              as List?;
+      items ??=
+          _navigateJson(response, [
+                'onResponseReceivedEndpoints',
+                0,
+                'appendContinuationItemsAction',
+                'continuationItems',
+              ])
+              as List?;
+
+      if (items == null) {
+        return _parseLibraryContinuation(response);
+      }
+
+      for (final item in items) {
+        // Standard continuation item
+        var track = _parseTrackItem(item);
+        if (track != null) {
+          tracks.add(track);
+          continue;
+        }
+
+        // Wrapped continuation item shape
+        final renderer = item['musicResponsiveListItemRenderer'];
+        if (renderer != null) {
+          track = _parseTrackItem({
+            'musicResponsiveListItemRenderer': renderer,
+          });
+          if (track != null) {
+            tracks.add(track);
+          }
+        }
+
+        // Nested shelf continuation shape
+        final shelfItems =
+            item['musicPlaylistShelfRenderer']?['contents'] as List?;
+        if (shelfItems != null) {
+          for (final shelfItem in shelfItems) {
+            final shelfTrack = _parseTrackItem(shelfItem);
+            if (shelfTrack != null) {
+              tracks.add(shelfTrack);
+            }
+          }
+        }
+      }
+
+      // Get next continuation token
+      if (continuationContents != null) {
+        continuation = _extractContinuationToken(
+          continuationContents['continuations'],
+        );
+      }
+      continuation ??= _extractContinuationToken(items);
+      continuation ??= _extractContinuationToken(
+        response['onResponseReceivedActions'],
+      );
+      continuation ??= _extractContinuationToken(
+        response['onResponseReceivedEndpoints'],
+      );
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing liked songs continuation: $e');
+      }
+    }
+
+    return (tracks, continuation);
+  }
+
+  /// Extract continuation token from known YouTube continuation shapes.
+  String? _extractContinuationToken(dynamic node) {
+    if (node is List) {
+      for (final item in node) {
+        final token = _extractContinuationToken(item);
+        if (token != null && token.isNotEmpty) return token;
+      }
+      return null;
+    }
+
+    if (node is! Map) return null;
+
+    final nextContinuationData = node['nextContinuationData'];
+    if (nextContinuationData is Map) {
+      final token = nextContinuationData['continuation'] as String?;
+      if (token != null && token.isNotEmpty) return token;
+    }
+
+    final reloadContinuationData = node['reloadContinuationData'];
+    if (reloadContinuationData is Map) {
+      final token = reloadContinuationData['continuation'] as String?;
+      if (token != null && token.isNotEmpty) return token;
+    }
+
+    final continuationCommand = node['continuationCommand'];
+    if (continuationCommand is Map) {
+      final token = continuationCommand['token'] as String?;
+      if (token != null && token.isNotEmpty) return token;
+    }
+
+    final continuationEndpoint = node['continuationEndpoint'];
+    if (continuationEndpoint != null) {
+      final token = _extractContinuationToken(continuationEndpoint);
+      if (token != null && token.isNotEmpty) return token;
+    }
+
+    final continuationItemRenderer = node['continuationItemRenderer'];
+    if (continuationItemRenderer != null) {
+      final token = _extractContinuationToken(continuationItemRenderer);
+      if (token != null && token.isNotEmpty) return token;
+    }
+
+    final continuations = node['continuations'];
+    if (continuations != null) {
+      final token = _extractContinuationToken(continuations);
+      if (token != null && token.isNotEmpty) return token;
+    }
+
+    // appendContinuationItemsAction shape
+    final appendAction = node['appendContinuationItemsAction'];
+    if (appendAction is Map) {
+      final token = _extractContinuationToken(
+        appendAction['continuationItems'],
+      );
+      if (token != null && token.isNotEmpty) return token;
+    }
+
+    return null;
+  }
+
+  /// Get user's library songs (uploaded/private)
+  Future<List<Track>> getLibrarySongs() async {
+    if (!isAuthenticated) return [];
+
+    final response = await _request('browse', {
+      'browseId': 'FEmusic_library_privately_owned_tracks',
+    }, authenticated: true);
+
+    if (response == null) return [];
+    return _parseLibraryTracks(response);
+  }
+
+  /// Get user's saved albums
+  Future<List<Album>> getSavedAlbums() async {
+    if (!isAuthenticated) return [];
+
+    final response = await _request('browse', {
+      'browseId': 'FEmusic_liked_albums',
+    }, authenticated: true);
+
+    if (response == null) return [];
+    return _parseLibraryAlbums(response);
+  }
+
+  /// Get user's saved playlists
+  Future<List<Playlist>> getSavedPlaylists() async {
+    if (!isAuthenticated) return [];
+
+    final response = await _request('browse', {
+      'browseId': 'FEmusic_liked_playlists',
+    }, authenticated: true);
+
+    if (response == null) return [];
+    return _parseLibraryPlaylists(response);
+  }
+
+  /// Get the user's saved podcasts (shows) plus the "New Episodes" and
+  /// "Episodes for Later" auto-lists, from the non-music-audio library feed.
+  Future<List<Playlist>> getLibraryPodcasts() async {
+    if (!isAuthenticated) return [];
+
+    final response = await _request('browse', {
+      'browseId': 'FEmusic_library_non_music_audio_list',
+    }, authenticated: true);
+    if (response == null) return [];
+
+    final podcasts = <Playlist>[];
+    final seen = <String>{};
+
+    void walk(dynamic node) {
+      if (node is List) {
+        for (final e in node) {
+          walk(e);
+        }
+        return;
+      }
+      if (node is! Map) return;
+      final it = node['musicTwoRowItemRenderer'];
+      if (it is Map) {
+        final title = (it['title']?['runs'] as List?)
+                ?.map((r) => r['text']?.toString() ?? '')
+                .join() ??
+            '';
+        final browseId = _navigateJson(it.cast<String, dynamic>(), [
+          'navigationEndpoint',
+          'browseEndpoint',
+          'browseId',
+        ]) as String?;
+        // Skip action tiles (e.g. "Add podcast") that carry no browse id.
+        if (browseId != null &&
+            browseId.isNotEmpty &&
+            title.isNotEmpty &&
+            seen.add(browseId)) {
+          final subtitle = (it['subtitle']?['runs'] as List?)
+              ?.map((r) => r['text']?.toString() ?? '')
+              .join();
+          final thumb = _extractThumbnail(
+            it['thumbnailRenderer']?['musicThumbnailRenderer']?['thumbnail'],
+          );
+          podcasts.add(Playlist(
+            id: browseId,
+            title: title,
+            author: subtitle,
+            thumbnailUrl: thumb,
+            isPodcast: true,
+            isYTMusic: true,
+          ));
+        }
+      }
+      for (final v in node.values) {
+        walk(v);
+      }
+    }
+
+    walk(response['contents']);
+    return podcasts;
+  }
+
+  /// Get user's library artists (artists from saved songs)
+  Future<List<Artist>> getLibraryArtists({LibraryArtistSort? sort}) async {
+    if (!isAuthenticated) return [];
+
+    final response = await _request('browse', {
+      'browseId': 'FEmusic_library_corpus_track_artists',
+      if (sort?.params != null) 'params': sort!.params,
+    }, authenticated: true);
+
+    if (response == null) return [];
+    
+    final artists = _parseLibraryArtists(response);
+    
+    // Handle "Most Songs" sort locally
+    if (sort == LibraryArtistSort.mostSongs) {
+      artists.sort((a, b) => (b.songsCount ?? 0).compareTo(a.songsCount ?? 0));
+    }
+    
+    return artists;
+  }
+
+  /// Get user's subscribed artists (channel subscriptions)
+  Future<List<Artist>> getLibrarySubscriptions({LibraryArtistSort? sort}) async {
+    if (!isAuthenticated) return [];
+
+    final response = await _request('browse', {
+      'browseId': 'FEmusic_library_corpus_artists',
+      if (sort?.params != null) 'params': sort!.params,
+    }, authenticated: true);
+
+    if (response == null) return [];
+    
+    final artists = _parseLibraryArtists(response);
+    
+    // Handle "Most Songs" sort locally
+    if (sort == LibraryArtistSort.mostSongs) {
+      artists.sort((a, b) => (b.songsCount ?? 0).compareTo(a.songsCount ?? 0));
+    }
+    
+    return artists;
+  }
+
+  /// Get recently played (flat list)
+  Future<List<Track>> getRecentlyPlayed() async {
+    final sections = await getHistorySections();
+    return sections.expand((s) => s.tracks).toList();
+  }
+
+  /// Get recently played grouped by timeline (Today, Yesterday, etc.)
+  Future<List<HistorySection>> getHistorySections() async {
+    if (!isAuthenticated) return [];
+
+    final response = await _request('browse', {
+      'browseId': 'FEmusic_history',
+    }, authenticated: true);
+
+    if (response == null) return [];
+    return _parseHistorySections(response);
+  }
+
+  /// Get home page content (personalized recommendations)
+  Future<HomePageContent> getHomePageContent() async {
+    final response = await _request('browse', {
+      'browseId': 'FEmusic_home',
+    }, authenticated: isAuthenticated);
+
+    if (response == null) return HomePageContent.empty;
+    return _parseHomePageContent(response);
+  }
+
+  /// Load more home page content using continuation token
+  Future<HomePageContent> getHomePageContinuation(
+    String continuationToken,
+  ) async {
+    final response = await _request('browse', {
+      'continuation': continuationToken,
+    }, authenticated: isAuthenticated);
+
+    if (response == null) return HomePageContent.empty;
+    return _parseHomePageContinuation(response);
+  }
+
+  /// Get raw home page response (for debugging)
+  Future<Map<String, dynamic>?> getHomePage() async {
+    final response = await _request('browse', {
+      'browseId': 'FEmusic_home',
+    }, authenticated: isAuthenticated);
+
+    return response;
+  }
+
+  // ============ ACTIONS ============
+
+  /// Like or unlike a song
+  Future<bool> likeVideo(String videoId, bool like) async {
+    if (!isAuthenticated) return false;
+
+    final response = await _request(like ? 'like/like' : 'like/removelike', {
+      'target': {'videoId': videoId},
+    }, authenticated: true);
+
+    return response != null;
+  }
+
+  /// Dislike or undislike a video
+  Future<bool> dislikeVideo(String videoId, bool dislike) async {
+    if (!isAuthenticated) return false;
+
+    final response = await _request(dislike ? 'like/dislike' : 'like/removelike', {
+      'target': {'videoId': videoId},
+    }, authenticated: true);
+
+    return response != null;
+  }
+
+  /// Save (subscribe) or unsave a podcast show to the user's library. The show
+  /// is targeted by its playlist id, via the same like endpoint YT Music uses.
+  Future<bool> savePodcast(String playlistId, bool save) async {
+    if (!isAuthenticated) return false;
+    var pl = playlistId;
+    if (pl.startsWith('VL')) pl = pl.substring(2);
+    final response = await _request(save ? 'like/like' : 'like/removelike', {
+      'target': {'playlistId': pl},
+    }, authenticated: true);
+    return response != null;
+  }
+
+  /// Subscribe or unsubscribe from an artist
+  Future<bool> subscribeArtist(String channelId, bool subscribe) async {
+    if (!isAuthenticated) return false;
+
+    final endpoint = subscribe
+        ? 'subscription/subscribe'
+        : 'subscription/unsubscribe';
+    final response = await _request(endpoint, {
+      'channelIds': [channelId],
+    }, authenticated: true);
+
+    return response != null;
+  }
+
+  /// Add track to playlist (requires auth)
+  Future<bool> addToPlaylist(String playlistId, String videoId) async {
+    if (!isAuthenticated) return false;
+
+    String cleanPlaylistId = playlistId;
+    if (cleanPlaylistId.startsWith('VL')) {
+      cleanPlaylistId = cleanPlaylistId.substring(2);
+    }
+
+    final response = await _request('browse/edit_playlist', {
+      'playlistId': cleanPlaylistId,
+      'actions': [
+        {'action': 'ACTION_ADD_VIDEO', 'addedVideoId': videoId},
+      ],
+    }, authenticated: true);
+
+    return response != null;
+  }
+
+  /// Remove song from playlist
+  Future<bool> removeFromPlaylist(
+    String playlistId,
+    String videoId,
+    String setVideoId,
+  ) async {
+    if (!isAuthenticated) return false;
+
+    String cleanPlaylistId = playlistId;
+    if (cleanPlaylistId.startsWith('VL')) {
+      cleanPlaylistId = cleanPlaylistId.substring(2);
+    }
+
+    final response = await _request('browse/edit_playlist', {
+      'playlistId': cleanPlaylistId,
+      'actions': [
+        {
+          'action': 'ACTION_REMOVE_VIDEO',
+          'removedVideoId': videoId,
+          'setVideoId': setVideoId,
+        },
+      ],
+    }, authenticated: true);
+
+    return response != null;
+  }
+
+  /// Create a new playlist
+  Future<String?> createPlaylist(
+    String title, {
+    String? description,
+    bool isPrivate = true,
+  }) async {
+    if (!isAuthenticated) return null;
+
+    final response = await _request('playlist/create', {
+      'title': title,
+      'description': description ?? '',
+      'privacyStatus': isPrivate ? 'PRIVATE' : 'PUBLIC',
+    }, authenticated: true);
+
+    if (response == null) return null;
+    return response['playlistId'] as String?;
+  }
+
+  /// Delete a playlist
+  Future<bool> deletePlaylist(String playlistId) async {
+    if (!isAuthenticated) return false;
+
+    String cleanPlaylistId = playlistId;
+    if (cleanPlaylistId.startsWith('VL')) {
+      cleanPlaylistId = cleanPlaylistId.substring(2);
+    }
+
+    final response = await _request('playlist/delete', {
+      'playlistId': cleanPlaylistId,
+    }, authenticated: true);
+
+    return response != null;
+  }
+
+  /// Strip the "VL" prefix YouTube Music uses for browse ids so the value can
+  /// be sent to the edit_playlist endpoint (which expects the bare id).
+  String _cleanPlaylistId(String playlistId) {
+    if (playlistId.startsWith('VL')) return playlistId.substring(2);
+    return playlistId;
+  }
+
+  /// Edit an owned playlist's metadata: title, description and/or privacy.
+  ///
+  /// Any combination of fields may be supplied; only the provided ones are
+  /// changed. [privacyStatus] must be one of `PUBLIC`, `PRIVATE`, `UNLISTED`.
+  Future<bool> editPlaylistMetadata(
+    String playlistId, {
+    String? title,
+    String? description,
+    String? privacyStatus,
+  }) async {
+    if (!isAuthenticated) return false;
+
+    final actions = <Map<String, dynamic>>[];
+    if (title != null) {
+      actions.add({'action': 'ACTION_SET_PLAYLIST_NAME', 'playlistName': title});
+    }
+    if (description != null) {
+      actions.add({
+        'action': 'ACTION_SET_PLAYLIST_DESCRIPTION',
+        'playlistDescription': description,
+      });
+    }
+    if (privacyStatus != null) {
+      actions.add({
+        'action': 'ACTION_SET_PLAYLIST_PRIVACY',
+        'playlistPrivacy': privacyStatus,
+      });
+    }
+    if (actions.isEmpty) return true;
+
+    final response = await _request('browse/edit_playlist', {
+      'playlistId': _cleanPlaylistId(playlistId),
+      'actions': actions,
+    }, authenticated: true);
+
+    return response != null;
+  }
+
+  /// Move a track within an owned playlist (drag-to-reorder).
+  ///
+  /// [setVideoId] is the moved item's set-video-id. The item is inserted
+  /// directly before [successorSetVideoId]; pass null to move it to the end.
+  Future<bool> movePlaylistItem(
+    String playlistId,
+    String setVideoId, {
+    String? successorSetVideoId,
+  }) async {
+    if (!isAuthenticated) return false;
+    if (setVideoId.isEmpty) return false;
+
+    final action = <String, dynamic>{
+      'action': 'ACTION_MOVE_VIDEO_BEFORE',
+      'setVideoId': setVideoId,
+    };
+    if (successorSetVideoId != null && successorSetVideoId.isNotEmpty) {
+      action['movedSetVideoIdSuccessor'] = successorSetVideoId;
+    }
+
+    final response = await _request('browse/edit_playlist', {
+      'playlistId': _cleanPlaylistId(playlistId),
+      'actions': [action],
+    }, authenticated: true);
+
+    return response != null;
+  }
+
+  /// Upload a custom cover image for an owned playlist.
+  ///
+  /// Mirrors the three-step flow the YT Music web client uses: start a
+  /// resumable upload, stream the raw image bytes to finalize it, then attach
+  /// the returned upload token to the playlist via edit_playlist.
+  Future<bool> uploadPlaylistImage(
+    String playlistId,
+    Uint8List imageBytes,
+  ) async {
+    if (!isAuthenticated) return false;
+    if (imageBytes.isEmpty) return false;
+
+    final cleanId = _cleanPlaylistId(playlistId);
+    final referer = 'https://music.youtube.com/playlist?list=$cleanId';
+
+    try {
+      // Step 1 — initiate the resumable upload and read back the upload URL.
+      final startHeaders = _buildHeaders(authenticated: true, referer: referer)
+        ..['Content-Type'] = 'application/x-www-form-urlencoded;charset=utf-8'
+        ..['X-Goog-Upload-Protocol'] = 'resumable'
+        ..['X-Goog-Upload-Command'] = 'start'
+        ..['X-Goog-Upload-Header-Content-Length'] = imageBytes.length.toString();
+
+      final startResp = await http
+          .post(
+            Uri.parse(
+              'https://music.youtube.com/playlist_image_upload/playlist_custom_thumbnail',
+            ),
+            headers: startHeaders,
+            body: '',
+          )
+          .timeout(const Duration(seconds: 20));
+
+      final uploadUrl = startResp.headers['x-goog-upload-url'];
+      if (startResp.statusCode != 200 || uploadUrl == null) {
+        if (kDebugMode) {
+          print('Playlist image upload: start failed '
+              '(${startResp.statusCode}) ${startResp.body}');
+        }
+        return false;
+      }
+
+      // Step 2 — upload the raw bytes and finalize in a single request.
+      final uploadHeaders = _buildHeaders(authenticated: true, referer: referer)
+        ..['Content-Type'] = 'application/x-www-form-urlencoded;charset=utf-8'
+        ..['X-Goog-Upload-Command'] = 'upload, finalize'
+        ..['X-Goog-Upload-Offset'] = '0';
+
+      final uploadResp = await http
+          .post(Uri.parse(uploadUrl), headers: uploadHeaders, body: imageBytes)
+          .timeout(const Duration(seconds: 60));
+
+      if (uploadResp.statusCode != 200) {
+        if (kDebugMode) {
+          print('Playlist image upload: finalize failed '
+              '(${uploadResp.statusCode}) ${uploadResp.body}');
+        }
+        return false;
+      }
+
+      // The finalize response is JSON: {"encryptedBlobId":"..."}. Older/edge
+      // responses may return the bare id as plain text, so fall back to that.
+      String? encryptedBlobId;
+      try {
+        final decoded = jsonDecode(uploadResp.body);
+        if (decoded is Map) {
+          encryptedBlobId = decoded['encryptedBlobId'] as String?;
+        }
+      } catch (_) {
+        // Not JSON; treat the whole body as the id below.
+      }
+      encryptedBlobId ??=
+          uploadResp.body.trim().isNotEmpty ? uploadResp.body.trim() : null;
+      if (encryptedBlobId == null || encryptedBlobId.isEmpty) return false;
+
+      // Step 3 — attach the uploaded image to the playlist.
+      final response = await _request('browse/edit_playlist', {
+        'playlistId': cleanId,
+        'actions': [
+          {
+            'action': 'ACTION_SET_CUSTOM_THUMBNAIL',
+            'addedCustomThumbnail': {
+              'imageKey': {
+                'type': 'PLAYLIST_IMAGE_TYPE_CUSTOM_THUMBNAIL',
+                'name': 'studio_square_thumbnail',
+              },
+              'playlistScottyEncryptedBlobId': encryptedBlobId,
+            },
+          },
+        ],
+      }, authenticated: true);
+
+      return response != null;
+    } catch (e) {
+      if (kDebugMode) print('Playlist image upload failed: $e');
+      return false;
+    }
+  }
+
+  // ============ YOUTUBE MUSIC RADIO / WATCH PLAYLIST ============
+
+  /// Get YouTube Music radio queue (Up Next) for a video
+  /// This is the PROPER way to get radio - uses the "next" endpoint
+  /// Returns tracks that YouTube Music would actually play in its queue
+  Future<List<Track>> getWatchPlaylist(
+    String videoId, {
+    String? playlistId,
+    int limit = 25,
+  }) async {
+    // Use the "next" endpoint which returns the watch queue
+    // For radio mode, we need to provide a radio mix playlist ID
+    // YouTube Music radio playlist IDs start with "RDAMVM" + videoId
+    final radioPlaylistId = playlistId ?? 'RDAMVM$videoId';
+
+    final body = <String, dynamic>{
+      'videoId': videoId,
+      'playlistId': radioPlaylistId,
+      'isAudioOnly': true,
+      'params': 'wAEB', // Parameter for autoplay/radio mode
+    };
+
+    if (kDebugMode) {
+      print(
+        'InnerTube: Fetching watch playlist for $videoId with playlist $radioPlaylistId',
+      );
+    }
+
+    final response = await _request(
+      'next',
+      body,
+      authenticated: isAuthenticated,
+    );
+
+    if (response == null) {
+      if (kDebugMode) {
+        print('InnerTube: getWatchPlaylist got null response');
+      }
+      return [];
+    }
+    return _parseWatchPlaylist(response, videoId, limit);
+  }
+
+  /// Get the actual YouTube Music "Related" tab content for a video.
+  Future<WatchRelatedContent> getWatchRelatedContent(
+    String videoId, {
+    String? playlistId,
+    int limitPerShelf = 12,
+  }) async {
+    final languageCode = requestLanguageCodeForLocale(
+      await _resolveRequestLocale(),
+    );
+    final radioPlaylistId = playlistId ?? 'RDAMVM$videoId';
+
+    final body = <String, dynamic>{
+      'videoId': videoId,
+      'playlistId': radioPlaylistId,
+      'isAudioOnly': true,
+      'params': 'wAEB',
+    };
+
+    var response = await _request(
+      'next',
+      body,
+      authenticated: isAuthenticated,
+    );
+
+    // Fallback for podcast episodes or single videos that don't have automated radio
+    if (response == null || _extractWatchRelatedBrowseId(response) == null) {
+      final retryResp = await _request(
+        'next',
+        {'videoId': videoId},
+        authenticated: isAuthenticated,
+      );
+      if (retryResp != null) {
+        response = retryResp;
+      }
+    }
+
+    if (response == null) {
+      return WatchRelatedContent.empty;
+    }
+
+    final relatedBrowseId = _extractWatchRelatedBrowseId(response);
+    if (relatedBrowseId != null) {
+      final relatedResponse = await _request('browse', {
+        'browseId': relatedBrowseId,
+      }, authenticated: isAuthenticated);
+
+      if (relatedResponse != null) {
+        var relatedContent = _parseWatchRelatedBrowseContent(
+          relatedResponse,
+          videoId,
+          limitPerShelf,
+        );
+        if (!relatedContent.hasAboutSection && languageCode != 'en') {
+          final englishAboutContent = await _fetchEnglishRelatedAboutContent(
+            relatedBrowseId,
+            videoId,
+            limitPerShelf,
+          );
+          relatedContent = _mergeRelatedAboutContent(
+            relatedContent,
+            englishAboutContent,
+          );
+        }
+        if (!relatedContent.isEmpty) {
+          return relatedContent;
+        }
+      }
+    }
+
+    var fallbackContent = _parseWatchRelatedContent(response, videoId, limitPerShelf);
+    if (!fallbackContent.hasAboutSection && languageCode != 'en') {
+      final englishRelatedBrowseId = await _fetchEnglishRelatedBrowseId(videoId, radioPlaylistId);
+      if (englishRelatedBrowseId != null) {
+        final englishAboutContent = await _fetchEnglishRelatedAboutContent(
+          englishRelatedBrowseId,
+          videoId,
+          limitPerShelf,
+        );
+        fallbackContent = _mergeRelatedAboutContent(fallbackContent, englishAboutContent);
+      }
+    }
+
+    if (fallbackContent.isEmpty) {
+      final queueTracks = _parseWatchPlaylist(response, videoId, limitPerShelf);
+      if (queueTracks.isNotEmpty) {
+        final items = queueTracks
+            .map(
+              (t) => HomeShelfItem(
+                id: t.id,
+                title: t.title,
+                subtitle: t.artist,
+                thumbnailUrl: t.thumbnailUrl,
+                itemType: HomeShelfItemType.song,
+                videoId: t.id,
+                artistId: t.artistId,
+                album: t.album,
+                albumId: t.albumId,
+                duration: t.duration,
+                isExplicit: t.isExplicit,
+              ),
+            )
+            .toList();
+        return WatchRelatedContent(
+          shelves: [
+            HomeShelf(
+              id: 'related_queue',
+              title: 'Recommended & Up Next',
+              type: HomeShelfType.quickPicks,
+              items: items,
+            ),
+          ],
+        );
+      }
+    }
+
+    return fallbackContent;
+  }
+
+  /// Parse the watch playlist response to extract tracks
+  List<Track> _parseWatchPlaylist(
+    Map<String, dynamic> response,
+    String currentVideoId,
+    int limit,
+  ) {
+    try {
+      final tracks = <Track>[];
+
+      // Debug: print top-level keys
+      if (kDebugMode) {
+        print('WatchPlaylist: Response keys: ${response.keys.toList()}');
+      }
+
+      // Navigate to playlist panel renderer
+      // Path: contents.singleColumnMusicWatchNextResultsRenderer.tabbedRenderer
+      //       .watchNextTabbedResultsRenderer.tabs[0].tabRenderer.content
+      //       .musicQueueRenderer.content.playlistPanelRenderer.contents
+      final tabs =
+          _navigateJson(response, [
+                'contents',
+                'singleColumnMusicWatchNextResultsRenderer',
+                'tabbedRenderer',
+                'watchNextTabbedResultsRenderer',
+                'tabs',
+              ])
+              as List?;
+
+      if (tabs == null || tabs.isEmpty) {
+        if (kDebugMode) {
+          print('WatchPlaylist: No tabs found in standard path');
+        }
+        // Try alternative path for continuationContents
+        final continuationContents = response['continuationContents'];
+        if (continuationContents != null) {
+          final playlistPanelContinuation =
+              continuationContents['playlistPanelContinuation'];
+          if (playlistPanelContinuation != null) {
+            final contents =
+                playlistPanelContinuation['contents'] as List? ?? [];
+            if (kDebugMode) {
+              print(
+                'WatchPlaylist: Found ${contents.length} items in continuation',
+              );
+            }
+            for (final item in contents) {
+              if (item['automixPreviewVideoRenderer'] != null) continue;
+              final videoRenderer = item['playlistPanelVideoRenderer'];
+              if (videoRenderer == null) continue;
+              final track = _parsePlaylistPanelVideo(videoRenderer);
+              if (track != null && track.id != currentVideoId) {
+                tracks.add(track);
+                if (tracks.length >= limit) break;
+              }
+            }
+            return tracks;
+          }
+        }
+        return [];
+      }
+
+      // Find the "Up Next" tab (usually first tab)
+      Map<String, dynamic>? playlistPanel;
+      for (final tab in tabs) {
+        final content = tab['tabRenderer']?['content'];
+        final musicQueueRenderer = content?['musicQueueRenderer'];
+        if (musicQueueRenderer != null) {
+          playlistPanel =
+              musicQueueRenderer['content']?['playlistPanelRenderer'];
+          break;
+        }
+      }
+
+      if (playlistPanel == null) {
+        if (kDebugMode) {
+          print('WatchPlaylist: No playlist panel found');
+        }
+        return [];
+      }
+
+      final contents = playlistPanel['contents'] as List? ?? [];
+      if (kDebugMode) {
+        print('WatchPlaylist: Found ${contents.length} items in queue');
+      }
+
+      for (final item in contents) {
+        // Skip the automix preview renderer (it's at the end for continuation)
+        if (item['automixPreviewVideoRenderer'] != null) continue;
+
+        final videoRenderer = item['playlistPanelVideoRenderer'];
+        if (videoRenderer == null) continue;
+
+        final track = _parsePlaylistPanelVideo(videoRenderer);
+        if (track != null && track.id != currentVideoId) {
+          tracks.add(track);
+          if (tracks.length >= limit) break;
+        }
+      }
+
+      if (kDebugMode) {
+        print('WatchPlaylist: Parsed ${tracks.length} tracks');
+      }
+      return tracks;
+    } catch (e, stack) {
+      if (kDebugMode) {
+        print('WatchPlaylist: Error parsing: $e');
+      }
+      if (kDebugMode) {
+        print('WatchPlaylist: Stack: $stack');
+      }
+      return [];
+    }
+  }
+
+  WatchRelatedContent _parseWatchRelatedContent(
+    Map<String, dynamic> response,
+    String currentVideoId,
+    int limitPerShelf,
+  ) {
+    try {
+      final tabs =
+          _navigateJson(response, [
+                'contents',
+                'singleColumnMusicWatchNextResultsRenderer',
+                'tabbedRenderer',
+                'watchNextTabbedResultsRenderer',
+                'tabs',
+              ])
+              as List?;
+
+      if (tabs == null || tabs.isEmpty) {
+        return WatchRelatedContent.empty;
+      }
+
+      for (final tab in tabs) {
+        final tabRenderer = tab['tabRenderer'] as Map<String, dynamic>?;
+        if (tabRenderer == null) continue;
+
+        final content = tabRenderer['content'] as Map<String, dynamic>?;
+        if (content == null) continue;
+
+        // Skip the queue tab; we only want the actual Related tab sections.
+        if (content['musicQueueRenderer'] != null) continue;
+
+        final sectionList =
+            content['sectionListRenderer']?['contents'] as List?;
+        final sections = sectionList ?? [content];
+        return _parseWatchRelatedSections(
+          sections,
+          currentVideoId,
+          limitPerShelf,
+        );
+      }
+
+      return WatchRelatedContent.empty;
+    } catch (e) {
+      if (kDebugMode) {
+        print('WatchRelated: Error parsing: $e');
+      }
+      return WatchRelatedContent.empty;
+    }
+  }
+
+  WatchRelatedContent _parseWatchRelatedBrowseContent(
+    Map<String, dynamic> response,
+    String currentVideoId,
+    int limitPerShelf,
+  ) {
+    try {
+      final sections =
+          _navigateJson(response, [
+                'contents',
+                'sectionListRenderer',
+                'contents',
+              ])
+              as List?;
+
+      if (sections == null || sections.isEmpty) {
+        return WatchRelatedContent.empty;
+      }
+
+      return _parseWatchRelatedSections(
+        sections,
+        currentVideoId,
+        limitPerShelf,
+      );
+    } catch (e) {
+      if (kDebugMode) {
+        print('WatchRelatedBrowse: Error parsing: $e');
+      }
+      return WatchRelatedContent.empty;
+    }
+  }
+
+  WatchRelatedContent _parseWatchRelatedSections(
+    List<dynamic> rawSections,
+    String currentVideoId,
+    int limitPerShelf,
+  ) {
+    final shelves = <HomeShelf>[];
+    String? aboutTitle;
+    String? aboutDescription;
+    var shelfIndex = 0;
+
+    for (final rawSection in rawSections) {
+      final section = rawSection as Map<String, dynamic>;
+
+      final descriptionRenderer =
+          section['musicDescriptionShelfRenderer'] as Map<String, dynamic>?;
+      if (descriptionRenderer != null) {
+        aboutTitle ??= _extractText(
+          descriptionRenderer['header'] ??
+              descriptionRenderer['title'] ??
+              descriptionRenderer['subheader'],
+        );
+        aboutDescription ??=
+            _extractText(descriptionRenderer['description']) ??
+            _extractText(descriptionRenderer['subheader']) ??
+            _extractText(descriptionRenderer['footer']);
+        continue;
+      }
+
+      final shelf = _parseHomeShelf(section, shelfIndex);
+      if (shelf == null || shelf.items.isEmpty) continue;
+
+      final filteredItems = shelf.items
+          .where((item) {
+            if (item.itemType != HomeShelfItemType.song) {
+              return true;
+            }
+            final itemVideoId = item.videoId ?? item.id;
+            return itemVideoId.isNotEmpty && itemVideoId != currentVideoId;
+          })
+          .take(limitPerShelf)
+          .toList();
+
+      if (filteredItems.isEmpty) continue;
+
+      shelves.add(
+        HomeShelf(
+          id: shelf.id,
+          title: shelf.title,
+          subtitle: shelf.subtitle,
+          type: shelf.type,
+          items: filteredItems,
+          isPlayable: shelf.isPlayable,
+          playlistId: shelf.playlistId,
+          strapline: shelf.strapline,
+          headerThumbnailUrl: shelf.headerThumbnailUrl,
+          browseId: shelf.browseId,
+          params: shelf.params,
+        ),
+      );
+      shelfIndex++;
+    }
+
+    return WatchRelatedContent(
+      shelves: shelves,
+      aboutTitle: aboutTitle,
+      aboutDescription: aboutDescription,
+    );
+  }
+
+  String? _extractWatchRelatedBrowseId(Map<String, dynamic> response) {
+    final tabs =
+        _navigateJson(response, [
+              'contents',
+              'singleColumnMusicWatchNextResultsRenderer',
+              'tabbedRenderer',
+              'watchNextTabbedResultsRenderer',
+              'tabs',
+            ])
+            as List?;
+
+    if (tabs == null || tabs.isEmpty) return null;
+
+    for (final tab in tabs) {
+      final tabRenderer = tab['tabRenderer'] as Map<String, dynamic>?;
+      if (tabRenderer == null) continue;
+
+      final browseEndpoint =
+          tabRenderer['endpoint']?['browseEndpoint'] as Map<String, dynamic>?;
+      final pageType =
+          browseEndpoint?['browseEndpointContextSupportedConfigs']?['browseEndpointContextMusicConfig']?['pageType']
+              as String?;
+      if (pageType == 'MUSIC_PAGE_TYPE_TRACK_RELATED') {
+        return browseEndpoint?['browseId'] as String?;
+      }
+    }
+
+    return null;
+  }
+
+  /// Get official YouTube Music lyrics for a videoId
+  Future<String?> getLyrics(String videoId) async {
+    try {
+      final response = await _request('next', {
+        'videoId': videoId,
+        'isAudioOnly': true,
+      }, authenticated: isAuthenticated);
+
+      if (response == null) return null;
+
+      final lyricsBrowseId = _extractWatchLyricsBrowseId(response);
+      if (lyricsBrowseId == null) return null;
+
+      final lyricsResponse = await _request('browse', {
+        'browseId': lyricsBrowseId,
+      }, authenticated: isAuthenticated);
+
+      if (lyricsResponse == null) return null;
+
+      final sectionList = _navigateJson(lyricsResponse, [
+        'contents',
+        'sectionListRenderer',
+        'contents',
+      ]) as List?;
+
+      if (sectionList == null || sectionList.isEmpty) return null;
+
+      for (final item in sectionList) {
+        final shelf =
+            item['musicDescriptionShelfRenderer'] as Map<String, dynamic>?;
+        if (shelf != null) {
+          final runs =
+              _navigateJson(shelf, ['description', 'runs']) as List?;
+          if (runs != null && runs.isNotEmpty) {
+            final lyricsText =
+                runs.map((r) => r['text'] ?? '').join('').trim();
+            if (lyricsText.isNotEmpty) {
+              return lyricsText;
+            }
+          }
+        }
+      }
+      return null;
+    } catch (e) {
+      if (kDebugMode) {
+        print('InnerTube: Error fetching lyrics for $videoId: $e');
+      }
+      return null;
+    }
+  }
+
+  String? _extractWatchLyricsBrowseId(Map<String, dynamic> response) {
+    final tabs =
+        _navigateJson(response, [
+              'contents',
+              'singleColumnMusicWatchNextResultsRenderer',
+              'tabbedRenderer',
+              'watchNextTabbedResultsRenderer',
+              'tabs',
+            ])
+            as List?;
+
+    if (tabs == null || tabs.isEmpty) return null;
+
+    for (final tab in tabs) {
+      final tabRenderer = tab['tabRenderer'] as Map<String, dynamic>?;
+      if (tabRenderer == null) continue;
+
+      final browseEndpoint =
+          tabRenderer['endpoint']?['browseEndpoint'] as Map<String, dynamic>?;
+      final pageType =
+          browseEndpoint?['browseEndpointContextSupportedConfigs']?['browseEndpointContextMusicConfig']?['pageType']
+              as String?;
+      if (pageType == 'MUSIC_PAGE_TYPE_TRACK_LYRICS') {
+        return browseEndpoint?['browseId'] as String?;
+      }
+    }
+    return null;
+  }
+
+  /// Fetch YouTube video comments (top comments) for an episode/video
+  Future<List<Map<String, dynamic>>> getVideoComments(String videoId) async {
+    try {
+      // Comments only exist on regular YouTube (youtube.com WEB), not on
+      // YouTube Music (WEB_REMIX), so this uses the youtube.com InnerTube host.
+      final nextResp = await _requestYouTube('next', {'videoId': videoId});
+      if (nextResp == null) return [];
+
+      final token = _findCommentsContinuation(nextResp);
+      if (token == null) return [];
+
+      final commentsResp =
+          await _requestYouTube('next', {'continuation': token});
+      if (commentsResp == null) return [];
+
+      // Modern comments are delivered as entity payloads keyed in
+      // frameworkUpdates, referenced by commentViewModels in the render tree.
+      final comments = <Map<String, dynamic>>[];
+      final mutations = _navigateJson(commentsResp, [
+        'frameworkUpdates',
+        'entityBatchUpdate',
+        'mutations',
+      ]) as List?;
+
+      if (mutations != null) {
+        for (final m in mutations) {
+          final cp = m['payload']?['commentEntityPayload'];
+          if (cp is! Map) continue;
+          final text = cp['properties']?['content']?['content'] as String?;
+          if (text == null || text.isEmpty) continue;
+          final toolbar = cp['toolbar'] as Map?;
+          comments.add({
+            'author': cp['author']?['displayName'] as String? ?? 'User',
+            'text': text,
+            'time': cp['properties']?['publishedTime'] as String? ?? '',
+            'likes': (toolbar?['likeCountLiked'] ??
+                    toolbar?['likeCountNotliked'] ??
+                    '') as String,
+            'authorThumbnail': cp['author']?['avatarThumbnailUrl'] as String?,
+          });
+        }
+      }
+      return comments;
+    } catch (e) {
+      if (kDebugMode) {
+        print('getVideoComments error: $e');
+      }
+      return [];
+    }
+  }
+
+  /// InnerTube request against regular YouTube (youtube.com) with the WEB
+  /// client — used for data YT Music doesn't serve (comments, related videos).
+  Future<Map<String, dynamic>?> _requestYouTube(
+    String endpoint,
+    Map<String, dynamic> body,
+  ) async {
+    try {
+      final url = Uri.parse(
+        'https://www.youtube.com/youtubei/v1/$endpoint?prettyPrint=false',
+      );
+      final headers = _buildHeaders(
+        authenticated: false,
+        origin: 'https://www.youtube.com',
+        referer: 'https://www.youtube.com/',
+      );
+      final requestBody = {
+        'context': {
+          'client': {
+            'clientName': 'WEB',
+            'clientVersion': '2.20240101.00.00',
+            'hl': 'en',
+            'gl': 'US',
+          },
+          'user': <String, dynamic>{'lockedSafetyMode': false},
+        },
+        ...body,
+      };
+      final response = await http
+          .post(url, headers: headers, body: jsonEncode(requestBody))
+          .timeout(const Duration(seconds: 15));
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body) as Map<String, dynamic>;
+      }
+      return null;
+    } catch (e) {
+      if (kDebugMode) print('_requestYouTube($endpoint) failed: $e');
+      return null;
+    }
+  }
+
+  /// Related videos for an episode/video, from regular YouTube's watch-next
+  /// secondary results (YT Music's radio doesn't surface these for podcasts).
+  Future<WatchRelatedContent> getYouTubeRelated(String videoId) async {
+    try {
+      final resp = await _requestYouTube('next', {'videoId': videoId});
+      if (resp == null) return WatchRelatedContent.empty;
+
+      final results = _navigateJson(resp, [
+        'contents',
+        'twoColumnWatchNextResults',
+        'secondaryResults',
+        'secondaryResults',
+        'results',
+      ]) as List?;
+      if (results == null) return WatchRelatedContent.empty;
+
+      final items = <HomeShelfItem>[];
+      for (final r in results) {
+        final lmRaw = r['lockupViewModel'];
+        if (lmRaw is! Map) continue;
+        final lm = lmRaw.cast<String, dynamic>();
+        final vid = lm['contentId'] as String?;
+        if (vid == null || vid.isEmpty) continue;
+        final title = _navigateJson(lm, [
+          'metadata',
+          'lockupMetadataViewModel',
+          'title',
+          'content',
+        ]) as String?;
+        final sources = _navigateJson(lm, [
+          'contentImage',
+          'thumbnailViewModel',
+          'image',
+          'sources',
+        ]) as List?;
+        final thumb = (sources != null && sources.isNotEmpty)
+            ? sources.last['url'] as String?
+            : null;
+        final subtitle = _navigateJson(lm, [
+          'metadata',
+          'lockupMetadataViewModel',
+          'metadata',
+          'contentMetadataViewModel',
+          'metadataRows',
+          0,
+          'metadataParts',
+          0,
+          'text',
+          'content',
+        ]) as String?;
+        items.add(HomeShelfItem(
+          id: vid,
+          title: title ?? '',
+          subtitle: subtitle,
+          thumbnailUrl: thumb,
+          videoId: vid,
+          navigationId: vid,
+          itemType: HomeShelfItemType.video,
+        ));
+      }
+      if (items.isEmpty) return WatchRelatedContent.empty;
+      return WatchRelatedContent(shelves: [
+        HomeShelf(
+          id: 'related',
+          title: 'Related videos',
+          type: HomeShelfType.videos,
+          items: items,
+        ),
+      ]);
+    } catch (e) {
+      if (kDebugMode) print('getYouTubeRelated failed: $e');
+      return WatchRelatedContent.empty;
+    }
+  }
+
+  String? _findCommentsContinuation(dynamic node) {
+    if (node is List) {
+      for (final item in node) {
+        final res = _findCommentsContinuation(item);
+        if (res != null) return res;
+      }
+      return null;
+    }
+    if (node is! Map) return null;
+
+    // youtube.com: an itemSectionRenderer targeting the comments section holds a
+    // continuationItemRenderer whose token loads the comment threads.
+    final itemSection = node['itemSectionRenderer'];
+    if (itemSection is Map &&
+        (itemSection['targetId'] == 'comments-section' ||
+            itemSection['targetId'] == 'comment-item-section')) {
+      final token = _navigateJson(itemSection.cast<String, dynamic>(), [
+        'contents',
+        0,
+        'continuationItemRenderer',
+        'continuationEndpoint',
+        'continuationCommand',
+        'token',
+      ]) as String?;
+      if (token != null) return token;
+      final fallback = _extractContinuationToken(itemSection);
+      if (fallback != null) return fallback;
+    }
+
+    for (final value in node.values) {
+      final res = _findCommentsContinuation(value);
+      if (res != null) return res;
+    }
+    return null;
+  }
+
+  Future<String?> _fetchEnglishRelatedBrowseId(
+    String videoId,
+    String playlistId,
+  ) async {
+    final englishResponse = await _request('next', {
+      'context': _buildMusicContext(
+        languageCode: 'en',
+        countryCode: await _resolveRequestCountryCode(),
+      ),
+      'videoId': videoId,
+      'playlistId': playlistId,
+      'isAudioOnly': true,
+      'params': 'wAEB',
+    }, authenticated: isAuthenticated);
+
+    if (englishResponse == null) return null;
+    return _extractWatchRelatedBrowseId(englishResponse);
+  }
+
+  Future<WatchRelatedContent> _fetchEnglishRelatedAboutContent(
+    String relatedBrowseId,
+    String videoId,
+    int limitPerShelf,
+  ) async {
+    final englishResponse = await _request('browse', {
+      'context': _buildMusicContext(
+        languageCode: 'en',
+        countryCode: await _resolveRequestCountryCode(),
+      ),
+      'browseId': relatedBrowseId,
+    }, authenticated: isAuthenticated);
+
+    if (englishResponse == null) {
+      return WatchRelatedContent.empty;
+    }
+
+    return _parseWatchRelatedBrowseContent(
+      englishResponse,
+      videoId,
+      limitPerShelf,
+    );
+  }
+
+  WatchRelatedContent _mergeRelatedAboutContent(
+    WatchRelatedContent primary,
+    WatchRelatedContent fallback,
+  ) {
+    if (primary.hasAboutSection || !fallback.hasAboutSection) {
+      return primary;
+    }
+
+    return WatchRelatedContent(
+      shelves: primary.shelves.isNotEmpty ? primary.shelves : fallback.shelves,
+      aboutTitle: fallback.aboutTitle ?? primary.aboutTitle,
+      aboutDescription: fallback.aboutDescription ?? primary.aboutDescription,
+    );
+  }
+
+  /// Parse a playlistPanelVideoRenderer into a Track
+  Track? _parsePlaylistPanelVideo(Map<String, dynamic> renderer) {
+    try {
+      final videoId = renderer['videoId'] as String?;
+      if (videoId == null) return null;
+
+      // Get title
+      final titleRuns = renderer['title']?['runs'] as List?;
+      final title = titleRuns?.map((r) => r['text']).join() ?? 'Unknown';
+
+      // Get artist, artistId, album, albumId
+      String artist = 'Unknown Artist';
+      String? artistId;
+      String? album;
+      String? albumId;
+      Duration? parsedDuration;
+
+      final bylineRuns = renderer['longBylineText']?['runs'] as List? ?? 
+                         renderer['shortBylineText']?['runs'] as List?;
+      if (bylineRuns != null && bylineRuns.isNotEmpty) {
+        final parsed = _extractArtistInfoFromSubtitleRuns(bylineRuns);
+        artist = parsed.$1 == 'Unknown Artist' ? artist : parsed.$1;
+        artistId = parsed.$2;
+        parsedDuration = parsed.$3;
+        album = parsed.$4;
+        albumId = parsed.$5;
+      }
+
+      // Get duration (checking lengthText, lengthSeconds, fixedColumns, and byline runs)
+      Duration duration = Duration.zero;
+      final lengthTextObj = renderer['lengthText'];
+      String? durationStr;
+      if (lengthTextObj != null) {
+        durationStr = lengthTextObj['simpleText'] as String?;
+        if (durationStr == null || durationStr.isEmpty) {
+          final runs = lengthTextObj['runs'] as List?;
+          if (runs != null && runs.isNotEmpty) {
+            durationStr = runs[0]['text'] as String?;
+          }
+        }
+      }
+
+      if (durationStr == null || durationStr.isEmpty) {
+        final lengthSeconds = renderer['lengthSeconds'];
+        if (lengthSeconds != null) {
+          final secs = int.tryParse(lengthSeconds.toString());
+          if (secs != null && secs > 0) {
+            duration = Duration(seconds: secs);
+          }
+        }
+      }
+
+      if (duration == Duration.zero &&
+          (durationStr == null || durationStr.isEmpty)) {
+        final fixedColumns = renderer['fixedColumns'] as List?;
+        if (fixedColumns != null && fixedColumns.isNotEmpty) {
+          for (final col in fixedColumns) {
+            final textObj = col['fixedColumnRenderer']?['text'] ??
+                col['playlistPanelVideoFixedColumnRenderer']?['text'] ??
+                col['musicResponsiveListItemFixedColumnRenderer']?['text'];
+            if (textObj != null) {
+              final simple = textObj['simpleText'] as String?;
+              final runs = textObj['runs'] as List?;
+              final txt = simple ??
+                  (runs != null && runs.isNotEmpty
+                      ? runs[0]['text'] as String?
+                      : null);
+              if (txt != null &&
+                  RegExp(r'^\d+:\d+(:\d+)?$').hasMatch(txt.trim())) {
+                durationStr = txt.trim();
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      if (duration == Duration.zero &&
+          (durationStr == null || durationStr.isEmpty)) {
+        if (bylineRuns != null) {
+          for (final run in bylineRuns) {
+            final txt = (run['text'] as String?)?.trim();
+            if (txt != null && RegExp(r'^\d+:\d+(:\d+)?$').hasMatch(txt)) {
+              durationStr = txt;
+              break;
+            }
+          }
+        }
+      }
+
+      if (duration == Duration.zero &&
+          durationStr != null &&
+          durationStr.isNotEmpty) {
+        duration = _parseDuration(durationStr);
+      }
+      
+      if (duration == Duration.zero && parsedDuration != null) {
+        duration = parsedDuration;
+      }
+
+      // Get thumbnail
+      final thumbnails = renderer['thumbnail']?['thumbnails'] as List?;
+      String? thumbnailUrl;
+      if (thumbnails != null && thumbnails.isNotEmpty) {
+        thumbnailUrl = thumbnails.last['url'] as String?;
+      }
+      
+      final isExplicit = renderer.toString().contains('MUSIC_EXPLICIT_BADGE');
+
+      return Track(
+        id: videoId,
+        title: title,
+        artist: artist,
+        artistId: artistId ?? '',
+        album: album,
+        albumId: albumId,
+        duration: duration,
+        thumbnailUrl: thumbnailUrl,
+        isExplicit: isExplicit,
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // ============ SEARCH ============
+
+  /// Search YouTube Music
+  Future<SearchResults> search(String query, {String? filter}) async {
+    final params = filter != null ? {'params': filter} : <String, String>{};
+
+    final response = await _request('search', {
+      'query': query,
+      ...params,
+    }, authenticated: isAuthenticated);
+
+    if (response == null) return SearchResults.empty(query);
+    return _parseSearchResults(response, query);
+  }
+
+  /// Get search suggestions
+  Future<List<String>> getSearchSuggestions(String query) async {
+    final response = await _request('music/get_search_suggestions', {
+      'input': query,
+    });
+
+    if (response == null) return [];
+
+    try {
+      final contents = response['contents'] as List?;
+      if (contents == null) return [];
+
+      final suggestions = <String>[];
+      for (final item in contents) {
+        final runs =
+            item['searchSuggestionsSectionRenderer']?['contents'] as List?;
+        if (runs != null) {
+          for (final run in runs) {
+            final suggestion =
+                run['searchSuggestionRenderer']?['suggestion']?['runs'];
+            if (suggestion != null) {
+              final text = (suggestion as List).map((r) => r['text']).join();
+              suggestions.add(text);
+            }
+          }
+        }
+      }
+      return suggestions;
+    } catch (e) {
+      return [];
+    }
+  }
+
+  // ============ CONTENT ============
+
+  Future<Playlist?> _getRadioAsPlaylist(String radioId) async {
+    // A radio mix doesn't have a normal playlist header, 
+    // it just returns tracks from the `next` endpoint.
+    final body = <String, dynamic>{
+      'playlistId': radioId,
+      'isAudioOnly': true,
+      'params': 'wAEB',
+    };
+    final response = await _request('next', body, authenticated: isAuthenticated);
+    if (response == null) return null;
+
+    final tracks = _parseWatchPlaylist(response, '', 100);
+    if (tracks.isEmpty) return null;
+    
+    // Try to extract title from the header
+    String title = 'Mix';
+    final tabs = _navigateJson(response, [
+      'contents',
+      'singleColumnMusicWatchNextResultsRenderer',
+      'tabbedRenderer',
+      'watchNextTabbedResultsRenderer',
+      'tabs',
+    ]) as List?;
+
+    if (tabs != null && tabs.isNotEmpty) {
+      final headerTitle = tabs[0]['tabRenderer']?['content']?['musicQueueRenderer']?['content']?['playlistPanelRenderer']?['title'];
+      if (headerTitle is String) {
+        title = headerTitle;
+      }
+    }
+    
+    // Get thumbnail from the first track as fallback
+    final thumbnailUrl = tracks.first.thumbnailUrl;
+
+    return Playlist(
+      id: radioId,
+      title: title,
+      author: 'YouTube Music',
+      thumbnailUrl: thumbnailUrl,
+      tracks: tracks,
+    );
+  }
+
+  /// Get playlist details
+  Future<Playlist?> getPlaylist(String playlistId) async {
+    // If it's a radio playlist (e.g., RDMM / My Supermix), use the radio fetch logic
+    if (playlistId.startsWith('RD')) {
+      return _getRadioAsPlaylist(playlistId);
+    }
+
+    String browseId = playlistId;
+    if (!browseId.startsWith('VL') &&
+        !browseId.startsWith('MPSP') &&
+        !browseId.startsWith('MPED') &&
+        !browseId.startsWith('MPRE')) {
+      browseId = 'VL$playlistId';
+    }
+
+    final response = await _request('browse', {
+      'browseId': browseId,
+    }, authenticated: isAuthenticated);
+
+    if (response == null) return null;
+
+    // Parse first page (new parser with fallback to legacy parser)
+    final (playlistWithContinuation, continuation) =
+        _parsePlaylistDetailsWithContinuation(response, playlistId);
+    final playlist =
+        playlistWithContinuation ?? _parsePlaylistDetails(response, playlistId);
+    if (playlist == null) return null;
+
+    // Fetch remaining pages if there's a continuation.
+    // Some playlist responses place token outside the parsed shelf node.
+    String? nextContinuation =
+        continuation ??
+        _extractContinuationToken(response['contents']) ??
+        _extractContinuationToken(response['onResponseReceivedActions']) ??
+        _extractContinuationToken(response['onResponseReceivedEndpoints']) ??
+        _extractContinuationToken(response);
+    final allTracks = List<Track>.from(playlist.tracks ?? []);
+    final seenTrackIds = allTracks.map((t) => t.id).toSet();
+    final seenContinuations = <String>{};
+
+    while (nextContinuation != null &&
+        seenContinuations.add(nextContinuation)) {
+      final contResponse = await _request('browse', {
+        'continuation': nextContinuation,
+      }, authenticated: isAuthenticated);
+
+      if (contResponse == null) break;
+
+      final (moreTracks, nextCont) = _parsePlaylistContinuation(contResponse);
+      for (final track in moreTracks) {
+        if (seenTrackIds.add(track.id)) {
+          allTracks.add(track);
+        }
+      }
+      nextContinuation = nextCont;
+
+      // Safety guard against malformed continuation loops.
+      if (allTracks.length > 5000) break;
+    }
+
+    // Preserve every parsed field (including isEditable/privacy) — rebuilding a
+    // fresh Playlist here previously dropped ownership info, so owned playlists
+    // never showed the edit/reorder UI.
+    return playlist.copyWith(
+      trackCount: allTracks.length,
+      tracks: allTracks,
+    );
+  }
+
+  // ============ PODCASTS ============
+
+  /// Fetch a podcast show and its episodes. [podcastId] may be the show's
+  /// playlist id (PL…), a VL-prefixed id, or an MPSP browse id.
+  Future<Podcast?> getPodcast(String podcastId) async {
+    // Normalize to the bare id (strip MPSP / VL prefixes).
+    var pl = podcastId;
+    if (pl.startsWith('MPSP')) pl = pl.substring(4);
+    if (pl.startsWith('VL')) pl = pl.substring(2);
+
+    // Podcast SHOWS resolve with the MPSP prefix (browsing VL+PL returns an
+    // empty response). Special auto-lists — "New Episodes" (RDPN), "Episodes
+    // for Later" (SE), and library feeds (FE…) — resolve with the VL prefix.
+    final isSpecial = pl.startsWith('RDPN') ||
+        pl == 'SE' ||
+        pl.startsWith('SE') && pl.length <= 4 ||
+        pl.startsWith('FE');
+
+    Future<Podcast?> tryBrowse(String browseId) async {
+      final response = await _request('browse', {
+        'browseId': browseId,
+      }, authenticated: isAuthenticated);
+      if (response == null) return null;
+      return _parsePodcast(response, pl);
+    }
+
+    final primary = isSpecial ? 'VL$pl' : 'MPSP$pl';
+    final alt = isSpecial ? 'MPSP$pl' : 'VL$pl';
+
+    final parsed = await tryBrowse(primary);
+    if (parsed != null && parsed.episodes.isNotEmpty) return parsed;
+
+    // Fall back to the other prefix form if the first returned nothing usable.
+    final altParsed = await tryBrowse(alt);
+    if (altParsed != null && altParsed.episodes.isNotEmpty) return altParsed;
+
+    return parsed ?? altParsed;
+  }
+
+  Podcast? _parsePodcast(Map<String, dynamic> response, String playlistId) {
+    try {
+      String runsText(dynamic runs) => (runs is List)
+          ? runs.map((r) => r['text']?.toString() ?? '').join()
+          : '';
+
+      final responsiveHeader = _navigateJson(response, [
+            'contents',
+            'twoColumnBrowseResultsRenderer',
+            'tabs',
+            0,
+            'tabRenderer',
+            'content',
+            'sectionListRenderer',
+            'contents',
+            0,
+            'musicResponsiveHeaderRenderer',
+          ]) ??
+          _navigateJson(response, [
+            'contents',
+            'singleColumnBrowseResultsRenderer',
+            'tabs',
+            0,
+            'tabRenderer',
+            'content',
+            'sectionListRenderer',
+            'contents',
+            0,
+            'musicResponsiveHeaderRenderer',
+          ]) ??
+          response['header']?['musicResponsiveHeaderRenderer'];
+
+      final genericHeader = response['header']?['musicHeaderRenderer'] ??
+          response['header']?['musicDetailHeaderRenderer'];
+
+      String title = '';
+      String? author;
+      String? thumbnailUrl;
+      String? description;
+      bool saved = false;
+
+      if (responsiveHeader is Map) {
+        title = runsText(responsiveHeader['title']?['runs']);
+        author = runsText(
+          responsiveHeader['straplineTextOne']?['runs'] ??
+              responsiveHeader['subtitle']?['runs'],
+        );
+        thumbnailUrl = _extractThumbnail(
+          responsiveHeader['thumbnail']?['musicThumbnailRenderer']?['thumbnail'],
+        );
+
+        if (responsiveHeader['description'] != null) {
+          description = runsText(responsiveHeader['description']?['runs']);
+        }
+        if (description == null || description.isEmpty) {
+          final descShelf =
+              _findFirstRenderer(response, 'musicDescriptionShelfRenderer');
+          if (descShelf != null) {
+            description = runsText(descShelf['description']?['runs']);
+          }
+        }
+
+        final buttons = responsiveHeader['buttons'];
+        if (buttons is List) {
+          for (final b in buttons) {
+            final toggle = b['toggleButtonRenderer'];
+            if (toggle is Map) {
+              saved = toggle['isToggled'] == true;
+              break;
+            }
+          }
+        }
+      } else if (genericHeader is Map) {
+        title = runsText(genericHeader['title']?['runs']);
+        author = runsText(genericHeader['subtitle']?['runs']);
+        thumbnailUrl = _extractThumbnail(
+          genericHeader['thumbnail']?['musicThumbnailRenderer']?['thumbnail'],
+        );
+      }
+
+      // Default title for special library podcast playlists
+      if (title.isEmpty) {
+        if (playlistId.contains('new_episodes')) {
+          title = 'New Episodes';
+        } else if (playlistId.contains('episodes_for_later')) {
+          title = 'Episodes for Later';
+        } else {
+          title = 'Podcasts';
+        }
+      }
+
+      // Episodes live in secondaryContents, tab contents, or sectionListRenderer
+      final episodes = <Episode>[];
+      final secContents = _navigateJson(response, [
+            'contents',
+            'twoColumnBrowseResultsRenderer',
+            'secondaryContents',
+            'sectionListRenderer',
+            'contents',
+          ]) ??
+          _navigateJson(response, [
+            'contents',
+            'singleColumnBrowseResultsRenderer',
+            'tabs',
+            0,
+            'tabRenderer',
+            'content',
+            'sectionListRenderer',
+            'contents',
+          ]) ??
+          _navigateJson(response, [
+            'contents',
+            'sectionListRenderer',
+            'contents',
+          ]);
+
+      String? continuation;
+      if (secContents is List) {
+        for (final section in secContents) {
+          final shelf = section['musicShelfRenderer'] ??
+              section['musicPlaylistShelfRenderer'];
+          if (shelf is! Map) continue;
+          final items = shelf['contents'];
+          if (items is List) {
+            for (final item in items) {
+              final renderer = item['musicMultiRowListItemRenderer'] ??
+                  item['musicResponsiveListItemRenderer'];
+              if (renderer is Map) {
+                final ep = _parseEpisode(
+                  renderer.cast<String, dynamic>(),
+                  playlistId,
+                  title,
+                  author ?? '',
+                );
+                if (ep != null) {
+                  episodes.add(ep);
+                } else {
+                  // Fallback: try parsing as a track and converting to Episode
+                  final tr = _parseTrackItem({
+                    'musicResponsiveListItemRenderer': renderer,
+                  });
+                  if (tr != null && tr.id.isNotEmpty) {
+                    episodes.add(
+                      Episode(
+                        videoId: tr.id,
+                        title: tr.title,
+                        subtitle: tr.artist,
+                        duration: tr.duration,
+                        thumbnailUrl: tr.thumbnailUrl,
+                        podcastId: playlistId,
+                        podcastTitle: title,
+                        podcastAuthor: author ?? tr.artist,
+                      ),
+                    );
+                  }
+                }
+              }
+            }
+          }
+          continuation ??= _extractContinuationToken(shelf);
+        }
+      }
+
+      return Podcast(
+        id: playlistId,
+        title: title.isNotEmpty ? title : 'Podcast',
+        author: author?.isNotEmpty == true ? author : null,
+        description: (description != null && description.isNotEmpty)
+            ? description
+            : null,
+        thumbnailUrl: thumbnailUrl,
+        episodes: episodes,
+        saved: saved,
+        continuation: continuation,
+      );
+    } catch (e) {
+      if (kDebugMode) print('Error parsing podcast: $e');
+      return null;
+    }
+  }
+
+  Episode? _parseEpisode(
+    Map<String, dynamic> r,
+    String podcastId,
+    String podcastTitle,
+    String author,
+  ) {
+    try {
+      String runsText(dynamic runs) => (runs is List)
+          ? runs.map((x) => x['text']?.toString() ?? '').join()
+          : '';
+
+      final title = runsText(r['title']?['runs']);
+      final subtitle = runsText(r['subtitle']?['runs']);
+      final description = runsText(r['description']?['runs']);
+
+      String? videoId = _navigateJson(r, ['onTap', 'watchEndpoint', 'videoId'])
+          as String?;
+      videoId ??= _navigateJson(r, [
+        'overlay',
+        'musicItemThumbnailOverlayRenderer',
+        'content',
+        'musicPlayButtonRenderer',
+        'playNavigationEndpoint',
+        'watchEndpoint',
+        'videoId',
+      ]) as String?;
+      if (videoId == null || videoId.isEmpty) return null;
+
+      final thumbnailUrl = _extractThumbnail(
+        r['thumbnail']?['musicThumbnailRenderer']?['thumbnail'],
+      );
+
+      final prog = r['playbackProgress']?['musicPlaybackProgressRenderer'];
+      double progress = 0.0;
+      String? durationText;
+      if (prog is Map) {
+        final pct = prog['playbackProgressPercentage'];
+        if (pct is num) progress = (pct / 100).clamp(0.0, 1.0).toDouble();
+        final runs = prog['playbackProgressText']?['runs'];
+        if (runs is List && runs.isNotEmpty) {
+          durationText = runs.last['text']?.toString().trim();
+        }
+      }
+      final duration = _parseHumanDuration(durationText);
+
+      return Episode(
+        videoId: videoId,
+        title: title,
+        description: description.isNotEmpty ? description : null,
+        subtitle: subtitle.isNotEmpty ? subtitle : null,
+        durationText: durationText,
+        duration: duration,
+        thumbnailUrl: thumbnailUrl,
+        progress: progress,
+        podcastId: podcastId,
+        podcastTitle: podcastTitle,
+        podcastAuthor: author.isNotEmpty ? author : null,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Parse a human duration string like "58 min", "1 hr 5 min", "45 sec".
+  Duration _parseHumanDuration(String? text) {
+    if (text == null || text.isEmpty) return Duration.zero;
+    int hours = 0, minutes = 0, seconds = 0;
+    final h = RegExp(r'(\d+)\s*hr').firstMatch(text);
+    final m = RegExp(r'(\d+)\s*min').firstMatch(text);
+    final s = RegExp(r'(\d+)\s*sec').firstMatch(text);
+    if (h != null) hours = int.tryParse(h.group(1)!) ?? 0;
+    if (m != null) minutes = int.tryParse(m.group(1)!) ?? 0;
+    if (s != null) seconds = int.tryParse(s.group(1)!) ?? 0;
+    // Fallback: "mm:ss" / "hh:mm:ss"
+    if (hours == 0 && minutes == 0 && seconds == 0 && text.contains(':')) {
+      return _parseDuration(text);
+    }
+    return Duration(hours: hours, minutes: minutes, seconds: seconds);
+  }
+
+  /// Fetch more episodes for a podcast show using its continuation token.
+  Future<(List<Episode>, String?)> getPodcastContinuation({
+    required String continuationToken,
+    required String podcastId,
+    required String podcastTitle,
+    String? author,
+  }) async {
+    final response = await _request('browse', {
+      'continuation': continuationToken,
+    }, authenticated: isAuthenticated);
+    if (response == null) return (const <Episode>[], null);
+
+    final episodes = <Episode>[];
+    String? nextContinuation;
+    try {
+      final shelf = response['continuationContents']?['musicShelfContinuation'] ??
+          response['continuationContents']?['musicPlaylistShelfContinuation'];
+      if (shelf is Map) {
+        final items = shelf['contents'] as List?;
+        if (items != null) {
+          for (final item in items) {
+            final renderer = item['musicMultiRowListItemRenderer'] ??
+                item['musicResponsiveListItemRenderer'];
+            if (renderer is Map) {
+              final ep = _parseEpisode(
+                renderer.cast<String, dynamic>(),
+                podcastId,
+                podcastTitle,
+                author ?? '',
+              );
+              if (ep != null) episodes.add(ep);
+            }
+          }
+        }
+        nextContinuation = _extractContinuationToken(shelf);
+      }
+    } catch (e) {
+      if (kDebugMode) print('Error parsing podcast continuation: $e');
+    }
+    return (episodes, nextContinuation);
+  }
+
+  /// Fetch full episode details and unabridged show notes by video/browse id.
+  Future<Map<String, dynamic>?> getEpisodeDetails(String videoId) async {
+    final browseId = videoId.startsWith('MPED') ? videoId : 'MPED$videoId';
+    final response = await _request('browse', {
+      'browseId': browseId,
+    }, authenticated: isAuthenticated);
+    if (response == null) return null;
+
+    try {
+      final header = _navigateJson(response, [
+            'contents',
+            'twoColumnBrowseResultsRenderer',
+            'tabs',
+            0,
+            'tabRenderer',
+            'content',
+            'sectionListRenderer',
+            'contents',
+            0,
+            'musicResponsiveHeaderRenderer',
+          ]) ??
+          _navigateJson(response, [
+            'contents',
+            'singleColumnBrowseResultsRenderer',
+            'tabs',
+            0,
+            'tabRenderer',
+            'content',
+            'sectionListRenderer',
+            'contents',
+            0,
+            'musicResponsiveHeaderRenderer',
+          ]) ??
+          response['header']?['musicResponsiveHeaderRenderer'];
+
+      String runsText(dynamic runs) => (runs is List)
+          ? runs.map((r) => r['text']?.toString() ?? '').join()
+          : '';
+
+      String? title;
+      String? subtitle;
+      String? thumbnailUrl;
+      if (header is Map) {
+        title = runsText(header['title']?['runs']);
+        subtitle = runsText(header['subtitle']?['runs'] ?? header['straplineTextOne']?['runs']);
+        thumbnailUrl = _extractThumbnail(
+          header['thumbnail']?['musicThumbnailRenderer']?['thumbnail'],
+        );
+      }
+
+      // Full description lives in musicDescriptionShelfRenderer
+      String? description;
+      final descShelf = _findFirstRenderer(response, 'musicDescriptionShelfRenderer');
+      if (descShelf != null) {
+        description = runsText(descShelf['description']?['runs']);
+      } else if (header is Map && header['description'] != null) {
+        description = runsText(header['description']?['runs']);
+      }
+
+      return {
+        'videoId': videoId.startsWith('MPED') ? videoId.substring(4) : videoId,
+        'title': title,
+        'subtitle': subtitle,
+        'description': description,
+        'thumbnailUrl': thumbnailUrl,
+      };
+    } catch (e) {
+      if (kDebugMode) print('Error parsing episode details: $e');
+      return null;
+    }
+  }
+
+  /// Return the highest-resolution thumbnail URL from a `{thumbnails:[…]}` node.
+  String? _extractThumbnail(dynamic thumbnailNode) {
+    if (thumbnailNode is Map) {
+      final thumbs = thumbnailNode['thumbnails'];
+      if (thumbs is List && thumbs.isNotEmpty) {
+        return thumbs.last['url'] as String?;
+      }
+    }
+    return null;
+  }
+
+  /// Depth-first search for the first occurrence of a renderer key.
+  Map<String, dynamic>? _findFirstRenderer(dynamic node, String key) {
+    if (node is Map) {
+      final direct = node[key];
+      if (direct is Map) return direct.cast<String, dynamic>();
+      for (final v in node.values) {
+        final found = _findFirstRenderer(v, key);
+        if (found != null) return found;
+      }
+    } else if (node is List) {
+      for (final v in node) {
+        final found = _findFirstRenderer(v, key);
+        if (found != null) return found;
+      }
+    }
+    return null;
+  }
+
+  /// Get album details
+  Future<Album?> getAlbum(String albumId) async {
+    final response = await _request('browse', {
+      'browseId': albumId,
+    }, authenticated: isAuthenticated);
+
+    if (response == null) return null;
+    return _parseAlbumDetails(response, albumId);
+  }
+
+  /// Get artist details
+  Future<Artist?> getArtist(String channelId) async {
+    final response = await _request('browse', {
+      'browseId': channelId,
+    }, authenticated: isAuthenticated);
+
+    if (response == null) return null;
+    return _parseArtistDetails(response, channelId);
+  }
+
+  /// Browse a shelf/section by its browseId (for "See all" / "More" navigation)
+  /// Returns a list of HomeShelfItems with optional continuation token
+  /// For artist songs, params must also be provided
+  Future<BrowseShelfResult> browseShelf(
+    String browseId, {
+    String? continuationToken,
+    String? params,
+  }) async {
+    Map<String, dynamic> body;
+    if (continuationToken != null) {
+      body = {'continuation': continuationToken};
+    } else {
+      body = {'browseId': browseId};
+      if (params != null) {
+        body['params'] = params;
+      }
+    }
+
+    if (kDebugMode) {
+      print(
+        'BrowseShelf: browseId=$browseId, params=$params, continuation=${continuationToken != null}',
+      );
+    }
+
+    final response = await _request(
+      'browse',
+      body,
+      authenticated: isAuthenticated,
+    );
+
+    if (response == null) {
+      if (kDebugMode) {
+        print('BrowseShelf: Response is null');
+      }
+      return BrowseShelfResult(items: [], continuationToken: null);
+    }
+
+    return _parseBrowseShelfResult(response, browseId);
+  }
+
+  /// Get song/video details (for streaming URL)
+  Future<Map<String, dynamic>?> getPlayer(String videoId) async {
+    final response = await _request('player', {
+      'videoId': videoId,
+      'playlistId': null,
+    }, authenticated: isAuthenticated);
+
+    return response;
+  }
+
+  /// Get full track details for a specific videoId
+  Future<Track?> getSongDetails(String videoId) async {
+    try {
+      final response = await getPlayer(videoId);
+      if (response == null) return null;
+
+      final videoDetails = response['videoDetails'] as Map<String, dynamic>?;
+      if (videoDetails == null) return null;
+
+      final title = videoDetails['title'] as String? ?? 'Unknown Title';
+      final author = videoDetails['author'] as String? ?? 'Unknown Artist';
+      final lengthSeconds =
+          int.tryParse(videoDetails['lengthSeconds']?.toString() ?? '0') ?? 0;
+
+      String thumbnailUrl = 'https://img.youtube.com/vi/$videoId/hqdefault.jpg';
+      final thumbnails = videoDetails['thumbnail']?['thumbnails'] as List?;
+      if (thumbnails != null && thumbnails.isNotEmpty) {
+        final lastUrl = thumbnails.last['url'] as String?;
+        if (lastUrl != null && lastUrl.isNotEmpty) {
+          thumbnailUrl = lastUrl;
+        }
+      }
+
+      return Track(
+        id: videoId,
+        title: title,
+        artist: author,
+        thumbnailUrl: thumbnailUrl,
+        duration: Duration(seconds: lengthSeconds),
+      );
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error getting song details for $videoId: $e');
+      }
+      return null;
+    }
+  }
+
+  // Cache for player.js decryption function
+  String? _cachedPlayerJs;
+  List<String>? _cachedDecryptionSteps;
+
+  // SharedPreferences keys for signature cipher persistence
+  static const String _kDecryptionStepsKey = 'signature_decryption_steps';
+  static const String _kDecryptionStepsCachedAtKey =
+      'signature_decryption_cached_at';
+  static const int _decryptionStepsTtlHours = 24;
+
+  /// Decode a signatureCipher to get the actual stream URL
+  Future<String?> _decodeSignatureCipher(String signatureCipher) async {
+    try {
+      // Parse the cipher parameters
+      final params = Uri.splitQueryString(signatureCipher);
+      final scrambledSig = params['s'];
+      final sigParam = params['sp'] ?? 'signature';
+      final baseUrl = params['url'];
+
+      if (scrambledSig == null || baseUrl == null) {
+        if (kDebugMode) {
+          print('Auth: Invalid signatureCipher format');
+        }
+        return null;
+      }
+
+      // Get decryption steps from player.js
+      final steps = await _getDecryptionSteps();
+      if (steps == null || steps.isEmpty) {
+        if (kDebugMode) {
+          print('Auth: Could not get decryption steps');
+        }
+        return null;
+      }
+
+      // Apply decryption
+      final decodedSig = _decryptSignature(scrambledSig, steps);
+
+      // Build final URL
+      final decodedUrl =
+          '$baseUrl&$sigParam=${Uri.encodeComponent(decodedSig)}';
+      return decodedUrl;
+    } catch (e) {
+      if (kDebugMode) {
+        print('Auth: Signature decoding failed: $e');
+      }
+      return null;
+    }
+  }
+
+  /// Get decryption steps from YouTube's player.js
+  /// Persists to SharedPreferences for 24 hours
+  Future<List<String>?> _getDecryptionSteps() async {
+    // Check in-memory cache first
+    if (_cachedDecryptionSteps != null) {
+      return _cachedDecryptionSteps;
+    }
+
+    // Check SharedPreferences cache
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final cachedStepsJson = prefs.getString(_kDecryptionStepsKey);
+      final cachedAtStr = prefs.getString(_kDecryptionStepsCachedAtKey);
+
+      if (cachedStepsJson != null && cachedAtStr != null) {
+        final cachedAt = DateTime.tryParse(cachedAtStr);
+        if (cachedAt != null) {
+          final age = DateTime.now().difference(cachedAt);
+          if (age.inHours < _decryptionStepsTtlHours) {
+            final steps = (jsonDecode(cachedStepsJson) as List).cast<String>();
+            if (steps.isNotEmpty) {
+              if (kDebugMode) {
+                print(
+                  'Auth: Loaded ${steps.length} decryption steps from cache (${age.inMinutes}min old)',
+                );
+              }
+              _cachedDecryptionSteps = steps;
+              return steps;
+            }
+          } else {
+            if (kDebugMode) {
+              print(
+                'Auth: Cached decryption steps expired (${age.inHours}h old)',
+              );
+            }
+          }
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Auth: Failed to load cached decryption steps: $e');
+      }
+    }
+
+    try {
+      // First get the player.js URL from YouTube
+      final embedResponse = await http
+          .get(
+            Uri.parse(
+              'https://www.youtube.com/embed/dQw4w9WgXcQ',
+            ), // Any video works
+            headers: {
+              'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            },
+          )
+          .timeout(const Duration(seconds: 10));
+
+      // Find player.js URL
+      final playerJsMatch = RegExp(
+        r'"(/s/player/[^"]+/player_ias\.vflset/[^"]+/base\.js)"',
+      ).firstMatch(embedResponse.body);
+
+      if (playerJsMatch == null) {
+        // Try alternative pattern
+        final altMatch = RegExp(
+          r'/s/player/([a-zA-Z0-9_-]+)/',
+        ).firstMatch(embedResponse.body);
+        if (altMatch == null) {
+          if (kDebugMode) {
+            print('Auth: Could not find player.js URL');
+          }
+          return null;
+        }
+      }
+
+      final playerJsPath = playerJsMatch?.group(1) ?? '';
+      final playerJsUrl = 'https://www.youtube.com$playerJsPath';
+
+      if (kDebugMode) {
+        print('Auth: Fetching player.js from $playerJsUrl');
+      }
+
+      // Fetch player.js
+      final playerResponse = await http
+          .get(
+            Uri.parse(playerJsUrl),
+            headers: {
+              'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            },
+          )
+          .timeout(const Duration(seconds: 15));
+
+      _cachedPlayerJs = playerResponse.body;
+      if (kDebugMode) {
+        print('Auth: player.js length: ${_cachedPlayerJs!.length}');
+      }
+
+      // Debug: Search for signatureCipher handling code
+      final sigCipherIdx = _cachedPlayerJs!.indexOf('signatureCipher');
+      if (sigCipherIdx > 0) {
+        if (kDebugMode) {
+          print('Auth: signatureCipher found at $sigCipherIdx');
+        }
+      }
+
+      // Try to find the actual sig decryption by looking for common patterns
+      // Pattern: &&(c=XX(decodeURIComponent(c.s)),...)
+      final sigHandlerMatch = RegExp(
+        r'&&\s*\(\s*[a-z]\s*=\s*([a-zA-Z0-9$_]{2,})\s*\(\s*decodeURIComponent',
+      ).firstMatch(_cachedPlayerJs!);
+      if (sigHandlerMatch != null) {
+        if (kDebugMode) {
+          print(
+            'Auth: Possible sig handler function: ${sigHandlerMatch.group(1)}',
+          );
+        }
+      }
+
+      // Extract decryption function
+      _cachedDecryptionSteps = _extractDecryptionSteps(_cachedPlayerJs!);
+
+      // Persist to SharedPreferences
+      if (_cachedDecryptionSteps != null &&
+          _cachedDecryptionSteps!.isNotEmpty) {
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString(
+            _kDecryptionStepsKey,
+            jsonEncode(_cachedDecryptionSteps),
+          );
+          await prefs.setString(
+            _kDecryptionStepsCachedAtKey,
+            DateTime.now().toIso8601String(),
+          );
+          if (kDebugMode) {
+            print(
+              'Auth: Persisted ${_cachedDecryptionSteps!.length} decryption steps to cache',
+            );
+          }
+        } catch (e) {
+          if (kDebugMode) {
+            print('Auth: Failed to persist decryption steps: $e');
+          }
+        }
+      }
+
+      return _cachedDecryptionSteps;
+    } catch (e) {
+      if (kDebugMode) {
+        print('Auth: Failed to get player.js: $e');
+      }
+      return null;
+    }
+  }
+
+  /// Check if a name is a JavaScript built-in function
+  bool _isBuiltIn(String name) {
+    return [
+      'encodeURIComponent',
+      'decodeURIComponent',
+      'escape',
+      'unescape',
+      'parseInt',
+      'parseFloat',
+      'String',
+      'Number',
+      'Array',
+      'Object',
+    ].contains(name);
+  }
+
+  /// Extract decryption steps from player.js
+  List<String>? _extractDecryptionSteps(String playerJs) {
+    try {
+      // Find the signature decryption function name
+      // YouTube's player uses various variable names (a, m, etc.) and patterns
+
+      String? funcName;
+      String? varName; // The variable name used in the function (a, m, etc.)
+
+      // Look for the function that:
+      // 1. Takes a single argument
+      // 2. Splits it on ""
+      // 3. Applies transformations
+      // 4. Joins it back with ""
+
+      // The signature decryption function pattern has evolved.
+      // We need to find the function that's called when handling signatureCipher
+      // Look for pattern like: c.set(b,encodeURIComponent(XX(decodeURIComponent(c.get("s")))))
+      // or: XX(c)
+
+      // Method 1: Look for the encodeURIComponent call site that references the sig decryption
+      final encodePattern = RegExp(
+        r'\b([a-zA-Z0-9$_]{2,})\s*\(\s*decodeURIComponent\s*\(\s*[a-zA-Z0-9$_]+\.get\s*\(\s*"s"\s*\)\s*\)\s*\)',
+      );
+      var encMatch = encodePattern.firstMatch(playerJs);
+      if (encMatch != null) {
+        final candidate = encMatch.group(1);
+        if (candidate != null && !_isBuiltIn(candidate)) {
+          funcName = candidate;
+          if (kDebugMode) {
+            print(
+              'Auth: Found decryption function via encodeURIComponent pattern: $funcName',
+            );
+          }
+        }
+      }
+
+      // Method 2: Look for pattern set(b,XX(YY)) where XX is the function
+      if (funcName == null) {
+        final setPattern = RegExp(
+          r'\.set\s*\(\s*[a-zA-Z0-9$_]+\s*,\s*([a-zA-Z0-9$_]{2,})\s*\(\s*[a-zA-Z0-9$_]+\s*\)\s*\)',
+        );
+        for (final match in setPattern.allMatches(playerJs)) {
+          final candidate = match.group(1);
+          if (candidate != null &&
+              !_isBuiltIn(candidate) &&
+              candidate.length > 2) {
+            // Verify this function has a.split("") pattern
+            final funcPattern = RegExp(
+              '${RegExp.escape(candidate)}\\s*=\\s*function\\s*\\(\\s*[a-z]\\s*\\)\\s*\\{[a-z]\\s*=\\s*[a-z]\\.split\\s*\\(\\s*""\\s*\\)',
+            );
+            if (funcPattern.hasMatch(playerJs)) {
+              funcName = candidate;
+              if (kDebugMode) {
+                print(
+                  'Auth: Found decryption function via set() pattern: $funcName',
+                );
+              }
+              break;
+            }
+          }
+        }
+      }
+
+      // Method 3: Find functions that use the helper object pattern
+      // The signature function calls helper.method(a,N) multiple times
+      if (funcName == null) {
+        // First find a helper object with reverse/splice/swap methods
+        final helperObjPattern = RegExp(
+          r'var\s+([a-zA-Z0-9$_]{2,})\s*=\s*\{[^}]*(?:reverse|splice)[^}]*\}',
+        );
+        final helperMatch = helperObjPattern.firstMatch(playerJs);
+        if (helperMatch != null) {
+          final helperName = helperMatch.group(1)!;
+          if (kDebugMode) {
+            print('Auth: Found helper object: $helperName');
+          }
+
+          // Now find the function that uses this helper
+          final escapedHelper = RegExp.escape(helperName);
+          final userFuncPattern = RegExp(
+            '([a-zA-Z0-9\$_]{2,})\\s*=\\s*function\\s*\\(\\s*([a-z])\\s*\\)\\s*\\{[a-z]\\s*=\\s*[a-z]\\.split\\s*\\(\\s*""\\s*\\)[^}]*$escapedHelper\\.[a-zA-Z0-9\$_]+[^}]*return\\s+[a-z]\\.join\\s*\\(\\s*""\\s*\\)',
+          );
+          final userMatch = userFuncPattern.firstMatch(playerJs);
+          if (userMatch != null) {
+            funcName = userMatch.group(1);
+            varName = userMatch.group(2);
+            if (kDebugMode) {
+              print(
+                'Auth: Found decryption function that uses helper: $funcName (var: $varName)',
+              );
+            }
+          }
+        }
+      }
+
+      // Debug: show some context around split patterns
+      if (funcName == null) {
+        // More permissive pattern - find ANY function with split and join
+        // Pattern: funcName=function(x){x=x.split("");...return x.join("")}
+        // With looser whitespace requirements
+
+        // Try to find: =function(X){X=X.split("") where X is same var
+        final splitPattern = RegExp(
+          r'=\s*function\s*\(\s*([a-zA-Z])\s*\)\s*\{\s*\1\s*=\s*\1\s*\.\s*split\s*\(\s*""\s*\)',
+        );
+        final splitMatch = splitPattern.firstMatch(playerJs);
+
+        if (splitMatch != null) {
+          // Found the pattern, now find the function name before it
+          final matchStart = splitMatch.start;
+          final before = playerJs.substring(
+            max(0, matchStart - 50),
+            matchStart,
+          );
+          final nameMatch = RegExp(
+            r'([a-zA-Z0-9$_]{2,})\s*$',
+          ).firstMatch(before);
+          if (nameMatch != null) {
+            funcName = nameMatch.group(1);
+            varName = splitMatch.group(1);
+            if (kDebugMode) {
+              print(
+                'Auth: Found decryption function via split pattern: $funcName (var: $varName)',
+              );
+            }
+          }
+        }
+
+        // If still not found, try an even simpler approach
+        if (funcName == null) {
+          // Search for pattern: XX.YY(a,N) which is the helper call pattern
+          // First find a helper object with reverse/splice
+          final helperPattern = RegExp(
+            r'var\s+([a-zA-Z0-9$_]{2,})\s*=\s*\{[^}]*reverse[^}]*\}',
+          );
+          final helperMatch = helperPattern.firstMatch(playerJs);
+
+          if (helperMatch != null) {
+            final helperName = helperMatch.group(1)!;
+            if (kDebugMode) {
+              print('Auth: Found helper with reverse: $helperName');
+            }
+
+            // Now find the function that uses this helper
+            final usePattern = RegExp(
+              '([a-zA-Z0-9\$_]{2,})\\s*=\\s*function\\s*\\(\\s*([a-zA-Z])\\s*\\)[^{]*\\{[^}]*${RegExp.escape(helperName)}\\.',
+            );
+            final useMatch = usePattern.firstMatch(playerJs);
+            if (useMatch != null) {
+              funcName = useMatch.group(1);
+              varName = useMatch.group(2);
+              if (kDebugMode) {
+                print(
+                  'Auth: Found function using helper: $funcName (var: $varName)',
+                );
+              }
+            }
+          }
+        }
+
+        // Debug output
+        if (funcName == null) {
+          // Show raw patterns we're looking for
+          final rawSplit = playerJs.indexOf('=function(a){a=a.split("")');
+          if (kDebugMode) {
+            print('Auth: Raw pattern 1 at: $rawSplit');
+          }
+
+          final rawSplit2 = playerJs.indexOf('.split("")');
+          if (rawSplit2 > 0) {
+            if (kDebugMode) {
+              print('Auth: .split("") at $rawSplit2');
+            }
+            final ctx = playerJs.substring(
+              max(0, rawSplit2 - 40),
+              min(rawSplit2 + 20, playerJs.length),
+            );
+            if (kDebugMode) {
+              print('Auth: Context: $ctx');
+            }
+          }
+        }
+      }
+
+      // Alternative: search for the actual signature decryption call site
+      // Pattern: .set("sig",encodeURIComponent(XX(YY.s)))
+      // or: &&c.set(b,encodeURIComponent(XX(decodeURIComponent(c.get("s")))))
+      if (funcName == null) {
+        final callSitePattern = RegExp(
+          r'[a-zA-Z0-9$_]+\.set\s*\([^,]+,\s*encodeURIComponent\s*\(\s*([a-zA-Z0-9$_]{2,})\s*\([^)]+\)\s*\)',
+        );
+        final callMatch = callSitePattern.firstMatch(playerJs);
+        if (callMatch != null) {
+          final candidate = callMatch.group(1);
+          if (candidate != null && !_isBuiltIn(candidate)) {
+            funcName = candidate;
+            if (kDebugMode) {
+              print('Auth: Found decryption function via call site: $funcName');
+            }
+          }
+        }
+      }
+
+      if (funcName == null) {
+        if (kDebugMode) {
+          print('Auth: Could not find decryption function name');
+        }
+        return null;
+      }
+
+      // Find the function body - handle any single-letter variable name
+      final escapedName = RegExp.escape(funcName);
+
+      // Pattern that captures: funcName=function(x){...return x.join("")}
+      // Where x can be any single letter
+      final funcBodyMatch = RegExp(
+        '$escapedName\\s*=\\s*function\\s*\\(\\s*([a-zA-Z])\\s*\\)\\s*\\{(.+?)return\\s+\\1\\.join\\s*\\(\\s*""\\s*\\)',
+        dotAll: true,
+      ).firstMatch(playerJs);
+
+      if (funcBodyMatch == null) {
+        if (kDebugMode) {
+          print('Auth: Could not find function body for $funcName');
+        }
+        // Debug: show what we're looking for
+        final idx = playerJs.indexOf(funcName);
+        if (idx >= 0) {
+          if (kDebugMode) {
+            print(
+              'Auth: Found $funcName at index $idx, context: ${playerJs.substring(idx, min(idx + 100, playerJs.length))}...',
+            );
+          }
+        }
+        return null;
+      }
+
+      final actualVarName = funcBodyMatch.group(1)!;
+      final funcBody = funcBodyMatch.group(2)!;
+      if (kDebugMode) {
+        print(
+          'Auth: Found function body (var: $actualVarName, ${funcBody.length} chars)',
+        );
+      }
+      return _parseDecryptionBody(funcBody, playerJs, actualVarName);
+    } catch (e) {
+      if (kDebugMode) {
+        print('Auth: Failed to extract decryption steps: $e');
+      }
+      return null;
+    }
+  }
+
+  /// Parse the function body to extract decryption steps
+  List<String>? _parseDecryptionBody(
+    String funcBody,
+    String playerJs,
+    String varName,
+  ) {
+    // Extract the helper object name (e.g., "Xo" in "Xo.rW(a,3)")
+    // Use the actual variable name from the function
+    final helperMatch = RegExp(
+      '([a-zA-Z0-9\$_]{2,})\\.([a-zA-Z0-9\$_]+)\\s*\\(\\s*$varName\\s*,',
+    ).firstMatch(funcBody);
+    if (helperMatch == null) {
+      if (kDebugMode) {
+        print(
+          'Auth: Could not find helper object in function body (looking for var: $varName)',
+        );
+      }
+      if (kDebugMode) {
+        print(
+          'Auth: Function body sample: ${funcBody.substring(0, min(200, funcBody.length))}...',
+        );
+      }
+      return null;
+    }
+
+    final helperName = helperMatch.group(1)!;
+    if (kDebugMode) {
+      print('Auth: Found helper object: $helperName');
+    }
+
+    // Find helper object definition
+    final escapedHelper = RegExp.escape(helperName);
+    final helperDefMatch = RegExp(
+      'var $escapedHelper\\s*=\\s*\\{([\\s\\S]*?)\\};',
+    ).firstMatch(playerJs);
+
+    if (helperDefMatch == null) {
+      if (kDebugMode) {
+        print('Auth: Could not find helper object definition for $helperName');
+      }
+      return null;
+    }
+
+    final helperBody = helperDefMatch.group(1)!;
+    if (kDebugMode) {
+      print('Auth: Found helper object body (${helperBody.length} chars)');
+    }
+
+    // Parse helper methods
+    final methods = <String, String>{};
+    final methodMatches = RegExp(
+      r'([a-zA-Z0-9$_]+)\s*:\s*function\s*\([^)]*\)\s*\{([^}]+)\}',
+    ).allMatches(helperBody);
+
+    for (final match in methodMatches) {
+      final methodName = match.group(1)!;
+      final methodBody = match.group(2)!;
+
+      if (methodBody.contains('reverse')) {
+        methods[methodName] = 'reverse';
+      } else if (methodBody.contains('splice')) {
+        methods[methodName] = 'splice';
+      } else if (methodBody.contains('var c=') ||
+          methodBody.contains('var c ')) {
+        methods[methodName] = 'swap';
+      }
+    }
+
+    if (kDebugMode) {
+      print('Auth: Found ${methods.length} helper methods: $methods');
+    }
+
+    // Parse the main function calls - use the actual variable name
+    final steps = <String>[];
+    final callMatches = RegExp(
+      '$escapedHelper\\.([a-zA-Z0-9\$_]+)\\s*\\(\\s*$varName\\s*,\\s*(\\d+)\\s*\\)',
+    ).allMatches(funcBody);
+
+    for (final match in callMatches) {
+      final methodName = match.group(1)!;
+      final param = match.group(2)!;
+      final operation = methods[methodName];
+
+      if (operation != null) {
+        steps.add('$operation:$param');
+      } else {
+        if (kDebugMode) {
+          print('Auth: Unknown method $methodName');
+        }
+      }
+    }
+
+    if (kDebugMode) {
+      print('Auth: Extracted ${steps.length} decryption steps: $steps');
+    }
+    return steps.isNotEmpty ? steps : null;
+  }
+
+  /// Apply decryption steps to scrambled signature
+  String _decryptSignature(String sig, List<String> steps) {
+    var chars = sig.split('');
+
+    for (final step in steps) {
+      final parts = step.split(':');
+      final operation = parts[0];
+      final param = int.tryParse(parts[1]) ?? 0;
+
+      switch (operation) {
+        case 'reverse':
+          chars = chars.reversed.toList();
+          break;
+        case 'splice':
+          chars = chars.sublist(param);
+          break;
+        case 'swap':
+          final temp = chars[0];
+          chars[0] = chars[param % chars.length];
+          chars[param % chars.length] = temp;
+          break;
+      }
+    }
+
+    return chars.join('');
+  }
+
+  /// Get audio stream URL for a video
+  /// Tries authenticated request first if logged in, then embed, then InnerTube clients
+  Future<String?> getStreamUrl(String videoId) async {
+    if (kDebugMode) {
+      print(
+        'Stream: Getting URL for $videoId (authenticated: $isAuthenticated)',
+      );
+    }
+
+    // If authenticated, try authenticated request first (most reliable)
+    if (isAuthenticated) {
+      final authUrl = await _getAuthenticatedStreamUrl(videoId);
+      if (authUrl != null) {
+        return authUrl;
+      }
+    }
+
+    // Try embed approach (bypasses some bot protection)
+    final embedUrl = await _getEmbedStreamUrl(videoId);
+    if (embedUrl != null) {
+      return embedUrl;
+    }
+
+    // Fallback to direct InnerTube (may fail with bot protection)
+    return _getInnerTubeStreamUrl(videoId);
+  }
+
+  /// Get stream URL using authenticated YouTube Music request
+  Future<String?> _getAuthenticatedStreamUrl(String videoId) async {
+    if (kDebugMode) {
+      print('Auth: Trying authenticated request...');
+    }
+
+    try {
+      // Try ANDROID_MUSIC client first - it typically returns direct URLs
+      final androidMusicResult = await _tryAndroidMusicClient(videoId);
+      if (androidMusicResult != null) {
+        return androidMusicResult;
+      }
+
+      // Fallback to WEB_REMIX client
+      return await _tryWebRemixClient(videoId);
+    } catch (e) {
+      if (kDebugMode) {
+        print('Auth: Failed: $e');
+      }
+      return null;
+    }
+  }
+
+  /// Resolve a muxed (video+audio) stream URL for a video/episode, used by the
+  /// podcast video player. Uses the IOS_MUSIC client, which returns direct URLs
+  /// (no signature deciphering) for the progressive `formats` list.
+  Future<String?> getVideoStreamUrl(String videoId) async {
+    try {
+      final url = Uri.parse(
+        'https://music.youtube.com/youtubei/v1/player?key=$_apiKey',
+      );
+      final iosMusicContext = {
+        'client': {
+          'clientName': 'IOS_MUSIC',
+          'clientVersion': '6.42',
+          'deviceMake': 'Apple',
+          'deviceModel': 'iPhone14,3',
+          'hl': 'en',
+          'gl': 'US',
+          'osName': 'iOS',
+          'osVersion': '17.2.1',
+          'platform': 'MOBILE',
+        },
+        'user': <String, dynamic>{'lockedSafetyMode': false},
+      };
+
+      final response = await http
+          .post(
+            url,
+            headers: _buildHeaders(authenticated: isAuthenticated),
+            body: jsonEncode({
+              'context': iosMusicContext,
+              'videoId': videoId,
+              'racyCheckOk': true,
+              'contentCheckOk': true,
+            }),
+          )
+          .timeout(const Duration(seconds: 15));
+
+      if (response.statusCode != 200) return null;
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final streamingData = data['streamingData'] as Map<String, dynamic>?;
+      if (streamingData == null) return null;
+
+      // Progressive muxed formats carry both video and audio in one URL.
+      final formats = (streamingData['formats'] as List?) ?? const [];
+      final muxed = formats
+          .where((f) =>
+              f is Map &&
+              f['url'] != null &&
+              (f['mimeType'] as String?)?.startsWith('video/') == true)
+          .toList();
+      if (muxed.isEmpty) return null;
+      muxed.sort((a, b) =>
+          ((b['width'] as num?) ?? 0).compareTo((a['width'] as num?) ?? 0));
+      return muxed.first['url'] as String?;
+    } catch (e) {
+      if (kDebugMode) print('getVideoStreamUrl failed: $e');
+      return null;
+    }
+  }
+
+  /// Try ANDROID_MUSIC client (returns direct URLs)
+  Future<String?> _tryAndroidMusicClient(String videoId) async {
+    if (kDebugMode) {
+      print('Auth: Trying IOS_MUSIC client...');
+    }
+
+    try {
+      // Use IOS client - it typically returns direct URLs
+      final url = Uri.parse(
+        'https://music.youtube.com/youtubei/v1/player?key=$_apiKey',
+      );
+
+      final iosMusicContext = {
+        'client': {
+          'clientName': 'IOS_MUSIC',
+          'clientVersion': '6.42',
+          'deviceMake': 'Apple',
+          'deviceModel': 'iPhone14,3',
+          'hl': 'en',
+          'gl': 'US',
+          'osName': 'iOS',
+          'osVersion': '17.2.1',
+          'platform': 'MOBILE',
+        },
+        'user': <String, dynamic>{'lockedSafetyMode': false},
+      };
+
+      final response = await http
+          .post(
+            url,
+            headers: _buildHeaders(authenticated: true),
+            body: jsonEncode({
+              'context': iosMusicContext,
+              'videoId': videoId,
+              'racyCheckOk': true,
+              'contentCheckOk': true,
+            }),
+          )
+          .timeout(const Duration(seconds: 15));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final streamingData = data['streamingData'] as Map<String, dynamic>?;
+
+        if (kDebugMode) {
+          print('Auth: IOS_MUSIC: streamingData: ${streamingData != null}');
+        }
+
+        if (streamingData != null) {
+          // Check for direct URLs (IOS clients usually have them)
+          final adaptiveFormats = streamingData['adaptiveFormats'] as List?;
+          if (kDebugMode) {
+            print(
+              'Auth: IOS_MUSIC: adaptiveFormats: ${adaptiveFormats?.length}',
+            );
+          }
+
+          if (adaptiveFormats != null) {
+            final audioFormats = adaptiveFormats
+                .where(
+                  (f) =>
+                      (f['mimeType'] as String?)?.startsWith('audio/') == true,
+                )
+                .toList();
+
+            if (kDebugMode) {
+              print('Auth: IOS_MUSIC: audioFormats: ${audioFormats.length}');
+            }
+
+            if (audioFormats.isNotEmpty) {
+              audioFormats.sort(
+                (a, b) => (b['bitrate'] as int? ?? 0).compareTo(
+                  a['bitrate'] as int? ?? 0,
+                ),
+              );
+
+              final format = audioFormats.first;
+              final directUrl = format['url'] as String?;
+              final hasCipher = format['signatureCipher'] != null;
+
+              if (kDebugMode) {
+                print(
+                  'Auth: IOS_MUSIC: hasDirectUrl: ${directUrl != null}, hasCipher: $hasCipher',
+                );
+              }
+
+              if (directUrl != null) {
+                if (kDebugMode) {
+                  print(
+                    'Auth: IOS_MUSIC: Got direct audio URL (${format['bitrate']} bps)',
+                  );
+                }
+                return directUrl;
+              }
+            }
+          }
+
+          final formats = streamingData['formats'] as List?;
+          if (formats != null) {
+            for (final format in formats) {
+              final directUrl = format['url'] as String?;
+              if (directUrl != null) {
+                if (kDebugMode) {
+                  print('Auth: IOS_MUSIC: Got direct muxed URL');
+                }
+                return directUrl;
+              }
+            }
+          }
+        }
+
+        final playability = data['playabilityStatus'] as Map?;
+        if (kDebugMode) {
+          print(
+            'Auth: IOS_MUSIC status: ${playability?['status']} - ${playability?['reason'] ?? ''}',
+          );
+        }
+      } else {
+        if (kDebugMode) {
+          print('Auth: IOS_MUSIC: HTTP ${response.statusCode}');
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Auth: IOS_MUSIC failed: $e');
+      }
+    }
+
+    return null;
+  }
+
+  /// Try WEB_REMIX client (may return signatureCipher)
+  Future<String?> _tryWebRemixClient(String videoId) async {
+    if (kDebugMode) {
+      print('Auth: Trying WEB_REMIX client...');
+    }
+
+    try {
+      // First, get the signatureTimestamp from embed page
+      int sts = 20073; // Default fallback
+      try {
+        final embedResponse = await http
+            .get(
+              Uri.parse('https://www.youtube.com/embed/$videoId'),
+              headers: {
+                'User-Agent':
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              },
+            )
+            .timeout(const Duration(seconds: 10));
+
+        final stsMatch = RegExp(
+          r'"sts"\s*:\s*(\d+)',
+        ).firstMatch(embedResponse.body);
+        if (stsMatch != null) {
+          sts = int.tryParse(stsMatch.group(1)!) ?? sts;
+          if (kDebugMode) {
+            print('Auth: Using signatureTimestamp: $sts');
+          }
+        }
+      } catch (e) {
+        if (kDebugMode) {
+          print('Auth: Could not get STS, using default: $sts');
+        }
+      }
+
+      final url = Uri.parse('$_baseUrl/player?key=$_apiKey');
+
+      final response = await http
+          .post(
+            url,
+            headers: _buildHeaders(authenticated: true),
+            body: jsonEncode({
+              'context': _clientContext,
+              'videoId': videoId,
+              'playbackContext': {
+                'contentPlaybackContext': {'signatureTimestamp': sts},
+              },
+              'racyCheckOk': true,
+              'contentCheckOk': true,
+            }),
+          )
+          .timeout(const Duration(seconds: 15));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final streamingData = data['streamingData'] as Map<String, dynamic>?;
+
+        if (kDebugMode) {
+          print('Auth: streamingData keys: ${streamingData?.keys.toList()}');
+        }
+
+        if (streamingData != null) {
+          // Try adaptive formats first (audio only)
+          final adaptiveFormats = streamingData['adaptiveFormats'] as List?;
+          if (kDebugMode) {
+            print('Auth: adaptiveFormats count: ${adaptiveFormats?.length}');
+          }
+
+          if (adaptiveFormats != null && adaptiveFormats.isNotEmpty) {
+            // Find best audio stream
+            final audioFormats = adaptiveFormats
+                .where(
+                  (f) =>
+                      (f['mimeType'] as String?)?.startsWith('audio/') == true,
+                )
+                .toList();
+
+            if (kDebugMode) {
+              print('Auth: audioFormats count: ${audioFormats.length}');
+            }
+
+            if (audioFormats.isNotEmpty) {
+              // Sort by bitrate (highest first)
+              audioFormats.sort(
+                (a, b) => (b['bitrate'] as int? ?? 0).compareTo(
+                  a['bitrate'] as int? ?? 0,
+                ),
+              );
+
+              final format = audioFormats.first;
+
+              // Check for direct URL first
+              final url = format['url'] as String?;
+              if (url != null) {
+                if (kDebugMode) {
+                  print('Auth: Got audio stream (${format['bitrate']} bps)');
+                }
+                return url;
+              }
+
+              // Handle signatureCipher - decode and return URL
+              final signatureCipher = format['signatureCipher'] as String?;
+              if (signatureCipher != null) {
+                final decodedUrl = await _decodeSignatureCipher(
+                  signatureCipher,
+                );
+                if (decodedUrl != null) {
+                  if (kDebugMode) {
+                    print(
+                      'Auth: Got decoded audio stream (${format['bitrate']} bps)',
+                    );
+                  }
+                  return decodedUrl;
+                }
+              }
+            }
+          }
+
+          // Try formats (muxed streams)
+          final formats = streamingData['formats'] as List?;
+          if (formats != null && formats.isNotEmpty) {
+            for (final format in formats) {
+              final url = format['url'] as String?;
+              if (url != null) {
+                if (kDebugMode) {
+                  print('Auth: Got muxed stream');
+                }
+                return url;
+              }
+
+              // Handle signatureCipher for muxed formats too
+              final signatureCipher = format['signatureCipher'] as String?;
+              if (signatureCipher != null) {
+                final decodedUrl = await _decodeSignatureCipher(
+                  signatureCipher,
+                );
+                if (decodedUrl != null) {
+                  if (kDebugMode) {
+                    print('Auth: Got decoded muxed stream');
+                  }
+                  return decodedUrl;
+                }
+              }
+            }
+          }
+
+          // Try HLS manifest
+          final hlsUrl = streamingData['hlsManifestUrl'] as String?;
+          if (hlsUrl != null) {
+            if (kDebugMode) {
+              print('Auth: Got HLS manifest');
+            }
+            return hlsUrl;
+          }
+        } else {
+          if (kDebugMode) {
+            print('Auth: No streamingData in response');
+          }
+        }
+
+        final playabilityStatus = data['playabilityStatus'] as Map?;
+        final status = playabilityStatus?['status'] as String?;
+        final reason =
+            playabilityStatus?['reason'] as String? ??
+            playabilityStatus?['messages']?.first as String? ??
+            '';
+        if (kDebugMode) {
+          print('Auth: WEB_REMIX status: $status - $reason');
+        }
+      } else {
+        if (kDebugMode) {
+          print('Auth: WEB_REMIX request failed: ${response.statusCode}');
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Auth: WEB_REMIX failed: $e');
+      }
+    }
+
+    return null;
+  }
+
+  /// Get stream URL using YouTube embed approach
+  Future<String?> _getEmbedStreamUrl(String videoId) async {
+    if (kDebugMode) {
+      print('Embed: Trying embed approach...');
+    }
+
+    try {
+      // First, get the embed page to extract config
+      final embedUrl = 'https://www.youtube.com/embed/$videoId';
+      final embedResponse = await http
+          .get(
+            Uri.parse(embedUrl),
+            headers: {
+              'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              'Accept':
+                  'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.5',
+            },
+          )
+          .timeout(const Duration(seconds: 15));
+
+      if (embedResponse.statusCode != 200) {
+        if (kDebugMode) {
+          print('Embed: Failed to get embed page: ${embedResponse.statusCode}');
+        }
+        return null;
+      }
+
+      // Extract the sts (signature timestamp) from embed page
+      final body = embedResponse.body;
+      final stsMatch = RegExp(r'"sts"\s*:\s*(\d+)').firstMatch(body);
+      final sts = stsMatch?.group(1) ?? '20073';
+      if (kDebugMode) {
+        print('Embed: Got sts=$sts');
+      }
+
+      // Now make the player request with TV client (works better for embeds)
+      final playerUrl = Uri.parse(
+        'https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
+      );
+
+      final playerResponse = await http
+          .post(
+            playerUrl,
+            headers: {
+              'Content-Type': 'application/json',
+              'User-Agent':
+                  'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version',
+              'Origin': 'https://www.youtube.com',
+              'Referer': 'https://www.youtube.com/embed/$videoId',
+            },
+            body: jsonEncode({
+              'context': {
+                'client': {
+                  'clientName': 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+                  'clientVersion': '2.0',
+                  'hl': 'en',
+                  'gl': 'US',
+                  'clientScreen': 'EMBED',
+                },
+                'thirdParty': {
+                  'embedUrl': 'https://www.youtube.com/embed/$videoId',
+                },
+              },
+              'videoId': videoId,
+              'playbackContext': {
+                'contentPlaybackContext': {
+                  'signatureTimestamp': int.tryParse(sts) ?? 20073,
+                  'html5Preference': 'HTML5_PREF_WANTS',
+                },
+              },
+              'racyCheckOk': true,
+              'contentCheckOk': true,
+            }),
+          )
+          .timeout(const Duration(seconds: 15));
+
+      if (playerResponse.statusCode == 200) {
+        final data = jsonDecode(playerResponse.body) as Map<String, dynamic>;
+        final streamingData = data['streamingData'] as Map<String, dynamic>?;
+
+        if (streamingData != null) {
+          // Try adaptive formats first (audio only)
+          final adaptiveFormats = streamingData['adaptiveFormats'] as List?;
+          if (adaptiveFormats != null) {
+            for (final format in adaptiveFormats) {
+              final mimeType = format['mimeType'] as String? ?? '';
+              if (mimeType.startsWith('audio/')) {
+                final url = format['url'] as String?;
+                if (url != null) {
+                  if (kDebugMode) {
+                    print('Embed: Got audio stream');
+                  }
+                  return url;
+                }
+              }
+            }
+          }
+
+          // Try HLS
+          final hlsUrl = streamingData['hlsManifestUrl'] as String?;
+          if (hlsUrl != null) {
+            if (kDebugMode) {
+              print('Embed: Got HLS manifest');
+            }
+            return hlsUrl;
+          }
+        }
+
+        final playabilityStatus = data['playabilityStatus'] as Map?;
+        final status = playabilityStatus?['status'] as String?;
+        final reason =
+            playabilityStatus?['reason'] as String? ??
+            playabilityStatus?['messages']?.first as String? ??
+            'Unknown';
+        if (kDebugMode) {
+          print('Embed: Playability status: $status - $reason');
+        }
+      } else {
+        if (kDebugMode) {
+          print('Embed: Player request failed: ${playerResponse.statusCode}');
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Embed: Failed: $e');
+      }
+    }
+
+    return null;
+  }
+
+  /// Get stream URL directly from InnerTube (may fail with bot protection)
+  Future<String?> _getInnerTubeStreamUrl(String videoId) async {
+    if (kDebugMode) {
+      print('InnerTube: Trying direct API...');
+    }
+
+    // Try clients in order of reliability (based on OuterTune's findings)
+    final clients = [
+      // ANDROID_VR - Most reliable currently
+      {
+        'context': {
+          'client': {
+            'clientName': 'ANDROID_VR',
+            'clientVersion': '1.57.29',
+            'androidSdkVersion': 30,
+            'osName': 'Android',
+            'osVersion': '12',
+            'platform': 'MOBILE',
+            'hl': 'en',
+            'gl': 'US',
+          },
+          'user': <String, dynamic>{'lockedSafetyMode': false},
+        },
+        'headers': {
+          'User-Agent':
+              'com.google.android.apps.youtube.vr.oculus/1.57.29 (Linux; U; Android 12; Quest 2) gzip',
+          'X-YouTube-Client-Name': '28',
+          'X-YouTube-Client-Version': '1.57.29',
+        },
+      },
+      // ANDROID_TESTSUITE - Good fallback
+      {
+        'context': {
+          'client': {
+            'clientName': 'ANDROID_TESTSUITE',
+            'clientVersion': '1.9',
+            'androidSdkVersion': 30,
+            'osName': 'Android',
+            'osVersion': '11',
+            'platform': 'MOBILE',
+            'hl': 'en',
+            'gl': 'US',
+          },
+          'user': <String, dynamic>{'lockedSafetyMode': false},
+        },
+        'headers': {
+          'User-Agent':
+              'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip',
+          'X-YouTube-Client-Name': '30',
+          'X-YouTube-Client-Version': '1.9',
+        },
+      },
+      // TV_EMBEDDED - Another fallback
+      {
+        'context': {
+          'client': {
+            'clientName': 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+            'clientVersion': '2.0',
+            'platform': 'TV',
+            'hl': 'en',
+            'gl': 'US',
+          },
+          'thirdParty': {'embedUrl': 'https://www.youtube.com'},
+          'user': <String, dynamic>{'lockedSafetyMode': false},
+        },
+        'headers': {
+          'User-Agent':
+              'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/5.0 SmartHub/2021 TV Safari/538.1',
+          'X-YouTube-Client-Name': '85',
+          'X-YouTube-Client-Version': '2.0',
+        },
+      },
+      // IOS - Last resort
+      {
+        'context': {
+          'client': {
+            'clientName': 'IOS',
+            'clientVersion': '19.09.3',
+            'deviceModel': 'iPhone14,3',
+            'osName': 'iOS',
+            'osVersion': '17.4.1',
+            'hl': 'en',
+            'gl': 'US',
+          },
+          'user': <String, dynamic>{'lockedSafetyMode': false},
+        },
+        'headers': {
+          'User-Agent':
+              'com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 17_4_1 like Mac OS X)',
+          'X-YouTube-Client-Name': '5',
+          'X-YouTube-Client-Version': '19.09.3',
+        },
+      },
+    ];
+
+    for (var i = 0; i < clients.length; i++) {
+      final client = clients[i];
+      final clientName = (client['context'] as Map)['client']['clientName'];
+      if (kDebugMode) {
+        print('InnerTube: Trying client $clientName...');
+      }
+
+      try {
+        final url = Uri.parse(
+          'https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false',
+        );
+
+        final headers = {
+          'Content-Type': 'application/json',
+          'Origin': 'https://www.youtube.com',
+          'Referer': 'https://www.youtube.com/',
+          ...(client['headers'] as Map<String, String>),
+        };
+
+        final body = {
+          'context': client['context'],
+          'videoId': videoId,
+          'playbackContext': {
+            'contentPlaybackContext': {
+              'signatureTimestamp': 20073, // This may need updating
+            },
+          },
+          'racyCheckOk': true,
+          'contentCheckOk': true,
+        };
+
+        final response = await http.post(
+          url,
+          headers: headers,
+          body: jsonEncode(body),
+        );
+
+        if (response.statusCode == 200) {
+          final data = jsonDecode(response.body) as Map<String, dynamic>;
+
+          // Check playability
+          final playabilityStatus = data['playabilityStatus'];
+          if (playabilityStatus != null) {
+            final status = playabilityStatus['status'];
+            if (kDebugMode) {
+              print('InnerTube: $clientName playability status: $status');
+            }
+
+            if (status != 'OK') {
+              final reason = playabilityStatus['reason'] ?? 'Unknown';
+              if (kDebugMode) {
+                print('InnerTube: $clientName blocked: $reason');
+              }
+              continue; // Try next client
+            }
+          }
+
+          final streamUrl = _extractStreamUrl(data);
+          if (streamUrl != null) {
+            if (kDebugMode) {
+              print('InnerTube: Got stream URL from $clientName');
+            }
+            return streamUrl;
+          } else {
+            if (kDebugMode) {
+              print(
+                'InnerTube: $clientName returned OK but no stream URL found',
+              );
+            }
+          }
+        } else {
+          if (kDebugMode) {
+            print('InnerTube: $clientName HTTP ${response.statusCode}');
+          }
+        }
+      } catch (e) {
+        if (kDebugMode) {
+          print('InnerTube: $clientName error: $e');
+        }
+      }
+    }
+
+    if (kDebugMode) {
+      print('InnerTube: All clients failed for $videoId');
+    }
+    return null;
+  }
+
+  /// Extract best audio stream URL from player response
+  String? _extractStreamUrl(Map<String, dynamic> playerResponse) {
+    try {
+      final streamingData = playerResponse['streamingData'];
+      if (streamingData == null) {
+        if (kDebugMode) {
+          print('InnerTube: No streamingData in response');
+        }
+        return null;
+      }
+
+      // Try adaptive formats first (audio-only, better quality)
+      final adaptiveFormats = streamingData['adaptiveFormats'] as List?;
+      if (adaptiveFormats != null && adaptiveFormats.isNotEmpty) {
+        if (kDebugMode) {
+          print('InnerTube: Found ${adaptiveFormats.length} adaptive formats');
+        }
+
+        // Find audio-only streams
+        final audioStreams = adaptiveFormats.where((f) {
+          final mimeType = f['mimeType']?.toString() ?? '';
+          return mimeType.startsWith('audio/');
+        }).toList();
+
+        if (kDebugMode) {
+          print('InnerTube: Found ${audioStreams.length} audio streams');
+        }
+
+        if (audioStreams.isNotEmpty) {
+          // Sort by bitrate (highest first)
+          audioStreams.sort(
+            (a, b) => (b['bitrate'] as int? ?? 0).compareTo(
+              a['bitrate'] as int? ?? 0,
+            ),
+          );
+
+          for (final stream in audioStreams) {
+            // Direct URL (preferred)
+            if (stream['url'] != null) {
+              final url = stream['url'] as String;
+              if (kDebugMode) {
+                print(
+                  'InnerTube: Using direct URL, bitrate: ${stream['bitrate']}',
+                );
+              }
+              return url;
+            }
+
+            // Signature cipher (needs decoding - skip for now)
+            if (stream['signatureCipher'] != null) {
+              if (kDebugMode) {
+                print(
+                  'InnerTube: Stream has signatureCipher (not supported yet)',
+                );
+              }
+              continue;
+            }
+          }
+        }
+      }
+
+      // Fallback to regular formats (muxed audio+video)
+      final formats = streamingData['formats'] as List?;
+      if (formats != null && formats.isNotEmpty) {
+        if (kDebugMode) {
+          print('InnerTube: Trying ${formats.length} muxed formats');
+        }
+        for (final format in formats) {
+          if (format['url'] != null) {
+            if (kDebugMode) {
+              print('InnerTube: Using muxed format');
+            }
+            return format['url'] as String;
+          }
+        }
+      }
+
+      // Try HLS manifest as last resort
+      final hlsUrl = streamingData['hlsManifestUrl'] as String?;
+      if (hlsUrl != null) {
+        if (kDebugMode) {
+          print('InnerTube: Using HLS manifest');
+        }
+        return hlsUrl;
+      }
+
+      if (kDebugMode) {
+        print('InnerTube: No usable stream URL found');
+      }
+      return null;
+    } catch (e) {
+      if (kDebugMode) {
+        print('InnerTube: Error extracting stream URL: $e');
+      }
+      return null;
+    }
+  }
+
+  // ============ PARSERS ============
+
+  /// Parse library tracks with continuation token from initial browse response
+  (List<Track>, String?) _parseLibraryTracksWithContinuation(
+    Map<String, dynamic> response,
+  ) {
+    final tracks = <Track>[];
+    String? continuation;
+
+    try {
+      final contents =
+          _navigateJson(response, [
+                'contents',
+                'singleColumnBrowseResultsRenderer',
+                'tabs',
+                0,
+                'tabRenderer',
+                'content',
+                'sectionListRenderer',
+                'contents',
+              ])
+              as List?;
+
+      if (contents == null) return ([], null);
+
+      for (final section in contents) {
+        final musicShelf = section['musicShelfRenderer'];
+        if (musicShelf != null) {
+          final items = musicShelf['contents'] as List?;
+          if (items != null) {
+            for (final item in items) {
+              final track = _parseTrackItem(item);
+              if (track != null) tracks.add(track);
+            }
+          }
+
+          // Get continuation token
+          final continuations = musicShelf['continuations'] as List?;
+          if (continuations != null && continuations.isNotEmpty) {
+            continuation =
+                continuations[0]['nextContinuationData']?['continuation']
+                    as String?;
+          }
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing library tracks with continuation: $e');
+      }
+    }
+
+    return (tracks, continuation);
+  }
+
+  /// Parse continuation response for library tracks
+  (List<Track>, String?) _parseLibraryContinuation(
+    Map<String, dynamic> response,
+  ) {
+    final tracks = <Track>[];
+    String? continuation;
+
+    try {
+      final continuationContents =
+          response['continuationContents']?['musicShelfContinuation'];
+      if (continuationContents != null) {
+        final items = continuationContents['contents'] as List?;
+        if (items != null) {
+          for (final item in items) {
+            final track = _parseTrackItem(item);
+            if (track != null) tracks.add(track);
+          }
+        }
+
+        // Debug: Print all keys in musicShelfContinuation
+        if (kDebugMode) {
+          print(
+            'LikedSongs: musicShelfContinuation keys: ${(continuationContents as Map).keys.toList()}',
+          );
+        }
+
+        // Get next continuation token - try multiple possible locations
+        final continuations = continuationContents['continuations'] as List?;
+        if (continuations != null && continuations.isNotEmpty) {
+          if (kDebugMode) {
+            print(
+              'LikedSongs: continuations[0] keys: ${(continuations[0] as Map).keys.toList()}',
+            );
+          }
+          // Try nextContinuationData first
+          continuation =
+              continuations[0]['nextContinuationData']?['continuation']
+                  as String?;
+          // Also try reloadContinuationData
+          continuation ??=
+              continuations[0]['reloadContinuationData']?['continuation']
+                  as String?;
+        } else {
+          if (kDebugMode) {
+            print('LikedSongs: No continuations array found');
+          }
+        }
+      } else {
+        // Try alternative structure
+        final sectionListContinuation =
+            response['continuationContents']?['sectionListContinuation'];
+        if (sectionListContinuation != null) {
+          if (kDebugMode) {
+            print('LikedSongs: Found sectionListContinuation instead');
+          }
+          final contents = sectionListContinuation['contents'] as List?;
+          if (contents != null) {
+            for (final section in contents) {
+              final items = section['musicShelfRenderer']?['contents'] as List?;
+              if (items != null) {
+                for (final item in items) {
+                  final track = _parseTrackItem(item);
+                  if (track != null) tracks.add(track);
+                }
+              }
+            }
+          }
+          final continuations =
+              sectionListContinuation['continuations'] as List?;
+          if (continuations != null && continuations.isNotEmpty) {
+            continuation =
+                continuations[0]['nextContinuationData']?['continuation']
+                    as String?;
+            continuation ??=
+                continuations[0]['reloadContinuationData']?['continuation']
+                    as String?;
+          }
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing library continuation: $e');
+      }
+    }
+
+    return (tracks, continuation);
+  }
+
+  List<Track> _parseLibraryTracks(Map<String, dynamic> response) {
+    final tracks = <Track>[];
+
+    try {
+      final contents =
+          _navigateJson(response, [
+                'contents',
+                'singleColumnBrowseResultsRenderer',
+                'tabs',
+                0,
+                'tabRenderer',
+                'content',
+                'sectionListRenderer',
+                'contents',
+              ])
+              as List?;
+
+      if (contents == null) return [];
+
+      for (final section in contents) {
+        final items = section['musicShelfRenderer']?['contents'] as List?;
+        if (items != null) {
+          for (final item in items) {
+            final track = _parseTrackItem(item);
+            if (track != null) tracks.add(track);
+          }
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing library tracks: $e');
+      }
+    }
+
+    return tracks;
+  }
+
+  List<HistorySection> _parseHistorySections(Map<String, dynamic> response) {
+    final sections = <HistorySection>[];
+
+    try {
+      final contents =
+          _navigateJson(response, [
+                'contents',
+                'singleColumnBrowseResultsRenderer',
+                'tabs',
+                0,
+                'tabRenderer',
+                'content',
+                'sectionListRenderer',
+                'contents',
+              ])
+              as List?;
+
+      if (contents == null) return [];
+
+      for (final section in contents) {
+        final shelf = section['musicShelfRenderer'];
+        if (shelf == null) continue;
+        
+        // Extract section title (e.g. "Today", "Yesterday")
+        final titleRuns = shelf['title']?['runs'] as List?;
+        final title = titleRuns?.map((r) => r['text']).join() ?? 'History';
+        
+        final items = shelf['contents'] as List?;
+        final tracks = <Track>[];
+        if (items != null) {
+          for (final item in items) {
+            final track = _parseTrackItem(item);
+            if (track != null) tracks.add(track);
+          }
+        }
+        if (tracks.isNotEmpty) {
+          sections.add(HistorySection(title: title, tracks: tracks));
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing history sections: $e');
+      }
+    }
+
+    return sections;
+  }
+
+  Track? _parseTrackItem(Map<String, dynamic> item) {
+    try {
+      final renderer = item['musicResponsiveListItemRenderer'];
+      if (renderer == null) return null;
+
+      final flexColumns = renderer['flexColumns'] as List?;
+      if (flexColumns == null || flexColumns.isEmpty) return null;
+
+      // Get video ID
+      final videoId = _extractVideoIdFromTrackRenderer(renderer, flexColumns);
+
+      if (videoId == null) return null;
+
+      // Get title
+      final titleRuns =
+          flexColumns[0]['musicResponsiveListItemFlexColumnRenderer']?['text']?['runs']
+              as List?;
+      final title = titleRuns?.map((r) => r['text']).join() ?? 'Unknown';
+
+      // Get artist and artistId from second flex column
+      String artist = 'Unknown Artist';
+      String? artistId;
+      Duration? duration;
+      String? album;
+      String? albumId;
+
+      if (flexColumns.length > 1) {
+        final subtitleRuns =
+            flexColumns[1]['musicResponsiveListItemFlexColumnRenderer']?['text']?['runs']
+                as List?;
+        if (subtitleRuns != null && subtitleRuns.isNotEmpty) {
+          final parsed = _extractArtistInfoFromSubtitleRuns(subtitleRuns);
+          artist = parsed.$1;
+          artistId = parsed.$2;
+          duration = parsed.$3;
+          album = parsed.$4;
+          albumId = parsed.$5;
+        }
+      }
+
+      for (var i = 2; i < flexColumns.length; i++) {
+        final colRuns = flexColumns[i]['musicResponsiveListItemFlexColumnRenderer']?['text']?['runs'] as List?;
+        if (colRuns == null || colRuns.isEmpty) continue;
+        for (final run in colRuns) {
+          if (run is! Map) continue;
+          final text = (run['text'] as String?)?.trim();
+          if (text == null || text.isEmpty) continue;
+
+          if (_isDurationToken(text)) {
+            duration ??= _parseDuration(text);
+            continue;
+          }
+
+          if (RegExp(r'^\d+(\.\d+)?[kmb]?\s+(views|plays|view|play)$', caseSensitive: false).hasMatch(text)) {
+            continue;
+          }
+
+          if (_isMetadataTypeToken(text, hasMultipleChunks: true)) {
+            continue;
+          }
+
+          if (RegExp(r'^\d{4}$').hasMatch(text)) {
+            continue;
+          }
+
+          if (album == null) {
+            final browseEndpoint = run['navigationEndpoint']?['browseEndpoint'];
+            final pageType = (browseEndpoint?['browseEndpointContextSupportedConfigs']
+                    ?['browseEndpointContextMusicConfig']?['pageType'] ?? '')
+                .toString()
+                .toUpperCase();
+
+            if (pageType.contains('ARTIST')) continue;
+
+            album = text;
+            albumId = browseEndpoint?['browseId'] as String?;
+          }
+        }
+      }
+
+      // Get thumbnail
+      final thumbnails =
+          renderer['thumbnail']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+              as List?;
+      String? thumbnailUrl;
+      if (thumbnails != null && thumbnails.isNotEmpty) {
+        thumbnailUrl = thumbnails.last['url'] as String?;
+      }
+
+      // Get duration from fixedColumns if not found in subtitle
+      if (duration == null) {
+        final fixedColumns = renderer['fixedColumns'] as List?;
+        if (fixedColumns != null && fixedColumns.isNotEmpty) {
+          final durationText =
+              fixedColumns[0]['musicResponsiveListItemFixedColumnRenderer']?['text']?['runs']?[0]?['text']
+                  as String?;
+          if (durationText != null) {
+            duration = _parseDuration(durationText);
+          }
+        }
+      }
+
+      // Get setVideoId for playlist operations
+      final playlistItemData = renderer['playlistItemData'];
+      String? setVideoId = playlistItemData?['setVideoId'] as String?;
+      
+      if (setVideoId == null) {
+        try {
+          final overlay = renderer['overlay']?['musicItemThumbnailOverlayRenderer'];
+          final playEndpoint = overlay?['content']?['musicPlayButtonRenderer']?['playNavigationEndpoint']?['watchEndpoint'];
+          setVideoId = playEndpoint?['playlistSetVideoId'] as String?;
+        } catch (_) {}
+      }
+      
+      if (setVideoId == null) {
+        try {
+          final playEndpoint = renderer['playNavigationEndpoint']?['watchEndpoint'];
+          setVideoId = playEndpoint?['playlistSetVideoId'] as String?;
+        } catch (_) {}
+      }
+
+      // Also try finding it in the menu items (Remove from playlist action)
+      if (setVideoId == null) {
+        try {
+          final menuItems = renderer['menu']?['menuRenderer']?['items'] as List?;
+          if (menuItems != null) {
+            for (final item in menuItems) {
+              final serviceEndpoint = item['menuServiceItemRenderer']?['serviceEndpoint']?['playlistEditEndpoint'];
+              if (serviceEndpoint != null) {
+                final actions = serviceEndpoint['actions'] as List?;
+                if (actions != null && actions.isNotEmpty) {
+                  final action = actions.first;
+                  if (action['action'] == 'ACTION_REMOVE_VIDEO_BY_SET_VIDEO_ID' || action['action'] == 'ACTION_REMOVE_VIDEO') {
+                    setVideoId = action['setVideoId'] as String?;
+                    if (setVideoId != null) break;
+                  }
+                }
+              }
+            }
+          }
+        } catch (_) {}
+      }
+      
+      final isExplicit = renderer.toString().contains('MUSIC_EXPLICIT_BADGE');
+
+      return Track(
+        id: videoId,
+        title: title,
+        artist: artist,
+        artistId: artistId ?? '',
+        album: album,
+        albumId: albumId,
+        thumbnailUrl: thumbnailUrl,
+        duration: duration ?? Duration.zero,
+        isLiked: true,
+        setVideoId: setVideoId,
+        isExplicit: isExplicit,
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /// Extract video ID from different track renderer variants.
+  ///
+  /// Some album/list responses do not populate the overlay play endpoint,
+  /// so we fall back to playlistItemData and navigation endpoints.
+  String? _extractVideoIdFromTrackRenderer(dynamic renderer, List flexColumns) {
+    final overlay = renderer['overlay']?['musicItemThumbnailOverlayRenderer'];
+    final playEndpoint =
+        overlay?['content']?['musicPlayButtonRenderer']?['playNavigationEndpoint'];
+    final overlayVideoId =
+        playEndpoint?['watchEndpoint']?['videoId'] as String?;
+    if (overlayVideoId != null && overlayVideoId.isNotEmpty) {
+      return overlayVideoId;
+    }
+
+    final playlistVideoId = renderer['playlistItemData']?['videoId'] as String?;
+    if (playlistVideoId != null && playlistVideoId.isNotEmpty) {
+      return playlistVideoId;
+    }
+
+    final navVideoId =
+        renderer['navigationEndpoint']?['watchEndpoint']?['videoId'] as String?;
+    if (navVideoId != null && navVideoId.isNotEmpty) {
+      return navVideoId;
+    }
+
+    final titleRuns =
+        flexColumns[0]['musicResponsiveListItemFlexColumnRenderer']?['text']?['runs']
+            as List?;
+    if (titleRuns != null) {
+      for (final run in titleRuns) {
+        final runVideoId =
+            run['navigationEndpoint']?['watchEndpoint']?['videoId'] as String?;
+        if (runVideoId != null && runVideoId.isNotEmpty) {
+          return runVideoId;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /// Extract artist / artistId / duration from subtitle runs.
+  ///
+  /// Search and shelf subtitle runs can contain type labels, artist, album, and duration.
+  /// This extracts (artist, artistId, duration, album, albumId) using browse endpoints
+  /// and pageType detection for the creditsOf parser.
+  (String, String?, Duration?, String?, String?) _extractArtistInfoFromSubtitleRuns(List runs) {
+    final chunks = <({String text, String? browseId, String pageType})>[];
+    Duration? duration;
+    String? explicitAlbum;
+    String? explicitAlbumId;
+
+    for (final run in runs) {
+      if (run is! Map) continue;
+
+      final rawText = run['text'] as String?;
+      if (rawText == null || rawText.trim().isEmpty) continue;
+
+      final nav = run['navigationEndpoint'];
+      final browseEndpoint = nav?['browseEndpoint'];
+      final runBrowseId = browseEndpoint?['browseId'] as String?;
+      final pageType = (browseEndpoint?['browseEndpointContextSupportedConfigs']
+                  ?['browseEndpointContextMusicConfig']?['pageType'] ??
+              '')
+          .toString()
+          .toUpperCase();
+
+      if (pageType.contains('ALBUM') && explicitAlbum == null) {
+        explicitAlbum = rawText.trim();
+        explicitAlbumId = runBrowseId;
+        continue;
+      }
+
+      // Handle both proper bullets and mojibake bullets.
+      final normalizedText = rawText.replaceAll('â€¢', '•');
+      final parts = normalizedText
+          .split(RegExp(r'\s*[•·|]\s*'))
+          .map((p) => p.trim())
+          .where((p) => p.isNotEmpty);
+
+      for (final part in parts) {
+        if (_isDurationToken(part)) {
+          duration ??= _parseDuration(part);
+          continue;
+        }
+        chunks.add((text: part, browseId: runBrowseId, pageType: pageType));
+      }
+    }
+
+    final hasMultipleChunks = chunks.length > 1;
+    String artist = 'Unknown Artist';
+    String? artistId;
+    int artistChunkIdx = -1;
+
+    for (var i = 0; i < chunks.length; i++) {
+      final chunk = chunks[i];
+      if (_isMetadataTypeToken(
+        chunk.text,
+        hasMultipleChunks: hasMultipleChunks,
+      )) {
+        continue;
+      }
+      if (RegExp(r'^\d{4}$').hasMatch(chunk.text)) continue;
+      artist = chunk.text;
+      artistId = chunk.browseId;
+      artistChunkIdx = i;
+      break;
+    }
+
+    if (artist == 'Unknown Artist' && chunks.isNotEmpty) {
+      artist = chunks.first.text;
+      artistId = chunks.first.browseId;
+      artistChunkIdx = 0;
+    }
+
+    // If album was not identified by endpoint pageType, look at subsequent chunk
+    String? album = explicitAlbum;
+    String? albumId = explicitAlbumId;
+    if (album == null && artistChunkIdx >= 0) {
+      for (var j = artistChunkIdx + 1; j < chunks.length; j++) {
+        final candidate = chunks[j];
+        if (RegExp(r'^\d{4}$').hasMatch(candidate.text)) continue;
+        if (_isMetadataTypeToken(candidate.text, hasMultipleChunks: true)) continue;
+        if (RegExp(r'^\d+(\.\d+)?[kmb]?\s+(views|plays|view|play)$', caseSensitive: false)
+            .hasMatch(candidate.text)) {
+          continue;
+        }
+        album = candidate.text;
+        albumId = candidate.browseId;
+        break;
+      }
+    }
+
+    return (artist, artistId, duration, album, albumId);
+  }
+
+  bool _isDurationToken(String value) {
+    final text = value.trim();
+    return RegExp(r'^\d{1,2}:\d{2}(:\d{2})?$').hasMatch(text);
+  }
+
+  bool _isMetadataTypeToken(String value, {required bool hasMultipleChunks}) {
+    if (!hasMultipleChunks) return false;
+
+    final text = value.trim().toLowerCase().replaceFirst(RegExp(r'^#+'), '');
+    const typeTokens = {
+      'song',
+      'songs',
+      'track',
+      'tracks',
+      'video',
+      'videos',
+      'album',
+      'single',
+      'ep',
+      'playlist',
+      'playlists',
+      'artist',
+      'artists',
+      'şarkı',
+      'şarkılar',
+      'parça',
+      'parçalar',
+      'video klip',
+      'video klipler',
+      'videolar',
+      'albüm',
+      'tekli',
+      'oynatma listesi',
+      'oynatma listeleri',
+      'sanatçı',
+      'sanatçılar',
+      'песня',
+      'песни',
+      'трек',
+      'треки',
+      'видео',
+      'видеоклип',
+      'видеоклипы',
+      'альбом',
+      'сингл',
+      'плейлист',
+      'плейлисты',
+      'исполнитель',
+      'исполнители',
+      'артист',
+      'артисты',
+    };
+    return typeTokens.contains(text);
+  }
+
+  String _sanitizeSubtitleText(List runs, {String fallback = ''}) {
+    final parts = <String>[];
+
+    for (final run in runs) {
+      if (run is! Map) continue;
+
+      final rawText = run['text'] as String?;
+      if (rawText == null || rawText.trim().isEmpty) continue;
+
+      final normalizedText = rawText.replaceAll('Ã¢â‚¬Â¢', 'â€¢');
+      final splitParts = normalizedText
+          .split(RegExp(r'\s*[â€¢•·|]\s*'))
+          .map((part) => part.trim())
+          .where((part) => part.isNotEmpty);
+
+      for (final part in splitParts) {
+        if (_isDurationToken(part) ||
+            RegExp(r'^\d{4}$').hasMatch(part) ||
+            _isMetadataTypeToken(part, hasMultipleChunks: true)) {
+          continue;
+        }
+        parts.add(part);
+      }
+    }
+
+    if (parts.isNotEmpty) {
+      return parts.join(' • ');
+    }
+
+    return fallback;
+  }
+
+  List<Album> _parseLibraryAlbums(Map<String, dynamic> response) {
+    final albums = <Album>[];
+
+    try {
+      final contents =
+          _navigateJson(response, [
+                'contents',
+                'singleColumnBrowseResultsRenderer',
+                'tabs',
+                0,
+                'tabRenderer',
+                'content',
+                'sectionListRenderer',
+                'contents',
+              ])
+              as List?;
+
+      if (contents == null) return [];
+
+      for (final section in contents) {
+        final items =
+            section['gridRenderer']?['items'] as List? ??
+            section['musicShelfRenderer']?['contents'] as List?;
+
+        if (items != null) {
+          for (final item in items) {
+            final album = _parseAlbumItem(item);
+            if (album != null) albums.add(album);
+          }
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing library albums: $e');
+      }
+    }
+
+    return albums;
+  }
+
+  Album? _parseAlbumItem(Map<String, dynamic> item) {
+    try {
+      final renderer =
+          item['musicTwoRowItemRenderer'] ??
+          item['musicResponsiveListItemRenderer'];
+      if (renderer == null) return null;
+
+      // Get browse ID
+      final browseEndpoint = renderer['navigationEndpoint']?['browseEndpoint'];
+      final albumId = browseEndpoint?['browseId'] as String?;
+      if (albumId == null) return null;
+
+      // Check if this is actually an album (browseId should start with MPREb)
+      if (!albumId.startsWith('MPREb')) return null;
+
+      String title = 'Unknown Album';
+      String artist = 'Unknown Artist';
+      String? thumbnailUrl;
+
+      // Handle musicTwoRowItemRenderer (grid view)
+      if (item['musicTwoRowItemRenderer'] != null) {
+        title =
+            renderer['title']?['runs']?[0]?['text'] as String? ??
+            'Unknown Album';
+
+        final subtitle = renderer['subtitle']?['runs'] as List?;
+        if (subtitle != null && subtitle.isNotEmpty) {
+          // Skip type indicators like "Album" or "Single" and find artist name
+          for (final run in subtitle) {
+            final text = run['text'] as String?;
+            if (text != null &&
+                text != ' • ' &&
+                text != 'Album' &&
+                text != 'Single' &&
+                text != 'EP' &&
+                !RegExp(r'^\d{4}$').hasMatch(text)) {
+              // Skip year
+              artist = text;
+              break;
+            }
+          }
+        }
+
+        final thumbnails =
+            renderer['thumbnailRenderer']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+                as List?;
+        if (thumbnails != null && thumbnails.isNotEmpty) {
+          thumbnailUrl = thumbnails.last['url'] as String?;
+        }
+      }
+      // Handle musicResponsiveListItemRenderer (list view in search results)
+      else if (item['musicResponsiveListItemRenderer'] != null) {
+        final flexColumns = renderer['flexColumns'] as List?;
+        if (flexColumns != null && flexColumns.isNotEmpty) {
+          // Title is in first flex column
+          final titleRuns =
+              flexColumns[0]['musicResponsiveListItemFlexColumnRenderer']?['text']?['runs']
+                  as List?;
+          if (titleRuns != null && titleRuns.isNotEmpty) {
+            title = titleRuns.map((r) => r['text']).join();
+          }
+
+          // Artist is in second flex column
+          if (flexColumns.length > 1) {
+            final subtitleRuns =
+                flexColumns[1]['musicResponsiveListItemFlexColumnRenderer']?['text']?['runs']
+                    as List?;
+            if (subtitleRuns != null && subtitleRuns.isNotEmpty) {
+              // Find artist name - skip type indicators and separators
+              for (final run in subtitleRuns) {
+                final text = run['text'] as String?;
+                if (text != null &&
+                    text != ' • ' &&
+                    text != 'Album' &&
+                    text != 'Single' &&
+                    text != 'EP' &&
+                    !RegExp(r'^\d{4}$').hasMatch(text)) {
+                  artist = text;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        final thumbnails =
+            renderer['thumbnail']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+                as List?;
+        if (thumbnails != null && thumbnails.isNotEmpty) {
+          thumbnailUrl = thumbnails.last['url'] as String?;
+        }
+      }
+
+      return Album(
+        id: albumId,
+        title: title,
+        artist: artist,
+        thumbnailUrl: thumbnailUrl,
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  List<Playlist> _parseLibraryPlaylists(Map<String, dynamic> response) {
+    final playlists = <Playlist>[];
+
+    try {
+      final contents =
+          _navigateJson(response, [
+                'contents',
+                'singleColumnBrowseResultsRenderer',
+                'tabs',
+                0,
+                'tabRenderer',
+                'content',
+                'sectionListRenderer',
+                'contents',
+              ])
+              as List?;
+
+      if (contents == null) return [];
+
+      for (final section in contents) {
+        final items =
+            section['gridRenderer']?['items'] as List? ??
+            section['musicShelfRenderer']?['contents'] as List?;
+
+        if (items != null) {
+          for (final item in items) {
+            final playlist = _parsePlaylistItem(item);
+            if (playlist != null) playlists.add(playlist);
+          }
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing library playlists: $e');
+      }
+    }
+
+    return playlists;
+  }
+
+  Playlist? _parsePlaylistItem(Map<String, dynamic> item) {
+    try {
+      final renderer =
+          item['musicTwoRowItemRenderer'] ??
+          item['musicResponsiveListItemRenderer'];
+      if (renderer == null) return null;
+
+      // Get playlist ID
+      final browseEndpoint = renderer['navigationEndpoint']?['browseEndpoint'];
+      var playlistId = browseEndpoint?['browseId'] as String?;
+      if (playlistId == null) return null;
+
+      final pageType = browseEndpoint?['browseEndpointContextSupportedConfigs']
+          ?['browseEndpointContextMusicConfig']?['pageType'] as String?;
+      final isPodcast = playlistId.startsWith('MPSP') ||
+          playlistId.startsWith('FEmusic_library_podcasts') ||
+          pageType == 'MUSIC_PAGE_TYPE_PODCAST_SHOW_DETAIL_PAGE' ||
+          pageType == 'MUSIC_PAGE_TYPE_PODCAST_EPISODE_DETAIL_PAGE';
+
+      // Must be a playlist (VL, MPSP, or library podcasts prefix), RDCLAK (radio), or podcast show
+      if (!playlistId.startsWith('VL') &&
+          !playlistId.startsWith('RDCLAK') &&
+          !playlistId.startsWith('FEmusic_library_podcasts') &&
+          !isPodcast) {
+        return null;
+      }
+
+      // Remove VL prefix if present
+      if (playlistId.startsWith('VL')) {
+        playlistId = playlistId.substring(2);
+      }
+
+      // Get title from flexColumns or title field
+      String? title;
+      String? author;
+      int trackCount = 0;
+
+      // Try flexColumns first (search results use this)
+      final flexColumns = renderer['flexColumns'] as List?;
+      if (flexColumns != null && flexColumns.isNotEmpty) {
+        // First column is title
+        title =
+            _navigateJson(flexColumns[0], [
+                  'musicResponsiveListItemFlexColumnRenderer',
+                  'text',
+                  'runs',
+                  0,
+                  'text',
+                ])
+                as String?;
+
+        // Second column has author and track count
+        if (flexColumns.length > 1) {
+          final subtitleRuns =
+              _navigateJson(flexColumns[1], [
+                    'musicResponsiveListItemFlexColumnRenderer',
+                    'text',
+                    'runs',
+                  ])
+                  as List?;
+
+          if (subtitleRuns != null) {
+            final subtitleText = subtitleRuns.map((r) => r['text']).join();
+            // Parse author (usually first part before •)
+            if (subtitleRuns.isNotEmpty) {
+              author = subtitleRuns[0]['text'] as String?;
+              // Remove "Playlist" prefix if present
+              if (author == 'Playlist') {
+                author = subtitleRuns.length > 2
+                    ? subtitleRuns[2]['text'] as String?
+                    : null;
+              }
+            }
+            // Parse track count
+            final countMatch = RegExp(
+              r'(\d+)\s*(song|track|video|episode)',
+              caseSensitive: false,
+            ).firstMatch(subtitleText);
+            if (countMatch != null) {
+              trackCount = int.tryParse(countMatch.group(1)!) ?? 0;
+            } else {
+              // Try finding any digit in runs after the author
+              for (var i = 1; i < subtitleRuns.length; i++) {
+                final runText = (subtitleRuns[i]['text'] as String?)?.trim();
+                if (runText != null && RegExp(r'^\d+$').hasMatch(runText)) {
+                  trackCount = int.tryParse(runText) ?? 0;
+                  if (trackCount > 0) break;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Fallback to title field
+      title ??= renderer['title']?['runs']?[0]?['text'] as String?;
+      if (title == null || title == 'Unknown Playlist') {
+        return null; // Skip invalid playlists
+      }
+
+      // Get thumbnail
+      final thumbnails =
+          renderer['thumbnailRenderer']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails'] ??
+          renderer['thumbnail']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+              as List?;
+      String? thumbnailUrl;
+      if (thumbnails != null && thumbnails.isNotEmpty) {
+        thumbnailUrl = thumbnails.last['url'] as String?;
+      }
+
+      // Fallback track count from subtitle
+      if (trackCount == 0) {
+        final subtitle = renderer['subtitle']?['runs'] as List?;
+        if (subtitle != null) {
+          for (final run in subtitle) {
+            final text = run['text'] as String?;
+            if (text != null) {
+              final match = RegExp(
+                r'(\d+)\s*(song|track|video|episode)?',
+                caseSensitive: false,
+              ).firstMatch(text);
+              if (match != null) {
+                trackCount = int.tryParse(match.group(1)!) ?? 0;
+                if (trackCount > 0) break;
+              }
+            }
+          }
+        }
+      }
+
+      return Playlist(
+        id: playlistId,
+        title: title,
+        thumbnailUrl: thumbnailUrl,
+        trackCount: trackCount,
+        author: author,
+        isYTMusic: true,
+        isPodcast: isPodcast,
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  List<Artist> _parseLibraryArtists(Map<String, dynamic> response) {
+    final artists = <Artist>[];
+
+    try {
+      final contents =
+          _navigateJson(response, [
+                'contents',
+                'singleColumnBrowseResultsRenderer',
+                'tabs',
+                0,
+                'tabRenderer',
+                'content',
+                'sectionListRenderer',
+                'contents',
+              ])
+              as List?;
+
+      if (contents == null) return [];
+
+      for (final section in contents) {
+        final items = section['musicShelfRenderer']?['contents'] as List?;
+        if (items != null) {
+          for (final item in items) {
+            final artist = _parseArtistItem(item);
+            if (artist != null) artists.add(artist);
+          }
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing library artists: $e');
+      }
+    }
+
+    return artists;
+  }
+
+  Artist? _parseArtistItem(Map<String, dynamic> item) {
+    try {
+      final renderer = item['musicResponsiveListItemRenderer'];
+      if (renderer == null) return null;
+
+      // Get channel ID from navigation endpoint
+      final browseEndpoint = renderer['navigationEndpoint']?['browseEndpoint'];
+      final channelId = browseEndpoint?['browseId'] as String?;
+
+      // Artists have channel IDs starting with UC (channels) or FE (library artists)
+      if (channelId == null ||
+          (!channelId.startsWith('UC') && !channelId.startsWith('FE'))) {
+        return null;
+      }
+
+      // Get name from flex columns
+      final flexColumns = renderer['flexColumns'] as List?;
+      String name = 'Unknown Artist';
+
+      if (flexColumns != null && flexColumns.isNotEmpty) {
+        final nameRuns =
+            flexColumns[0]['musicResponsiveListItemFlexColumnRenderer']?['text']?['runs']
+                as List?;
+        if (nameRuns != null && nameRuns.isNotEmpty) {
+          name = nameRuns[0]['text'] ?? 'Unknown Artist';
+        }
+      }
+
+      // Get songs count if available (from second flex column)
+      int? songsCount;
+      if (flexColumns != null && flexColumns.length > 1) {
+        final subtitleRuns =
+            flexColumns[1]['musicResponsiveListItemFlexColumnRenderer']?['text']?['runs']
+                as List?;
+        if (subtitleRuns != null && subtitleRuns.isNotEmpty) {
+          for (final run in subtitleRuns) {
+            final text = run['text'] as String?;
+            if (text != null && text.contains('song')) {
+              // Extract number from "15 songs"
+              final match = RegExp(r'(\d+)').firstMatch(text);
+              if (match != null) {
+                songsCount = int.tryParse(match.group(1)!);
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      // Get thumbnail
+      final thumbnails =
+          renderer['thumbnail']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+              as List?;
+      String? thumbnailUrl;
+      if (thumbnails != null && thumbnails.isNotEmpty) {
+        thumbnailUrl = thumbnails.last['url'] as String?;
+      }
+
+      return Artist(
+        id: channelId,
+        name: name,
+        thumbnailUrl: thumbnailUrl,
+        songsCount: songsCount,
+        isSubscribed: true,
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  SearchResults _parseSearchResults(
+    Map<String, dynamic> response,
+    String query,
+  ) {
+    final tracks = <Track>[];
+    final albums = <Album>[];
+    final artists = <Artist>[];
+    final playlists = <Playlist>[];
+    SearchResultItem? topResult;
+
+    try {
+      // Add debug prints to figure out the JSON structure
+      if (kDebugMode) {
+        final tabs = _navigateJson(response, ['contents', 'tabbedSearchResultsRenderer', 'tabs']);
+        print('tabs is null? ${tabs == null}');
+        if (tabs != null && tabs is List && tabs.isNotEmpty) {
+           final tabRenderer = tabs[0]['tabRenderer'];
+           print('tabRenderer keys: ${tabRenderer?.keys}');
+           final content = tabRenderer?['content'];
+           print('content keys: ${content?.keys}');
+           final sectionList = content?['sectionListRenderer'];
+           print('sectionListRenderer keys: ${sectionList?.keys}');
+           final contents = sectionList?['contents'];
+           print('sectionList contents is null? ${contents == null}');
+        }
+      }
+
+      final contents =
+          _navigateJson(response, [
+                'contents',
+                'tabbedSearchResultsRenderer',
+                'tabs',
+                0,
+                'tabRenderer',
+                'content',
+                'sectionListRenderer',
+                'contents',
+              ])
+              as List?;
+
+      if (contents == null) return SearchResults.empty(query);
+
+      bool isFirstShelf = true;
+      for (final section in contents) {
+        // Check for top result card (musicCardShelfRenderer)
+        final cardShelf = section['musicCardShelfRenderer'];
+        if (cardShelf != null && topResult == null) {
+          topResult = _parseTopResultCard(cardShelf);
+          continue;
+        }
+
+        final itemSection = section['itemSectionRenderer'];
+        final shelf = section['musicShelfRenderer'];
+        
+        if (shelf == null && itemSection == null) continue;
+
+        final items = shelf?['contents'] as List? ?? itemSection?['contents'] as List?;
+        if (items == null) continue;
+
+        // Track the first item of the first shelf as a fallback top result
+        bool firstItemInShelf = isFirstShelf;
+        isFirstShelf = false;
+
+        for (final item in items) {
+          final track = _parseTrackItem(item);
+          if (track != null) {
+            tracks.add(track);
+            // Use first track as top result if no card shelf
+            if (firstItemInShelf && topResult == null) {
+              topResult = SearchResultItem.track(track);
+              firstItemInShelf = false;
+            }
+            continue;
+          }
+
+          final album = _parseAlbumItem(item);
+          if (album != null) {
+            albums.add(album);
+            if (firstItemInShelf && topResult == null) {
+              topResult = SearchResultItem.album(album);
+              firstItemInShelf = false;
+            }
+            continue;
+          }
+
+          final artist = _parseArtistItem(item);
+          if (artist != null) {
+            artists.add(artist);
+            if (firstItemInShelf && topResult == null) {
+              topResult = SearchResultItem.artist(artist);
+              firstItemInShelf = false;
+            }
+            continue;
+          }
+
+          final playlist = _parsePlaylistItem(item);
+          if (playlist != null) {
+            playlists.add(playlist);
+            if (firstItemInShelf && topResult == null) {
+              topResult = SearchResultItem.playlist(playlist);
+              firstItemInShelf = false;
+            }
+          }
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing search results: $e');
+      }
+    }
+
+    return SearchResults(
+      query: query,
+      tracks: tracks,
+      albums: albums,
+      artists: artists,
+      playlists: playlists,
+      topResult: topResult,
+    );
+  }
+
+  /// Parse the top result card from YouTube Music search
+  SearchResultItem? _parseTopResultCard(Map<String, dynamic> cardShelf) {
+    try {
+      // The card shelf can contain different types
+      final title = cardShelf['title']?['runs']?[0]?['text'] as String?;
+      if (title == null) return null;
+
+      // Get thumbnail
+      final thumbnails =
+          cardShelf['thumbnail']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+              as List?;
+      final thumbnailUrl = thumbnails?.isNotEmpty == true
+          ? thumbnails!.last['url'] as String?
+          : null;
+
+      // Get subtitle (artist/type info)
+      final subtitleRuns = cardShelf['subtitle']?['runs'] as List?;
+      final subtitle = subtitleRuns?.map((r) => r['text']).join() ?? '';
+      final subtitleArtist = _extractArtistInfoFromSubtitleRuns(
+        subtitleRuns ?? <dynamic>[],
+      ).$1;
+
+      // Get navigation endpoint to determine type
+      final browseEndpoint =
+          cardShelf['title']?['runs']?[0]?['navigationEndpoint']?['browseEndpoint'];
+      final watchEndpoint =
+          cardShelf['title']?['runs']?[0]?['navigationEndpoint']?['watchEndpoint'];
+
+      if (browseEndpoint != null) {
+        final browseId = browseEndpoint['browseId'] as String?;
+        if (browseId != null) {
+          // Artist (UC prefix)
+          if (browseId.startsWith('UC')) {
+            return SearchResultItem.artist(
+              Artist(id: browseId, name: title, thumbnailUrl: thumbnailUrl),
+            );
+          }
+          // Album (MPREb prefix)
+          if (browseId.startsWith('MPREb')) {
+            return SearchResultItem.album(
+              Album(
+                id: browseId,
+                title: title,
+                artist: subtitleArtist == 'Unknown Artist'
+                    ? subtitle
+                    : subtitleArtist,
+                thumbnailUrl: thumbnailUrl,
+              ),
+            );
+          }
+          // Playlist (VL or RDCLAK prefix) or Podcast (MPSP prefix)
+          final pageType = browseEndpoint['browseEndpointContextSupportedConfigs']
+              ?['browseEndpointContextMusicConfig']?['pageType'] as String?;
+          final isPodcast = browseId.startsWith('MPSP') ||
+              pageType == 'MUSIC_PAGE_TYPE_PODCAST_SHOW_DETAIL_PAGE' ||
+              pageType == 'MUSIC_PAGE_TYPE_PODCAST_EPISODE_DETAIL_PAGE';
+
+          if (browseId.startsWith('VL') ||
+              browseId.startsWith('RDCLAK') ||
+              isPodcast) {
+            return SearchResultItem.playlist(
+              Playlist(
+                id: browseId.startsWith('VL')
+                    ? browseId.substring(2)
+                    : browseId,
+                title: title,
+                thumbnailUrl: thumbnailUrl,
+                isPodcast: isPodcast,
+                isYTMusic: true,
+              ),
+            );
+          }
+        }
+      }
+
+      // Track (watchEndpoint)
+      if (watchEndpoint != null) {
+        final videoId = watchEndpoint['videoId'] as String?;
+        if (videoId != null) {
+          return SearchResultItem.track(
+            Track(
+              id: videoId,
+              title: title,
+              artist: subtitleArtist == 'Unknown Artist'
+                  ? subtitle
+                  : subtitleArtist,
+              duration: Duration.zero,
+              thumbnailUrl: thumbnailUrl,
+            ),
+          );
+        }
+      }
+
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /// Locate the `musicEditablePlaylistDetailHeaderRenderer`, which the API only
+  /// returns for playlists the signed-in user owns (and can therefore edit).
+  Map<String, dynamic>? _findEditablePlaylistHeader(
+    Map<String, dynamic> response,
+  ) {
+    final direct =
+        response['header']?['musicEditablePlaylistDetailHeaderRenderer'];
+    if (direct is Map<String, dynamic>) return direct;
+
+    for (final key in const [
+      'singleColumnBrowseResultsRenderer',
+      'twoColumnBrowseResultsRenderer',
+    ]) {
+      final container = _navigateJson(response, [
+        'contents',
+        key,
+        'tabs',
+        0,
+        'tabRenderer',
+        'content',
+        'sectionListRenderer',
+        'contents',
+        0,
+      ]);
+      final editable = (container is Map)
+          ? container['musicEditablePlaylistDetailHeaderRenderer']
+          : null;
+      if (editable is Map<String, dynamic>) return editable;
+    }
+    return null;
+  }
+
+  /// Read the current privacy (PUBLIC/PRIVATE/UNLISTED) from an editable header.
+  String? _extractPlaylistPrivacy(Map<String, dynamic>? editableHeader) {
+    if (editableHeader == null) return null;
+    final privacy = _navigateJson(editableHeader, [
+      'editHeader',
+      'musicPlaylistEditHeaderRenderer',
+      'privacy',
+    ]);
+    return privacy is String ? privacy : null;
+  }
+
+  Playlist? _parsePlaylistDetails(
+    Map<String, dynamic> response,
+    String playlistId,
+  ) {
+    try {
+      // Try multiple header locations (YouTube Music uses different structures)
+      final header =
+          response['header']?['musicDetailHeaderRenderer'] ??
+          response['header']?['musicEditablePlaylistDetailHeaderRenderer']?['header']?['musicDetailHeaderRenderer'] ??
+          response['header']?['musicEditablePlaylistDetailHeaderRenderer']?['header']?['musicResponsiveHeaderRenderer'] ??
+          response['header']?['musicResponsiveHeaderRenderer'];
+
+      // Also try to get header from content tabs for some playlist types
+      dynamic fallbackHeader;
+      if (header == null) {
+        final singleColContents = _navigateJson(response, [
+          'contents',
+          'singleColumnBrowseResultsRenderer',
+          'tabs',
+          0,
+          'tabRenderer',
+          'content',
+          'sectionListRenderer',
+          'contents',
+          0,
+        ]) as Map?;
+        
+        final twoColContents = _navigateJson(response, [
+          'contents',
+          'twoColumnBrowseResultsRenderer',
+          'tabs',
+          0,
+          'tabRenderer',
+          'content',
+          'sectionListRenderer',
+          'contents',
+          0,
+        ]) as Map?;
+
+        final headerContainer = singleColContents ?? twoColContents;
+        if (headerContainer != null) {
+          fallbackHeader = 
+            headerContainer['musicResponsiveHeaderRenderer'] ??
+            headerContainer['musicDetailHeaderRenderer'] ??
+            headerContainer['musicEditablePlaylistDetailHeaderRenderer']?['header']?['musicResponsiveHeaderRenderer'] ??
+            headerContainer['musicEditablePlaylistDetailHeaderRenderer']?['header']?['musicDetailHeaderRenderer'] ??
+            headerContainer['musicEditablePlaylistDetailHeaderRenderer'];
+        }
+      }
+
+      final activeHeader = header ?? fallbackHeader;
+      final editableHeader = _findEditablePlaylistHeader(response);
+
+      // Debug logging
+      if (activeHeader == null) {
+        if (kDebugMode) {
+          print('Playlist parse: No header found for $playlistId');
+        }
+        if (kDebugMode) {
+          print('Playlist parse: Response keys: ${response.keys.toList()}');
+        }
+        if (response['header'] != null) {
+          if (kDebugMode) {
+            print(
+              'Playlist parse: Header keys: ${(response['header'] as Map).keys.toList()}',
+            );
+          }
+        }
+      }
+
+      // Parse title from various locations
+      String title = 'Unknown Playlist';
+      String? description;
+      String? thumbnailUrl;
+      String? author;
+      String? authorAvatarUrl;
+      String? extraSubtitle;
+
+      if (activeHeader != null) {
+        // Standard header parsing
+        title =
+            activeHeader['title']?['runs']?[0]?['text'] as String? ??
+            (activeHeader['title']?['runs'] as List?)
+                ?.map((r) => r['text'])
+                .join() ??
+            'Unknown Playlist';
+
+        description =
+            activeHeader['description']?['runs']?[0]?['text'] as String? ??
+            (activeHeader['description']?['runs'] as List?)
+                ?.map((r) => r['text'])
+                .join();
+
+        // For musicResponsiveHeaderRenderer, description is in descriptionPreview
+        description ??=
+            (activeHeader['description']?['musicDescriptionShelfRenderer']?['description']?['runs'] as List?)
+                ?.map((r) => r['text'])
+                .join();
+        description ??=
+            (activeHeader['descriptionPreview']?['runs'] as List?)
+                ?.map((r) => r['text'])
+                .join();
+
+        // Get thumbnail
+        final thumbnails =
+            activeHeader['thumbnail']?['croppedSquareThumbnailRenderer']?['thumbnail']?['thumbnails']
+                as List? ??
+            activeHeader['thumbnail']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+                as List?;
+        if (thumbnails != null && thumbnails.isNotEmpty) {
+          thumbnailUrl = thumbnails.last['url'] as String?;
+        }
+
+        // For musicResponsiveHeaderRenderer:
+        //   subtitle = type label (e.g. "Playlist")
+        //   straplineTextOne = author name (e.g. "NotCyCo")
+        // For musicDetailHeaderRenderer:
+        //   subtitle = author name
+        //   straplineTextOne = N/A
+        final straplineRuns = activeHeader['straplineTextOne']?['runs'] as List?;
+        final subtitleRuns = activeHeader['subtitle']?['runs'] as List?;
+        
+        if (straplineRuns != null && straplineRuns.isNotEmpty) {
+          for (final run in straplineRuns) {
+            if (run['navigationEndpoint'] != null) {
+              author = run['text'] as String?;
+              break;
+            }
+          }
+          author ??= straplineRuns[0]['text'] as String?;
+        } else if (subtitleRuns != null && subtitleRuns.isNotEmpty) {
+          final typeLabels = {'Playlist', 'Album', 'Single', 'EP', 'Video'};
+          for (final run in subtitleRuns) {
+            final text = run['text'] as String? ?? '';
+            if (run['navigationEndpoint'] != null && !typeLabels.contains(text)) {
+              author = text;
+              break;
+            }
+          }
+          if (author == null) {
+            for (final run in subtitleRuns) {
+              final text = run['text'] as String? ?? '';
+              if (!typeLabels.contains(text) && text.trim() != '•' && text.trim().isNotEmpty) {
+                if (!RegExp(r'^\d{4}$').hasMatch(text.trim())) {
+                  author = text;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        // Try to get author + avatar from facepile (ViewModel format)
+        final facepile = activeHeader['facepile'];
+        if (facepile is Map) {
+          final avatarStack = facepile['avatarStackViewModel'];
+          if (avatarStack is Map) {
+            if (author == null) {
+              final textContent = avatarStack['text']?['content'] as String?;
+              if (textContent != null && textContent.trim().isNotEmpty) {
+                author = textContent.trim();
+              } else {
+                final fpTextRuns = avatarStack['text']?['runs'] as List?;
+                if (fpTextRuns != null && fpTextRuns.isNotEmpty) {
+                  author = fpTextRuns[0]['text'] as String?;
+                }
+              }
+            }
+            final fpAvatars = avatarStack['avatars'] as List?;
+            if (fpAvatars != null && fpAvatars.isNotEmpty) {
+              final firstAvatar = fpAvatars[0];
+              if (firstAvatar is Map) {
+                final avatarVM = firstAvatar['avatarViewModel'];
+                if (avatarVM is Map) {
+                  final sources = avatarVM['image']?['sources'] as List?;
+                  if (sources != null && sources.isNotEmpty) {
+                    authorAvatarUrl = sources.last['url'] as String?;
+                  }
+                  if (authorAvatarUrl == null) {
+                    final altSources = avatarVM['avatar']?['image']?['sources'] as List?;
+                    if (altSources != null && altSources.isNotEmpty) {
+                      authorAvatarUrl = altSources.last['url'] as String?;
+                    }
+                  }
+                  if (authorAvatarUrl == null) {
+                    final thumbs = avatarVM['image']?['thumbnails'] as List?;
+                    if (thumbs != null && thumbs.isNotEmpty) {
+                      authorAvatarUrl = thumbs.last['url'] as String?;
+                    }
+                  }
+                }
+                if (authorAvatarUrl == null) {
+                  final thumbs = firstAvatar['thumbnails'] as List? ??
+                      firstAvatar['thumbnail']?['thumbnails'] as List?;
+                  if (thumbs != null && thumbs.isNotEmpty) {
+                    authorAvatarUrl = thumbs.last['url'] as String?;
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // secondSubtitle
+        final secondSubtitleRuns = activeHeader['secondSubtitle']?['runs'] as List?;
+        if (secondSubtitleRuns != null && secondSubtitleRuns.isNotEmpty) {
+           extraSubtitle = secondSubtitleRuns.map((r) => r['text']).join();
+        } else if (subtitleRuns != null && subtitleRuns.length > 1) {
+           final fullSub = subtitleRuns.map((r) => r['text']).join();
+           if (author != null && fullSub.startsWith(author)) {
+              extraSubtitle = fullSub.substring(author.length).trim();
+              if (extraSubtitle.startsWith('•')) {
+                 extraSubtitle = extraSubtitle.substring(1).trim();
+              }
+           }
+        }
+
+        // Append privacy label (Public/Private) and Year if present in subtitleRuns and not already in extraSubtitle
+        if (subtitleRuns != null && subtitleRuns.isNotEmpty) {
+           final partsToAdd = <String>[];
+           for (final run in subtitleRuns) {
+              final text = (run['text'] as String?)?.trim() ?? '';
+              if (text == 'Public' || text == 'Private' || RegExp(r'^\d{4}$').hasMatch(text)) {
+                 if (extraSubtitle == null || !extraSubtitle.contains(text)) {
+                    partsToAdd.add(text);
+                 }
+              }
+           }
+           if (partsToAdd.isNotEmpty) {
+              final suffix = partsToAdd.join(' • ');
+              if (extraSubtitle == null || extraSubtitle.isEmpty) {
+                 extraSubtitle = suffix;
+              } else {
+                 extraSubtitle = '$extraSubtitle • $suffix';
+              }
+           }
+        }
+
+        // Try to get author avatar from straplineThumbnail (fallback)
+        if (authorAvatarUrl == null) {
+          final avatarThumbs =
+              activeHeader['straplineThumbnail']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails'] as List?;
+          if (avatarThumbs != null && avatarThumbs.isNotEmpty) {
+            authorAvatarUrl = avatarThumbs.last['url'] as String?;
+          }
+        }
+      }
+
+      if (title == 'Unknown Playlist') {
+        final microformat = response['microformat']?['microformatDataRenderer'];
+        if (microformat is Map) {
+          final titleObj = microformat['title'];
+          if (titleObj is Map) {
+            title = titleObj['simpleText'] as String? ?? 'Unknown Playlist';
+          } else if (titleObj is String) {
+            title = titleObj;
+          }
+
+          if (thumbnailUrl == null) {
+            final thumbObj = microformat['thumbnail'];
+            if (thumbObj is Map) {
+              final thumbs = thumbObj['thumbnails'] as List?;
+              if (thumbs != null && thumbs.isNotEmpty) {
+                thumbnailUrl = thumbs.last['url'];
+              }
+            }
+          }
+        }
+      }
+
+      // Parse tracks from multiple possible locations
+      final tracks = <Track>[];
+
+      // Try standard playlist shelf
+      var contents =
+          _navigateJson(response, [
+                'contents',
+                'singleColumnBrowseResultsRenderer',
+                'tabs',
+                0,
+                'tabRenderer',
+                'content',
+                'sectionListRenderer',
+                'contents',
+                0,
+                'musicPlaylistShelfRenderer',
+                'contents',
+              ])
+              as List?;
+
+      // Try alternative structure (musicShelfRenderer)
+      contents ??=
+          _navigateJson(response, [
+                'contents',
+                'singleColumnBrowseResultsRenderer',
+                'tabs',
+                0,
+                'tabRenderer',
+                'content',
+                'sectionListRenderer',
+                'contents',
+                0,
+                'musicShelfRenderer',
+                'contents',
+              ])
+              as List?;
+
+      // Try two-column browse results (used for some playlists)
+      contents ??=
+          _navigateJson(response, [
+                'contents',
+                'twoColumnBrowseResultsRenderer',
+                'secondaryContents',
+                'sectionListRenderer',
+                'contents',
+                0,
+                'musicPlaylistShelfRenderer',
+                'contents',
+              ])
+              as List?;
+
+      if (contents != null) {
+        for (final item in contents) {
+          final track = _parseTrackItem({
+            'musicResponsiveListItemRenderer':
+                item['musicResponsiveListItemRenderer'],
+          });
+          if (track != null) tracks.add(track);
+        }
+      }
+
+      // If we got tracks but no header, still return the playlist
+      if (tracks.isNotEmpty || activeHeader != null) {
+        return Playlist(
+          id: playlistId,
+          title: title,
+          description: description,
+          thumbnailUrl: thumbnailUrl,
+          author: author,
+          authorAvatarUrl: authorAvatarUrl,
+          extraSubtitle: extraSubtitle,
+          trackCount: tracks.length,
+          tracks: tracks,
+          isYTMusic: true,
+          isEditable: editableHeader != null,
+          privacy: _extractPlaylistPrivacy(editableHeader),
+        );
+      }
+
+      if (kDebugMode) {
+        print('Playlist parse: No content found for $playlistId');
+      }
+      return null;
+    } catch (e, stack) {
+      if (kDebugMode) {
+        print('Error parsing playlist details: $e');
+      }
+      if (kDebugMode) {
+        print('Stack: $stack');
+      }
+      return null;
+    }
+  }
+
+  /// Parse playlist details with continuation token support
+  (Playlist?, String?) _parsePlaylistDetailsWithContinuation(
+    Map<String, dynamic> response,
+    String playlistId,
+  ) {
+    try {
+      // Try multiple header locations (YouTube Music uses different structures)
+      final header =
+          response['header']?['musicDetailHeaderRenderer'] ??
+          response['header']?['musicEditablePlaylistDetailHeaderRenderer']?['header']?['musicDetailHeaderRenderer'] ??
+          response['header']?['musicEditablePlaylistDetailHeaderRenderer']?['header']?['musicResponsiveHeaderRenderer'] ??
+          response['header']?['musicResponsiveHeaderRenderer'];
+
+      // Also try to get header from content tabs for some playlist types
+      dynamic fallbackHeader;
+      if (header == null) {
+        final singleColContents = _navigateJson(response, [
+          'contents',
+          'singleColumnBrowseResultsRenderer',
+          'tabs',
+          0,
+          'tabRenderer',
+          'content',
+          'sectionListRenderer',
+          'contents',
+          0,
+        ]) as Map?;
+        
+        final twoColContents = _navigateJson(response, [
+          'contents',
+          'twoColumnBrowseResultsRenderer',
+          'tabs',
+          0,
+          'tabRenderer',
+          'content',
+          'sectionListRenderer',
+          'contents',
+          0,
+        ]) as Map?;
+
+        final headerContainer = singleColContents ?? twoColContents;
+        if (headerContainer != null) {
+          fallbackHeader = 
+            headerContainer['musicResponsiveHeaderRenderer'] ??
+            headerContainer['musicDetailHeaderRenderer'] ??
+            headerContainer['musicEditablePlaylistDetailHeaderRenderer']?['header']?['musicResponsiveHeaderRenderer'] ??
+            headerContainer['musicEditablePlaylistDetailHeaderRenderer']?['header']?['musicDetailHeaderRenderer'] ??
+            headerContainer['musicEditablePlaylistDetailHeaderRenderer'];
+        }
+      }
+
+      final activeHeader = header ?? fallbackHeader;
+      final editableHeader = _findEditablePlaylistHeader(response);
+
+      if (activeHeader == null) {
+        if (kDebugMode) {
+          print('=== ACTIVE HEADER IS NULL ===');
+          print('response keys: ${response.keys.toList()}');
+          
+          // Let's find out what's inside contents
+          try {
+            final singleCol = _navigateJson(response, ['contents', 'singleColumnBrowseResultsRenderer']);
+            if (singleCol != null) {
+               print('singleCol keys: ${(singleCol as Map).keys.toList()}');
+               final tabs = singleCol['tabs'] as List?;
+               if (tabs != null && tabs.isNotEmpty) {
+                 final tabContent = tabs[0]['tabRenderer']?['content']?['sectionListRenderer']?['contents'] as List?;
+                 if (tabContent != null && tabContent.isNotEmpty) {
+                   print('tabContent[0] keys: ${(tabContent[0] as Map).keys.toList()}');
+                 }
+               }
+            }
+            final twoCol = _navigateJson(response, ['contents', 'twoColumnBrowseResultsRenderer']);
+            if (twoCol != null) {
+               print('twoCol keys: ${(twoCol as Map).keys.toList()}');
+               final secondary = twoCol['secondaryContents']?['sectionListRenderer']?['contents'] as List?;
+               if (secondary != null && secondary.isNotEmpty) {
+                 print('secondary[0] keys: ${(secondary[0] as Map).keys.toList()}');
+               }
+               final tabs = twoCol['tabs'] as List?;
+               if (tabs != null && tabs.isNotEmpty) {
+                 final tabContent = tabs[0]['tabRenderer']?['content']?['sectionListRenderer']?['contents'] as List?;
+                 if (tabContent != null && tabContent.isNotEmpty) {
+                   print('twoCol tabContent[0] keys: ${(tabContent[0] as Map).keys.toList()}');
+                 }
+               }
+            }
+          } catch (e) {
+            print('Error dumping contents: $e');
+          }
+        }
+      }
+
+      // Parse title from various locations
+      String title = 'Unknown Playlist';
+      String? description;
+      String? thumbnailUrl;
+      String? author;
+      String? authorAvatarUrl;
+      String? extraSubtitle;
+
+      if (activeHeader != null) {
+        if (kDebugMode) {
+          print('=== PLAYLIST HEADER DEBUG ===');
+          print('Header keys: ${(activeHeader as Map).keys.toList()}');
+          final subRuns = activeHeader['subtitle']?['runs'] as List?;
+          print('subtitle runs: ${subRuns?.map((r) => r['text']).toList()}');
+          final strapRuns = activeHeader['straplineTextOne']?['runs'] as List?;
+          print('straplineTextOne runs: ${strapRuns?.map((r) => "${r['text']}(nav:${r['navigationEndpoint'] != null})").toList()}');
+          final secSubRuns = activeHeader['secondSubtitle']?['runs'] as List?;
+          print('secondSubtitle runs: ${secSubRuns?.map((r) => r['text']).toList()}');
+          print('description keys: ${activeHeader['description']?.runtimeType}');
+          print('descriptionPreview: ${activeHeader['descriptionPreview']?.runtimeType}');
+          print('straplineThumbnail: ${activeHeader['straplineThumbnail'] != null}');
+          // Dump facepile structure for debugging
+          final facepile = activeHeader['facepile'];
+          if (facepile != null) {
+            final avatarStack = (facepile as Map)['avatarStackViewModel'];
+            if (avatarStack is Map) {
+              print('facepile.avatarStack.text: ${avatarStack['text']}');
+              final fpAvatars = avatarStack['avatars'] as List?;
+              if (fpAvatars != null && fpAvatars.isNotEmpty) {
+                final av0 = fpAvatars[0];
+                if (av0 is Map) {
+                  final avm = av0['avatarViewModel'];
+                  if (avm is Map) {
+                    print('avatarViewModel keys: ${avm.keys.toList()}');
+                    print('avatarViewModel.image: ${avm['image']}');
+                  }
+                }
+              }
+            }
+          } else {
+            print('facepile: null');
+          }
+          print('=== END HEADER DEBUG ===');
+        }
+        title =
+            activeHeader['title']?['runs']?[0]?['text'] as String? ??
+            (activeHeader['title']?['runs'] as List?)
+                ?.map((r) => r['text'])
+                .join() ??
+            'Unknown Playlist';
+
+        description =
+            activeHeader['description']?['runs']?[0]?['text'] as String? ??
+            (activeHeader['description']?['runs'] as List?)
+                ?.map((r) => r['text'])
+                .join();
+
+        // For musicResponsiveHeaderRenderer, description is in descriptionPreview
+        description ??=
+            (activeHeader['description']?['musicDescriptionShelfRenderer']?['description']?['runs'] as List?)
+                ?.map((r) => r['text'])
+                .join();
+        description ??=
+            (activeHeader['descriptionPreview']?['runs'] as List?)
+                ?.map((r) => r['text'])
+                .join();
+
+        final thumbnails =
+            activeHeader['thumbnail']?['croppedSquareThumbnailRenderer']?['thumbnail']?['thumbnails']
+                as List? ??
+            activeHeader['thumbnail']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+                as List?;
+        if (thumbnails != null && thumbnails.isNotEmpty) {
+          thumbnailUrl = thumbnails.last['url'] as String?;
+        }
+
+        // For musicResponsiveHeaderRenderer:
+        //   subtitle = type label (e.g. "Playlist")
+        //   straplineTextOne = author name (e.g. "NotCyCo")
+        // For musicDetailHeaderRenderer:
+        //   subtitle = ["Playlist", " • ", "2026"] (type + year, NO author)
+        //   facepile = author name + avatar
+        final straplineRuns = activeHeader['straplineTextOne']?['runs'] as List?;
+        final subtitleRuns = activeHeader['subtitle']?['runs'] as List?;
+
+        if (straplineRuns != null && straplineRuns.isNotEmpty) {
+          // musicResponsiveHeaderRenderer: author is in straplineTextOne
+          for (final run in straplineRuns) {
+            if (run['navigationEndpoint'] != null) {
+              author = run['text'] as String?;
+              break;
+            }
+          }
+          author ??= straplineRuns[0]['text'] as String?;
+        } else if (subtitleRuns != null && subtitleRuns.isNotEmpty) {
+          // Try to find a non-type-label author in subtitle runs
+          final typeLabels = {'Playlist', 'Album', 'Single', 'EP', 'Video', 'Public', 'Private'};
+          for (final run in subtitleRuns) {
+            final text = run['text'] as String? ?? '';
+            if (run['navigationEndpoint'] != null && !typeLabels.contains(text)) {
+              author = text;
+              break;
+            }
+          }
+          // If no navigable author found, check for non-type, non-separator runs
+          if (author == null) {
+            for (final run in subtitleRuns) {
+              final text = run['text'] as String? ?? '';
+              if (!typeLabels.contains(text) && text.trim() != '•' && text.trim().isNotEmpty) {
+                // Skip year-only values like "2026"
+                if (!RegExp(r'^\d{4}$').hasMatch(text.trim())) {
+                  author = text;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        // Try to get author + avatar from facepile (used in musicDetailHeaderRenderer)
+        // YouTube uses ViewModel format here:
+        //   facepile.avatarStackViewModel.text.content = "AuthorName" (NOT .runs!)
+        //   facepile.avatarStackViewModel.avatars[0].avatarViewModel.image.sources[0].url
+        final facepile = activeHeader['facepile'];
+        if (facepile is Map) {
+          final avatarStack = facepile['avatarStackViewModel'];
+          if (avatarStack is Map) {
+            // Extract author name: try text.content (ViewModel) then text.runs (legacy)
+            if (author == null) {
+              final textContent = avatarStack['text']?['content'] as String?;
+              if (textContent != null && textContent.trim().isNotEmpty) {
+                author = textContent.trim();
+              } else {
+                final fpTextRuns = avatarStack['text']?['runs'] as List?;
+                if (fpTextRuns != null && fpTextRuns.isNotEmpty) {
+                  author = fpTextRuns[0]['text'] as String?;
+                }
+              }
+            }
+
+            // Extract avatar from avatarViewModel
+            final fpAvatars = avatarStack['avatars'] as List?;
+            if (fpAvatars != null && fpAvatars.isNotEmpty) {
+              final firstAvatar = fpAvatars[0];
+              if (firstAvatar is Map) {
+                final avatarVM = firstAvatar['avatarViewModel'];
+                if (avatarVM is Map) {
+                  // Try image.sources (ViewModel format)
+                  final sources = avatarVM['image']?['sources'] as List?;
+                  if (sources != null && sources.isNotEmpty) {
+                    authorAvatarUrl = sources.last['url'] as String?;
+                  }
+                  // Fallback: avatar.image.sources
+                  if (authorAvatarUrl == null) {
+                    final altSources = avatarVM['avatar']?['image']?['sources'] as List?;
+                    if (altSources != null && altSources.isNotEmpty) {
+                      authorAvatarUrl = altSources.last['url'] as String?;
+                    }
+                  }
+                  // Fallback: thumbnails directly
+                  if (authorAvatarUrl == null) {
+                    final thumbs = avatarVM['image']?['thumbnails'] as List?;
+                    if (thumbs != null && thumbs.isNotEmpty) {
+                      authorAvatarUrl = thumbs.last['url'] as String?;
+                    }
+                  }
+                }
+                // Legacy fallback for non-ViewModel avatars
+                if (authorAvatarUrl == null) {
+                  final thumbs = firstAvatar['thumbnails'] as List? ??
+                      firstAvatar['thumbnail']?['thumbnails'] as List?;
+                  if (thumbs != null && thumbs.isNotEmpty) {
+                    authorAvatarUrl = thumbs.last['url'] as String?;
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // secondSubtitle contains "59 views • 2 hrs 17 mins • 3 wk ago • Public"
+        final secondSubtitleRuns = activeHeader['secondSubtitle']?['runs'] as List?;
+        if (secondSubtitleRuns != null && secondSubtitleRuns.isNotEmpty) {
+          extraSubtitle = secondSubtitleRuns.map((r) => r['text']).join();
+        } else if (subtitleRuns != null && subtitleRuns.length > 1) {
+          final fullSub = subtitleRuns.map((r) => r['text']).join();
+          if (author != null && fullSub.startsWith(author)) {
+            extraSubtitle = fullSub.substring(author.length).trim();
+            if (extraSubtitle.startsWith('•')) {
+              extraSubtitle = extraSubtitle.substring(1).trim();
+            }
+          }
+        }
+
+        // Append privacy label (Public/Private) and Year if present in subtitleRuns and not already in extraSubtitle
+        if (subtitleRuns != null && subtitleRuns.isNotEmpty) {
+           final partsToAdd = <String>[];
+           for (final run in subtitleRuns) {
+              final text = (run['text'] as String?)?.trim() ?? '';
+              if (text == 'Public' || text == 'Private' || RegExp(r'^\d{4}$').hasMatch(text)) {
+                 if (extraSubtitle == null || !extraSubtitle.contains(text)) {
+                    partsToAdd.add(text);
+                 }
+              }
+           }
+           if (partsToAdd.isNotEmpty) {
+              final suffix = partsToAdd.join(' • ');
+              if (extraSubtitle == null || extraSubtitle.isEmpty) {
+                 extraSubtitle = suffix;
+              } else {
+                 extraSubtitle = '$extraSubtitle • $suffix';
+              }
+           }
+        }
+
+        // Try to get author avatar from straplineThumbnail (fallback)
+        if (authorAvatarUrl == null) {
+          final avatarThumbs =
+              activeHeader['straplineThumbnail']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails'] as List?;
+          if (avatarThumbs != null && avatarThumbs.isNotEmpty) {
+            authorAvatarUrl = avatarThumbs.last['url'] as String?;
+          }
+        }
+      }
+
+      if (title == 'Unknown Playlist') {
+        final microformat = response['microformat']?['microformatDataRenderer'];
+        if (microformat is Map) {
+          final titleObj = microformat['title'];
+          if (titleObj is Map) {
+            title = titleObj['simpleText'] as String? ?? 'Unknown Playlist';
+          } else if (titleObj is String) {
+            title = titleObj;
+          }
+
+          if (thumbnailUrl == null) {
+            final thumbObj = microformat['thumbnail'];
+            if (thumbObj is Map) {
+              final thumbs = thumbObj['thumbnails'] as List?;
+              if (thumbs != null && thumbs.isNotEmpty) {
+                thumbnailUrl = thumbs.last['url'];
+              }
+            }
+          }
+        }
+      }
+
+      // Parse tracks and get continuation
+      final tracks = <Track>[];
+      String? continuation;
+
+      // Try two-column browse results first (most common for playlists like Liked Songs)
+      var shelf =
+          _navigateJson(response, [
+                'contents',
+                'twoColumnBrowseResultsRenderer',
+                'secondaryContents',
+                'sectionListRenderer',
+                'contents',
+                0,
+                'musicPlaylistShelfRenderer',
+              ])
+              as Map?;
+
+      var contents = shelf?['contents'] as List?;
+
+      // Try singleColumn if twoColumn didn't work
+      if (contents == null) {
+        shelf =
+            _navigateJson(response, [
+                  'contents',
+                  'singleColumnBrowseResultsRenderer',
+                  'tabs',
+                  0,
+                  'tabRenderer',
+                  'content',
+                  'sectionListRenderer',
+                  'contents',
+                  0,
+                  'musicPlaylistShelfRenderer',
+                ])
+                as Map?;
+
+        contents = shelf?['contents'] as List?;
+      }
+
+      // Try musicShelfRenderer
+      if (contents == null) {
+        shelf =
+            _navigateJson(response, [
+                  'contents',
+                  'singleColumnBrowseResultsRenderer',
+                  'tabs',
+                  0,
+                  'tabRenderer',
+                  'content',
+                  'sectionListRenderer',
+                  'contents',
+                  0,
+                  'musicShelfRenderer',
+                ])
+                as Map?;
+
+        contents = shelf?['contents'] as List?;
+      }
+
+      // Get continuation from shelf
+      if (shelf != null) {
+        continuation = _extractContinuationToken(shelf['continuations']);
+      }
+
+      // Some first-page playlist responses keep continuation in item lists
+      // or response wrappers rather than shelf.continuations.
+      continuation ??= _extractContinuationToken(contents);
+      continuation ??= _extractContinuationToken(
+        response['onResponseReceivedActions'],
+      );
+      continuation ??= _extractContinuationToken(
+        response['onResponseReceivedEndpoints'],
+      );
+
+      if (contents != null) {
+        for (final item in contents) {
+          final track = _parseTrackItem({
+            'musicResponsiveListItemRenderer':
+                item['musicResponsiveListItemRenderer'],
+          });
+          if (track != null) tracks.add(track);
+        }
+      }
+
+      if (tracks.isNotEmpty || activeHeader != null) {
+        return (
+          Playlist(
+            id: playlistId,
+            title: title,
+            description: description,
+            thumbnailUrl: thumbnailUrl,
+            author: author,
+            authorAvatarUrl: authorAvatarUrl,
+            extraSubtitle: extraSubtitle,
+            trackCount: tracks.length,
+            tracks: tracks,
+            isYTMusic: true,
+            isEditable: editableHeader != null,
+            privacy: _extractPlaylistPrivacy(editableHeader),
+          ),
+          continuation,
+        );
+      }
+
+      return (null, null);
+    } catch (e, stack) {
+      if (kDebugMode) {
+        print('Error parsing playlist details with continuation: $e');
+      }
+      if (kDebugMode) {
+        print('Stack: $stack');
+      }
+      return (null, null);
+    }
+  }
+
+  /// Parse playlist continuation response
+  (List<Track>, String?) _parsePlaylistContinuation(
+    Map<String, dynamic> response,
+  ) {
+    final tracks = <Track>[];
+    String? continuation;
+
+    try {
+      List? items;
+
+      // Try musicPlaylistShelfContinuation
+      var continuationContents =
+          response['continuationContents']?['musicPlaylistShelfContinuation'];
+
+      // Try musicShelfContinuation
+      continuationContents ??=
+          response['continuationContents']?['musicShelfContinuation'];
+
+      if (continuationContents != null) {
+        items = continuationContents['contents'] as List?;
+      }
+
+      // Some playlist continuations return items via appendContinuationItemsAction.
+      items ??=
+          _navigateJson(response, [
+                'onResponseReceivedActions',
+                0,
+                'appendContinuationItemsAction',
+                'continuationItems',
+              ])
+              as List?;
+      items ??=
+          _navigateJson(response, [
+                'onResponseReceivedEndpoints',
+                0,
+                'appendContinuationItemsAction',
+                'continuationItems',
+              ])
+              as List?;
+
+      if (items != null) {
+        for (final item in items) {
+          // Standard continuation item.
+          var track = _parseTrackItem(item);
+          if (track != null) {
+            tracks.add(track);
+            continue;
+          }
+
+          // Wrapped continuation item shape.
+          final renderer = item['musicResponsiveListItemRenderer'];
+          if (renderer != null) {
+            track = _parseTrackItem({
+              'musicResponsiveListItemRenderer': renderer,
+            });
+            if (track != null) {
+              tracks.add(track);
+              continue;
+            }
+          }
+
+          // Nested shelf continuation shape.
+          final shelfItems =
+              item['musicPlaylistShelfRenderer']?['contents'] as List?;
+          if (shelfItems != null) {
+            for (final shelfItem in shelfItems) {
+              final shelfTrack = _parseTrackItem(shelfItem);
+              if (shelfTrack != null) {
+                tracks.add(shelfTrack);
+              }
+            }
+          }
+        }
+      }
+
+      // Get next continuation token using robust extractor.
+      if (continuationContents != null) {
+        continuation = _extractContinuationToken(
+          continuationContents['continuations'],
+        );
+      }
+      continuation ??= _extractContinuationToken(items);
+      continuation ??= _extractContinuationToken(
+        response['onResponseReceivedActions'],
+      );
+      continuation ??= _extractContinuationToken(
+        response['onResponseReceivedEndpoints'],
+      );
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing playlist continuation: $e');
+      }
+    }
+
+    return (tracks, continuation);
+  }
+
+  Album? _parseAlbumDetails(Map<String, dynamic> response, String albumId) {
+    try {
+      // Try multiple header locations
+      final header =
+          response['header']?['musicDetailHeaderRenderer'] ??
+          response['header']?['musicResponsiveHeaderRenderer'];
+
+      // Also try to get header from content tabs (common in two-column layouts)
+      dynamic fallbackHeader;
+      if (header == null) {
+        fallbackHeader =
+            _navigateJson(response, [
+              'contents',
+              'twoColumnBrowseResultsRenderer',
+              'tabs',
+              0,
+              'tabRenderer',
+              'content',
+              'sectionListRenderer',
+              'contents',
+              0,
+              'musicResponsiveHeaderRenderer',
+            ]) ??
+            _navigateJson(response, [
+              'contents',
+              'singleColumnBrowseResultsRenderer',
+              'tabs',
+              0,
+              'tabRenderer',
+              'content',
+              'sectionListRenderer',
+              'contents',
+              0,
+              'musicResponsiveHeaderRenderer',
+            ]);
+      }
+
+      final activeHeader = header ?? fallbackHeader;
+
+      if (activeHeader == null) {
+        if (kDebugMode) {
+          print('Album parse: No header found for $albumId');
+        }
+        return null; // Can't parse without minimal info
+      }
+
+      // Parse title
+      String title = 'Unknown Album';
+      if (activeHeader['title'] != null) {
+        title =
+            activeHeader['title']?['runs']?[0]?['text'] as String? ??
+            (activeHeader['title']?['runs'] as List?)
+                ?.map((r) => r['text'])
+                .join() ??
+            'Unknown Album';
+      }
+
+      // Parse Artist, Year, and ArtistId
+      // For musicResponsiveHeaderRenderer:
+      //   straplineTextOne = artist name(s) + browseEndpoint (artistId)
+      //   subtitle = type label (e.g. "Album", "EP", "Single") • release year
+      // For musicDetailHeaderRenderer:
+      //   subtitle = artist name • year
+      final straplineRuns = activeHeader['straplineTextOne']?['runs'] as List?;
+      final subtitleRuns = activeHeader['subtitle']?['runs'] as List?;
+
+      String artist = 'Unknown Artist';
+      String artistId = '';
+      String? year;
+      const typeLabels = {
+        'playlist',
+        'album',
+        'single',
+        'ep',
+        'video',
+        'song',
+        'station',
+        'podcast',
+      };
+
+      // 1. Check straplineTextOne first (contains the actual artist and artist channel navigation)
+      if (straplineRuns != null && straplineRuns.isNotEmpty) {
+        final artistNames = <String>[];
+        for (final run in straplineRuns) {
+          final text = (run['text'] as String?)?.trim() ?? '';
+          if (text.isEmpty || text == '•') continue;
+
+          if (run['navigationEndpoint'] != null) {
+            final bId =
+                run['navigationEndpoint']?['browseEndpoint']?['browseId']
+                    as String?;
+            if (bId != null && bId.isNotEmpty && artistId.isEmpty) {
+              artistId = bId;
+            }
+          }
+          if (!typeLabels.contains(text.toLowerCase()) &&
+              !text.toLowerCase().contains('song')) {
+            artistNames.add(text);
+          }
+        }
+        if (artistNames.isNotEmpty) {
+          artist = artistNames.join();
+        }
+      }
+
+      // 2. Parse subtitleRuns for year, and fallback for artist if not found from strapline
+      if (subtitleRuns != null && subtitleRuns.isNotEmpty) {
+        for (final run in subtitleRuns) {
+          final text = (run['text'] as String?)?.trim() ?? '';
+          if (text.isEmpty || text == '•') continue;
+
+          if (RegExp(r'^\d{4}$').hasMatch(text)) {
+            year = text;
+            continue;
+          }
+
+          if (typeLabels.contains(text.toLowerCase()) ||
+              text.toLowerCase().contains('song')) {
+            continue;
+          }
+
+          if (artist == 'Unknown Artist') {
+            artist = text;
+            final bId =
+                run['navigationEndpoint']?['browseEndpoint']?['browseId']
+                    as String?;
+            if (bId != null && bId.isNotEmpty && artistId.isEmpty) {
+              artistId = bId;
+            }
+          }
+        }
+      }
+
+      if (typeLabels.contains(artist.toLowerCase().trim())) {
+        artist = 'Unknown Artist';
+      }
+
+      // Get thumbnail
+      final thumbnails =
+          activeHeader['thumbnail']?['croppedSquareThumbnailRenderer']?['thumbnail']?['thumbnails']
+              as List? ??
+          activeHeader['thumbnail']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+              as List?;
+
+      String? thumbnailUrl;
+      if (thumbnails != null && thumbnails.isNotEmpty) {
+        thumbnailUrl = thumbnails.last['url'] as String?;
+      }
+
+      String? description;
+      if (activeHeader['description'] != null) {
+        description =
+            activeHeader['description']?['runs']?[0]?['text'] as String? ??
+            (activeHeader['description']?['runs'] as List?)
+                ?.map((r) => r['text'])
+                .join();
+      }
+
+      // Parse tracks
+      final tracks = <Track>[];
+
+      // Try standard album shelf
+      var contents =
+          _navigateJson(response, [
+                'contents',
+                'singleColumnBrowseResultsRenderer',
+                'tabs',
+                0,
+                'tabRenderer',
+                'content',
+                'sectionListRenderer',
+                'contents',
+                0,
+                'musicShelfRenderer',
+                'contents',
+              ])
+              as List?;
+
+      // Try two-column browse results (Desktop Web often uses this for Albums)
+      contents ??=
+          _navigateJson(response, [
+                'contents',
+                'twoColumnBrowseResultsRenderer',
+                'secondaryContents',
+                'sectionListRenderer',
+                'contents',
+                0,
+                'musicShelfRenderer',
+                'contents',
+              ])
+              as List?;
+
+      // Sometimes it's a playlist shelf for albums?
+      contents ??=
+          _navigateJson(response, [
+                'contents',
+                'twoColumnBrowseResultsRenderer',
+                'secondaryContents',
+                'sectionListRenderer',
+                'contents',
+                0,
+                'musicPlaylistShelfRenderer',
+                'contents',
+              ])
+              as List?;
+
+      if (contents != null) {
+        for (final item in contents) {
+          var track = _parseTrackItem(item);
+          if (track != null) {
+            final trackArtist =
+                (track.artist.isEmpty ||
+                 track.artist == 'Unknown Artist' ||
+                 typeLabels.contains(track.artist.toLowerCase().trim()))
+                    ? artist
+                    : track.artist;
+            final trackArtistId =
+                (track.artistId.isEmpty && artistId.isNotEmpty)
+                    ? artistId
+                    : track.artistId;
+            track = track.copyWith(
+              artist: trackArtist,
+              artistId: trackArtistId,
+              album: (track.album == null ||
+                      track.album!.isEmpty ||
+                      track.album == 'Unknown Album')
+                  ? title
+                  : track.album,
+              albumId: (track.albumId == null || track.albumId!.isEmpty)
+                  ? albumId
+                  : track.albumId,
+              thumbnailUrl: (track.thumbnailUrl == null ||
+                      track.thumbnailUrl!.isEmpty)
+                  ? thumbnailUrl
+                  : track.thumbnailUrl,
+            );
+            tracks.add(track);
+          }
+        }
+      }
+
+      return Album(
+        id: albumId,
+        title: title,
+        artist: artist,
+        artistId: artistId,
+        year: year,
+        thumbnailUrl: thumbnailUrl,
+        description: description,
+        tracks: tracks,
+      );
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing album details: $e');
+      }
+      return null;
+    }
+  }
+
+  Artist? _parseArtistDetails(Map<String, dynamic> response, String channelId) {
+    try {
+      final header =
+          response['header']?['musicImmersiveHeaderRenderer'] ??
+          response['header']?['musicVisualHeaderRenderer'] ??
+          response['header']?['musicResponsiveHeaderRenderer'] ??
+          response['header']?['musicHeaderRenderer']; // Fallback for library artists
+
+      String? name;
+      String? thumbnailUrl;
+      String? description;
+      int? subscriberCount;
+
+      if (header != null) {
+        name = header['title']?['runs']?[0]?['text'] as String?;
+
+        final thumbnails =
+            header['thumbnail']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+                as List?;
+        if (thumbnails != null && thumbnails.isNotEmpty) {
+          thumbnailUrl = thumbnails.last['url'] as String?;
+        }
+
+        description = header['description']?['runs']?[0]?['text'] as String?;
+
+        final subText =
+            header['subscriptionButton']?['subscribeButtonRenderer']?['subscriberCountText']?['runs']?[0]?['text']
+                as String?;
+        if (subText != null) {
+          // "1.2M subscribers" -> parse number?
+          // Simple parsing: remove non-digits (handle K/M)
+          // For now just keep string if model allows? Model expects int.
+          // Regex to find number.
+          // "3.75M subscribers"
+          // "12K subscribers"
+          // "100 subscribers"
+          // I'll skip complex parsing for now or do a quick one
+          if (subText.contains('K')) {
+            subscriberCount =
+                (double.parse(subText.replaceAll(RegExp(r'[^0-9.]'), '')) *
+                        1000)
+                    .toInt();
+          } else if (subText.contains('M')) {
+            subscriberCount =
+                (double.parse(subText.replaceAll(RegExp(r'[^0-9.]'), '')) *
+                        1000000)
+                    .toInt();
+          } else {
+            subscriberCount = int.tryParse(
+              subText.replaceAll(RegExp(r'[^0-9]'), ''),
+            );
+          }
+        }
+      }
+
+      // Microformat fallback for name/thumb
+      if (name == null) {
+        final microformat = response['microformat']?['microformatDataRenderer'];
+        name = microformat?['title'] as String? ?? 'Unknown Artist';
+        if (thumbnailUrl == null) {
+          final thumbs = microformat?['thumbnail']?['thumbnails'] as List?;
+          if (thumbs != null && thumbs.isNotEmpty) {
+            thumbnailUrl = thumbs.last['url'];
+          }
+        }
+      }
+
+      final topTracks = <Track>[];
+      final albums = <Album>[];
+      final singles = <Album>[];
+      final appearsOn = <Album>[];
+      final playlists = <Playlist>[];
+      final similarArtists = <Artist>[];
+      String? songsBrowseId;
+      String? songsParams;
+
+      // Parse Content Sections
+      var sections =
+          _navigateJson(response, [
+                'contents',
+                'singleColumnBrowseResultsRenderer',
+                'tabs',
+                0, // Usually first tab is "Home" or "Songs"
+                'tabRenderer',
+                'content',
+                'sectionListRenderer',
+                'contents',
+              ])
+              as List?;
+
+      // Fallback for Library Artists which might just have a musicShelfRenderer directly
+      if (sections == null) {
+        final shelf = _navigateJson(response, [
+          'contents',
+          'singleColumnBrowseResultsRenderer',
+          'tabs',
+          0,
+          'tabRenderer',
+          'content',
+          'musicShelfRenderer',
+        ]);
+        if (shelf != null) {
+          sections = [{'musicShelfRenderer': shelf}];
+        }
+      }
+
+      if (sections != null) {
+        for (final section in sections) {
+          // Top Songs (MusicShelf)
+          final musicShelf = section['musicShelfRenderer'];
+          if (musicShelf != null) {
+            final title = musicShelf['title']?['runs']?[0]?['text'] as String?;
+            final contents = musicShelf['contents'] as List?;
+            final parsedTracks = <Track>[];
+            if (contents != null) {
+              for (final item in contents) {
+                final track = _parseTrackItem(item);
+                if (track != null) parsedTracks.add(track);
+              }
+            }
+
+            if (parsedTracks.isNotEmpty &&
+                (topTracks.isEmpty || _isArtistSongsSectionTitle(title))) {
+              final moreButton =
+                  musicShelf['bottomEndpoint']?['browseEndpoint'];
+              if (moreButton != null) {
+                songsBrowseId = moreButton['browseId'] as String?;
+                songsParams = moreButton['params'] as String?;
+              }
+              topTracks.addAll(parsedTracks);
+            }
+          }
+
+          // Albums / Singles / EPs / Appears On (MusicCarouselShelf)
+          final musicCarousel = section['musicCarouselShelfRenderer'];
+          if (musicCarousel != null) {
+            final title =
+                musicCarousel['header']?['musicCarouselShelfBasicHeaderRenderer']?['title']?['runs']?[0]?['text']
+                    as String?;
+
+            final contents = musicCarousel['contents'] as List?;
+            if (contents == null) continue;
+
+            final parsedAlbums = <Album>[];
+            for (final item in contents) {
+              final r = item['musicTwoRowItemRenderer'];
+              if (r != null) {
+                final id =
+                    r['navigationEndpoint']?['browseEndpoint']?['browseId'];
+                if (id != null) {
+                  final albumTitle =
+                      r['title']?['runs']?[0]?['text'] ?? 'Unknown Album';
+                  final thumb =
+                      r['thumbnailRenderer']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+                          ?.last['url'];
+                  // Subtitle may contain "Album • 2023" or "Single • 2023"
+                  final subtitleRuns = r['subtitle']?['runs'] as List?;
+                  String? year;
+                  if (subtitleRuns != null) {
+                    // Usually: "[type] • [year]" or "[artist] • [year]"
+                    final subtitleText = subtitleRuns
+                        .map((r) => r['text'])
+                        .join();
+                    // Extract year (4 digits)
+                    final yearMatch = RegExp(
+                      r'\b(19|20)\d{2}\b',
+                    ).firstMatch(subtitleText);
+                    if (yearMatch != null) {
+                      year = yearMatch.group(0);
+                    }
+                  }
+
+                  parsedAlbums.add(
+                    Album(
+                      id: id,
+                      title: albumTitle,
+                      artist: name,
+                      thumbnailUrl: thumb,
+                      year: year,
+                    ),
+                  );
+                }
+              }
+            }
+
+            // Categorize by shelf title
+            final lowerTitle = title?.toLowerCase() ?? '';
+            if (lowerTitle.contains('albums')) {
+              albums.addAll(parsedAlbums);
+            } else if (lowerTitle.contains('singles') ||
+                lowerTitle.contains('eps')) {
+              singles.addAll(parsedAlbums);
+            } else if (lowerTitle.contains('appears on') ||
+                lowerTitle.contains('featured on')) {
+              appearsOn.addAll(parsedAlbums);
+            }
+          }
+
+          // Playlists shelf
+          final playlistShelf = section['musicCarouselShelfRenderer'];
+          if (playlistShelf != null) {
+            final title =
+                playlistShelf['header']?['musicCarouselShelfBasicHeaderRenderer']?['title']?['runs']?[0]?['text']
+                    as String?;
+            final lowerTitle = title?.toLowerCase() ?? '';
+
+            if (lowerTitle.contains('playlist') ||
+                lowerTitle.contains('featuring')) {
+              final contents = playlistShelf['contents'] as List?;
+              if (contents != null) {
+                for (final item in contents) {
+                  final r = item['musicTwoRowItemRenderer'];
+                  if (r != null) {
+                    final id =
+                        r['navigationEndpoint']?['browseEndpoint']?['browseId'];
+                    if (id != null && (id as String).startsWith('VL')) {
+                      final playlistTitle =
+                          r['title']?['runs']?[0]?['text'] ?? 'Playlist';
+                      final thumb =
+                          r['thumbnailRenderer']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+                              ?.last['url'];
+                      final author = r['subtitle']?['runs']?[0]?['text'];
+
+                      playlists.add(
+                        Playlist(
+                          id: id.replaceFirst('VL', ''),
+                          title: playlistTitle,
+                          thumbnailUrl: thumb,
+                          author: author,
+                        ),
+                      );
+                    }
+                  }
+                }
+              }
+            }
+
+            // Similar artists / Fans also like
+            if (lowerTitle.contains('fans also like') ||
+                lowerTitle.contains('similar artists') ||
+                lowerTitle.contains('related artists')) {
+              final contents = playlistShelf['contents'] as List?;
+              if (contents != null) {
+                for (final item in contents) {
+                  final r = item['musicTwoRowItemRenderer'];
+                  if (r != null) {
+                    final id =
+                        r['navigationEndpoint']?['browseEndpoint']?['browseId'];
+                    if (id != null && (id as String).startsWith('UC')) {
+                      final artistName =
+                          r['title']?['runs']?[0]?['text'] ?? 'Artist';
+                      final thumb =
+                          r['thumbnailRenderer']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+                              ?.last['url'];
+
+                      similarArtists.add(
+                        Artist(id: id, name: artistName, thumbnailUrl: thumb),
+                      );
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          if (musicCarousel != null) {
+            final fallbackTitle =
+                musicCarousel['header']?['musicCarouselShelfBasicHeaderRenderer']?['title']?['runs']?[0]?['text']
+                    as String?;
+            final fallbackLowerTitle = fallbackTitle?.toLowerCase() ?? '';
+            final recognizedByLegacy =
+                fallbackLowerTitle.contains('albums') ||
+                fallbackLowerTitle.contains('singles') ||
+                fallbackLowerTitle.contains('eps') ||
+                fallbackLowerTitle.contains('appears on') ||
+                fallbackLowerTitle.contains('featured on') ||
+                fallbackLowerTitle.contains('playlist') ||
+                fallbackLowerTitle.contains('featuring') ||
+                fallbackLowerTitle.contains('fans also like') ||
+                fallbackLowerTitle.contains('similar artists') ||
+                fallbackLowerTitle.contains('related artists');
+
+            if (!recognizedByLegacy) {
+              final fallbackContents = musicCarousel['contents'] as List?;
+              if (fallbackContents != null) {
+                final parsedArtists = <Artist>[];
+                final parsedPlaylists = <Playlist>[];
+                final parsedAlbums = <Album>[];
+
+                for (final item in fallbackContents) {
+                  final renderer = item['musicTwoRowItemRenderer'];
+                  if (renderer == null) continue;
+
+                  final browseEndpoint =
+                      renderer['navigationEndpoint']?['browseEndpoint']
+                          as Map<String, dynamic>?;
+                  final browseId = browseEndpoint?['browseId'] as String?;
+                  if (browseId == null) continue;
+
+                  final pageType =
+                      browseEndpoint?['browseEndpointContextSupportedConfigs']?['browseEndpointContextMusicConfig']?['pageType']
+                          as String?;
+                  final itemTitle =
+                      renderer['title']?['runs']?[0]?['text'] ?? 'Unknown';
+                  final thumb =
+                      renderer['thumbnailRenderer']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+                          ?.last['url'];
+
+                  if (pageType == 'MUSIC_PAGE_TYPE_ARTIST' ||
+                      browseId.startsWith('UC')) {
+                    parsedArtists.add(
+                      Artist(
+                        id: browseId,
+                        name: itemTitle,
+                        thumbnailUrl: thumb,
+                      ),
+                    );
+                    continue;
+                  }
+
+                  if (pageType == 'MUSIC_PAGE_TYPE_PLAYLIST' ||
+                      browseId.startsWith('VL')) {
+                    final subtitleRuns = renderer['subtitle']?['runs'] as List?;
+                    parsedPlaylists.add(
+                      Playlist(
+                        id: browseId.startsWith('VL')
+                            ? browseId.replaceFirst('VL', '')
+                            : browseId,
+                        title: itemTitle,
+                        thumbnailUrl: thumb,
+                        author: subtitleRuns?.isNotEmpty == true
+                            ? subtitleRuns!.first['text'] as String?
+                            : null,
+                      ),
+                    );
+                    continue;
+                  }
+
+                  final subtitleRuns = renderer['subtitle']?['runs'] as List?;
+                  String? year;
+                  if (subtitleRuns != null) {
+                    final subtitleText = subtitleRuns
+                        .map((r) => r['text'])
+                        .join();
+                    final yearMatch = RegExp(
+                      r'\b(19|20)\d{2}\b',
+                    ).firstMatch(subtitleText);
+                    if (yearMatch != null) {
+                      year = yearMatch.group(0);
+                    }
+                  }
+
+                  parsedAlbums.add(
+                    Album(
+                      id: browseId,
+                      title: itemTitle,
+                      artist: name,
+                      thumbnailUrl: thumb,
+                      year: year,
+                    ),
+                  );
+                }
+
+                final normalizedFallbackTitle = _normalizeArtistSectionTitle(
+                  fallbackTitle,
+                );
+                if (parsedArtists.isNotEmpty) {
+                  similarArtists.addAll(parsedArtists);
+                } else if (parsedPlaylists.isNotEmpty) {
+                  playlists.addAll(parsedPlaylists);
+                } else if (parsedAlbums.isNotEmpty) {
+                  if (_isArtistSinglesSectionTitle(normalizedFallbackTitle)) {
+                    singles.addAll(parsedAlbums);
+                  } else if (_isArtistAppearsOnSectionTitle(
+                    normalizedFallbackTitle,
+                  )) {
+                    appearsOn.addAll(parsedAlbums);
+                  } else {
+                    albums.addAll(parsedAlbums);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      return Artist(
+        id: channelId,
+        name: name,
+        thumbnailUrl: thumbnailUrl,
+        description: description,
+        subscriberCount: subscriberCount,
+        topTracks: topTracks,
+        albums: albums,
+        singles: singles.isNotEmpty ? singles : null,
+        appearsOn: appearsOn.isNotEmpty ? appearsOn : null,
+        playlists: playlists.isNotEmpty ? playlists : null,
+        similarArtists: similarArtists.isNotEmpty ? similarArtists : null,
+        songsBrowseId: songsBrowseId,
+        songsParams: songsParams,
+      );
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing artist details: $e');
+      }
+      return null;
+    }
+  }
+
+  // Helper to navigate nested JSON
+  dynamic _navigateJson(Map<String, dynamic> json, List<dynamic> path) {
+    dynamic current = json;
+    for (final key in path) {
+      if (current == null) return null;
+      if (key is int) {
+        if (current is List && key < current.length) {
+          current = current[key];
+        } else {
+          return null;
+        }
+      } else {
+        if (current is Map) {
+          current = current[key];
+        } else {
+          return null;
+        }
+      }
+    }
+    return current;
+  }
+
+  String? _extractText(dynamic node) {
+    if (node == null) return null;
+    if (node is String) return node.trim().isEmpty ? null : node.trim();
+
+    if (node is Map) {
+      final simpleText = node['simpleText'] as String?;
+      if (simpleText != null && simpleText.trim().isNotEmpty) {
+        return simpleText.trim();
+      }
+
+      final runs = node['runs'] as List?;
+      if (runs != null && runs.isNotEmpty) {
+        final text = runs
+            .map((run) => run['text'] as String? ?? '')
+            .join()
+            .trim();
+        return text.isEmpty ? null : text;
+      }
+    }
+
+    if (node is List) {
+      final text = node
+          .map((item) => _extractText(item) ?? '')
+          .where((item) => item.isNotEmpty)
+          .join()
+          .trim();
+      return text.isEmpty ? null : text;
+    }
+
+    return null;
+  }
+
+  Map<String, dynamic> _buildMusicContext({
+    required String languageCode,
+    required String countryCode,
+  }) {
+    return {
+      'client': {
+        'clientName': 'WEB_REMIX',
+        'clientVersion': '1.20260114.03.00',
+        'hl': languageCode,
+        'gl': countryCode,
+        'experimentIds': <dynamic>[],
+        'experimentsToken': '',
+        'browserName': 'Chrome',
+        'browserVersion': '120.0.0.0',
+        'osName': 'Windows',
+        'osVersion': '10.0',
+        'platform': 'DESKTOP',
+        'utcOffsetMinutes': 0,
+      },
+      'user': <String, dynamic>{'lockedSafetyMode': false},
+    };
+  }
+
+  Future<ui.Locale> _resolveRequestLocale() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return resolveEffectiveAppLocale(
+        storedCode: prefs.getString(AppLocaleNotifier.localePrefKey),
+      );
+    } catch (_) {
+      return resolveEffectiveAppLocale();
+    }
+  }
+
+  Future<String> _resolveRequestCountryCode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return resolveAppContentCountryCode(
+        storedCountryCode: prefs.getString(
+          AppContentLocationNotifier.contentLocationPrefKey,
+        ),
+      );
+    } catch (_) {
+      return resolveSystemContentCountryCode();
+    }
+  }
+
+  String _acceptLanguageHeader({
+    required String languageCode,
+    required String countryCode,
+  }) {
+    return '$languageCode-$countryCode,$languageCode;q=0.9,en;q=0.8';
+  }
+
+  String _normalizeArtistSectionTitle(String? title) {
+    return (title ?? '').trim().toLowerCase();
+  }
+
+  bool _isArtistSongsSectionTitle(String? title) {
+    final normalized = _normalizeArtistSectionTitle(title);
+    return normalized == 'songs' ||
+        normalized == 'top songs' ||
+        normalized == 'şarkılar' ||
+        normalized == 'en popüler şarkılar' ||
+        normalized == 'песни' ||
+        normalized == 'популярные треки';
+  }
+
+  bool _isArtistSinglesSectionTitle(String normalizedTitle) {
+    return normalizedTitle.contains('single') ||
+        normalizedTitle.contains('singles') ||
+        normalizedTitle.contains('eps') ||
+        normalizedTitle.contains('ep') ||
+        normalizedTitle.contains('tekli') ||
+        normalizedTitle.contains('tekliler') ||
+        normalizedTitle.contains('single ve ep') ||
+        normalizedTitle.contains('сингл') ||
+        normalizedTitle.contains('синглы') ||
+        normalizedTitle.contains('ep и синглы');
+  }
+
+  bool _isArtistAppearsOnSectionTitle(String normalizedTitle) {
+    return normalizedTitle.contains('appears on') ||
+        normalizedTitle.contains('featured on') ||
+        normalizedTitle.contains('yer aldığı') ||
+        normalizedTitle.contains('öne çıkan') ||
+        normalizedTitle.contains('katıldığı') ||
+        normalizedTitle.contains('при участии') ||
+        normalizedTitle.contains('участвует');
+  }
+
+  Duration _parseDuration(String text) {
+    final parts = text.split(':').map((e) => int.tryParse(e) ?? 0).toList();
+    if (parts.length == 2) {
+      return Duration(minutes: parts[0], seconds: parts[1]);
+    } else if (parts.length == 3) {
+      return Duration(hours: parts[0], minutes: parts[1], seconds: parts[2]);
+    }
+    return Duration.zero;
+  }
+
+  // ============ HOME PAGE PARSER ============
+
+  HomePageContent _parseHomePageContent(Map<String, dynamic> response) {
+    final shelves = <HomeShelf>[];
+
+    try {
+      // Navigate to the contents
+      final tabs =
+          _navigateJson(response, [
+                'contents',
+                'singleColumnBrowseResultsRenderer',
+                'tabs',
+              ])
+              as List?;
+
+      if (tabs == null || tabs.isEmpty) return HomePageContent.empty;
+
+      final sectionList =
+          _navigateJson(tabs[0], [
+                'tabRenderer',
+                'content',
+                'sectionListRenderer',
+                'contents',
+              ])
+              as List?;
+
+      if (sectionList == null) return HomePageContent.empty;
+
+      int shelfIndex = 0;
+      for (final section in sectionList) {
+        final shelf = _parseHomeShelf(section, shelfIndex);
+        if (shelf != null && shelf.items.isNotEmpty) {
+          shelves.add(shelf);
+          shelfIndex++;
+        }
+      }
+
+      // Get continuation token if available
+      final continuations =
+          _navigateJson(response, [
+                'contents',
+                'singleColumnBrowseResultsRenderer',
+                'tabs',
+                0,
+                'tabRenderer',
+                'content',
+                'sectionListRenderer',
+                'continuations',
+              ])
+              as List?;
+
+      String? continuationToken;
+      if (continuations != null && continuations.isNotEmpty) {
+        continuationToken =
+            continuations[0]['nextContinuationData']?['continuation']
+                as String?;
+      }
+
+      return HomePageContent(
+        shelves: shelves,
+        continuationToken: continuationToken,
+        fetchedAt: DateTime.now(),
+      );
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing home page: $e');
+      }
+      return HomePageContent.empty;
+    }
+  }
+
+  HomeShelf? _parseHomeShelf(Map<String, dynamic> section, int index) {
+    try {
+      // Try different renderer types
+      final musicCarouselShelfRenderer = section['musicCarouselShelfRenderer'];
+      final musicShelfRenderer = section['musicShelfRenderer'];
+      final musicImmersiveCarouselShelfRenderer =
+          section['musicImmersiveCarouselShelfRenderer'];
+      final musicTastebuilderShelfRenderer =
+          section['musicTastebuilderShelfRenderer'];
+      final gridRenderer = section['gridRenderer'];
+
+      if (musicCarouselShelfRenderer != null) {
+        return _parseMusicCarouselShelf(musicCarouselShelfRenderer, index);
+      } else if (musicTastebuilderShelfRenderer != null) {
+        return _parseTastebuilderShelf(musicTastebuilderShelfRenderer, index);
+      } else if (musicShelfRenderer != null) {
+        return _parseMusicShelfRenderer(musicShelfRenderer, index);
+      } else if (musicImmersiveCarouselShelfRenderer != null) {
+        return _parseImmersiveCarouselShelf(
+          musicImmersiveCarouselShelfRenderer,
+          index,
+        );
+      } else if (gridRenderer != null) {
+        return _parseGridShelf(gridRenderer, index);
+      }
+
+      return null;
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing shelf: $e');
+      }
+      return null;
+    }
+  }
+
+  HomeShelf? _parseMusicCarouselShelf(
+    Map<String, dynamic> renderer,
+    int index,
+  ) {
+    final header = renderer['header']?['musicCarouselShelfBasicHeaderRenderer'];
+    if (header == null) return null;
+
+    // Get title
+    final titleRuns = header['title']?['runs'] as List?;
+    final title = titleRuns?.map((r) => r['text']).join() ?? 'Recommendations';
+
+    // Get strapline (small text above title)
+    final straplineRuns = header['strapline']?['runs'] as List?;
+    final strapline = straplineRuns?.map((r) => r['text']).join();
+
+    final headerThumbnails =
+        header['thumbnail']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+            as List?;
+    final headerThumbnailUrl =
+        headerThumbnails != null && headerThumbnails.isNotEmpty
+        ? headerThumbnails.last['url'] as String?
+        : null;
+
+    // Get browse endpoint for "See all"
+    final browseEndpoint =
+        header['title']?['runs']?[0]?['navigationEndpoint']?['browseEndpoint'];
+    final browseId = browseEndpoint?['browseId'] as String?;
+
+    // Determine shelf type from title
+    var shelfType = _determineShelfType(title, strapline);
+
+    // Parse items
+    final contents = renderer['contents'] as List? ?? [];
+    final items = <HomeShelfItem>[];
+
+    for (final content in contents) {
+      final item = _parseCarouselItem(content, shelfType);
+      if (item != null) items.add(item);
+    }
+
+    shelfType = _inferStructuralShelfType(
+      currentType: shelfType,
+      items: items,
+      isPlayable: browseId != null,
+    );
+
+    return HomeShelf(
+      id: 'shelf_$index',
+      title: title,
+      strapline: strapline,
+      headerThumbnailUrl: headerThumbnailUrl,
+      type: shelfType,
+      items: items,
+      browseId: browseId,
+    );
+  }
+
+  HomeShelf? _parseMusicShelfRenderer(
+    Map<String, dynamic> renderer,
+    int index,
+  ) {
+    final titleRuns = renderer['title']?['runs'] as List?;
+    final title = titleRuns?.map((r) => r['text']).join() ?? 'Recommendations';
+
+    var shelfType = _determineShelfType(title, null);
+
+    final contents = renderer['contents'] as List? ?? [];
+    final items = <HomeShelfItem>[];
+
+    for (final content in contents) {
+      final item = _parseMusicShelfItem(content, shelfType);
+      if (item != null) items.add(item);
+    }
+
+    // Get playlistId if this is a playable shelf (like Quick Picks)
+    final playButton = renderer['playAllButton'];
+    String? playlistId;
+    if (playButton != null) {
+      playlistId =
+          playButton['buttonRenderer']?['navigationEndpoint']?['watchEndpoint']?['playlistId']
+              as String?;
+    }
+
+    shelfType = _inferStructuralShelfType(
+      currentType: shelfType,
+      items: items,
+      isPlayable: playlistId != null,
+    );
+
+    return HomeShelf(
+      id: 'shelf_$index',
+      title: title,
+      type: shelfType,
+      items: items,
+      isPlayable: playlistId != null,
+      playlistId: playlistId,
+    );
+  }
+
+  HomeShelf? _parseImmersiveCarouselShelf(
+    Map<String, dynamic> renderer,
+    int index,
+  ) {
+    final header =
+        renderer['header']?['musicImmersiveCarouselShelfBasicHeaderRenderer'];
+    final titleRuns = header?['title']?['runs'] as List?;
+    final title = titleRuns?.map((r) => r['text']).join() ?? 'Featured';
+
+    final contents = renderer['contents'] as List? ?? [];
+    final items = <HomeShelfItem>[];
+
+    for (final content in contents) {
+      final item = _parseCarouselItem(content, HomeShelfType.mixedForYou);
+      if (item != null) items.add(item);
+    }
+
+    return HomeShelf(
+      id: 'shelf_$index',
+      title: title,
+      type: HomeShelfType.mixedForYou,
+      items: items,
+    );
+  }
+
+  /// Parse Taste Builder shelves (personalized: Mixed For You, Listen Again, etc.)
+  HomeShelf? _parseTastebuilderShelf(Map<String, dynamic> renderer, int index) {
+    try {
+      final header = renderer['header']?['musicResponsiveHeaderRenderer'];
+      if (header == null) return null;
+
+      final titleRuns = header['title']?['runs'] as List?;
+      final title = titleRuns?.map((r) => r['text']).join() ?? 'Personalized';
+
+      final subtitleRuns = header['subtitle']?['runs'] as List?;
+      final strapline = subtitleRuns?.map((r) => r['text']).join();
+
+      // Determine type from title
+      HomeShelfType shelfType = HomeShelfType.unknown;
+      if (title.contains('Mixed') || title.contains('Mix')) {
+        shelfType = HomeShelfType.mixedForYou;
+      } else if (title.contains('Listen') || title.contains('Again')) {
+        shelfType = HomeShelfType.listenAgain;
+      } else if (title.contains('Discover')) {
+        shelfType = HomeShelfType.mixedForYou;
+      } else if (title.contains('Forgotten')) {
+        shelfType = HomeShelfType.forgottenFavorites;
+      }
+
+      // Parse contents
+      final contents = renderer['contents'] as List? ?? [];
+      final items = <HomeShelfItem>[];
+
+      for (final content in contents) {
+        final item = _parseCarouselItem(content, shelfType);
+        if (item != null) items.add(item);
+      }
+
+      if (items.isEmpty) return null;
+
+      return HomeShelf(
+        id: 'shelf_$index',
+        title: title,
+        strapline: strapline,
+        type: shelfType,
+        items: items,
+      );
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing tastebuilder shelf: $e');
+      }
+      return null;
+    }
+  }
+
+  HomeShelf? _parseGridShelf(Map<String, dynamic> renderer, int index) {
+    final header = renderer['header']?['gridHeaderRenderer'];
+    final title = header?['title']?['runs']?[0]?['text'] as String? ?? 'More';
+
+    final items = renderer['items'] as List? ?? [];
+    final parsedItems = <HomeShelfItem>[];
+
+    for (final item in items) {
+      final parsed = _parseGridItem(item);
+      if (parsed != null) parsedItems.add(parsed);
+    }
+
+    return HomeShelf(
+      id: 'shelf_$index',
+      title: title,
+      type: HomeShelfType.unknown,
+      items: parsedItems,
+    );
+  }
+
+  HomeShelfType _determineShelfType(String title, String? strapline) {
+    final lowerTitle = title.toLowerCase();
+    final lowerStrapline = strapline?.toLowerCase() ?? '';
+
+    // Quick picks
+    if (lowerTitle.contains('quick picks') ||
+        lowerTitle.contains('start radio') ||
+        lowerTitle.contains('hızlı seçimler') ||
+        lowerTitle.contains('быстрый выбор') ||
+        lowerTitle.contains('быстрые подборки')) {
+      return HomeShelfType.quickPicks;
+    }
+
+    // Mixed for you / personalized mixes
+    if (lowerTitle.contains('mixed for you') ||
+        lowerTitle.contains('your mixes') ||
+        lowerTitle.contains('supermix') ||
+        lowerTitle.contains('my mix') ||
+        lowerStrapline.contains('based on your listening')) {
+      return HomeShelfType.mixedForYou;
+    }
+
+    // Discover mix
+    if (lowerTitle.contains('discover mix') ||
+        lowerTitle.contains('discover weekly') ||
+        lowerTitle.contains('discovery')) {
+      return HomeShelfType.discoverMix;
+    }
+
+    // New release mix
+    if (lowerTitle.contains('new release') && lowerTitle.contains('mix')) {
+      return HomeShelfType.newReleaseMix;
+    }
+
+    // Similar to artist
+    if (lowerTitle.contains('similar to') ||
+        lowerTitle.contains('fans also like') ||
+        lowerTitle.contains('you might also like')) {
+      return HomeShelfType.similarToArtist;
+    }
+
+    // New releases (albums)
+    if (lowerTitle.contains('new release') ||
+        lowerTitle.contains('new album') ||
+        lowerTitle.contains('fresh')) {
+      return HomeShelfType.newReleases;
+    }
+
+    // Forgotten favorites
+    if (lowerTitle.contains('forgotten') ||
+        lowerTitle.contains('throwback') ||
+        lowerTitle.contains('revisit') ||
+        lowerTitle.contains('blast from')) {
+      return HomeShelfType.forgottenFavorites;
+    }
+
+    // Listen again / Recently played
+    if (lowerTitle.contains('listen again') ||
+        lowerTitle.contains('recently played') ||
+        lowerTitle.contains('play again')) {
+      return HomeShelfType.listenAgain;
+    }
+
+    // Charts
+    if (lowerTitle.contains('chart') ||
+        lowerTitle.contains('top 100') ||
+        lowerTitle.contains('top songs') ||
+        lowerTitle.contains('trending')) {
+      return HomeShelfType.charts;
+    }
+
+    // Trending
+    if (lowerTitle.contains('trending')) {
+      return HomeShelfType.trending;
+    }
+
+    // Moods
+    if (lowerTitle.contains('mood') ||
+        lowerTitle.contains('feel good') ||
+        lowerTitle.contains('chill') ||
+        lowerTitle.contains('workout') ||
+        lowerTitle.contains('focus') ||
+        lowerTitle.contains('sleep') ||
+        lowerTitle.contains('romance')) {
+      return HomeShelfType.moods;
+    }
+
+    // Genres
+    if (lowerTitle.contains('genre') ||
+        lowerTitle.contains('pop') ||
+        lowerTitle.contains('rock') ||
+        lowerTitle.contains('hip hop') ||
+        lowerTitle.contains('r&b') ||
+        lowerTitle.contains('electronic') ||
+        lowerTitle.contains('country')) {
+      return HomeShelfType.genres;
+    }
+
+    // Videos
+    if (lowerTitle.contains('video') || lowerTitle.contains('music video')) {
+      return HomeShelfType.videos;
+    }
+
+    // Podcasts
+    if (lowerTitle.contains('podcast') ||
+        lowerTitle.contains('long listening')) {
+      return HomeShelfType.podcasts;
+    }
+
+    // Artists
+    if (lowerTitle.contains('artist') ||
+        lowerTitle.contains('recommended artist')) {
+      return HomeShelfType.artists;
+    }
+
+    return HomeShelfType.unknown;
+  }
+
+  HomeShelfType _inferStructuralShelfType({
+    required HomeShelfType currentType,
+    required List<HomeShelfItem> items,
+    required bool isPlayable,
+  }) {
+    if (currentType != HomeShelfType.unknown || items.isEmpty) {
+      return currentType;
+    }
+
+    final songCount = items
+        .where((item) => item.itemType == HomeShelfItemType.song)
+        .length;
+
+    // Locale-safe Quick Picks detection:
+    // YT Music's first song shelf can be fully localized, but it still comes
+    // through as a playable all-song shelf with a larger item count.
+    if (isPlayable && songCount >= 8 && songCount == items.length) {
+      return HomeShelfType.quickPicks;
+    }
+
+    return currentType;
+  }
+
+  HomeShelfItem? _parseCarouselItem(
+    Map<String, dynamic> content,
+    HomeShelfType shelfType,
+  ) {
+    try {
+      // Try musicTwoRowItemRenderer (most common for playlists/albums)
+      final twoRowRenderer = content['musicTwoRowItemRenderer'];
+      if (twoRowRenderer != null) {
+        return _parseTwoRowItem(twoRowRenderer, shelfType);
+      }
+
+      // Try musicResponsiveListItemRenderer (for tracks)
+      final responsiveRenderer = content['musicResponsiveListItemRenderer'];
+      if (responsiveRenderer != null) {
+        return _parseResponsiveListItem(responsiveRenderer);
+      }
+
+      // Try musicNavigationButtonRenderer (for mood/genre pills)
+      final navButtonRenderer = content['musicNavigationButtonRenderer'];
+      if (navButtonRenderer != null) {
+        return _parseNavigationButton(navButtonRenderer);
+      }
+
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  HomeShelfItem? _parseTwoRowItem(
+    Map<String, dynamic> renderer,
+    HomeShelfType shelfType,
+  ) {
+    try {
+      // Get title
+      final title =
+          renderer['title']?['runs']?[0]?['text'] as String? ?? 'Unknown';
+
+      // Get subtitle
+      final subtitleRuns = renderer['subtitle']?['runs'] as List?;
+      final subtitle = subtitleRuns?.map((r) => r['text']).join() ?? '';
+
+      // Get thumbnail
+      final thumbnails =
+          renderer['thumbnailRenderer']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+              as List?;
+      String? thumbnailUrl;
+      if (thumbnails != null && thumbnails.isNotEmpty) {
+        thumbnailUrl = thumbnails.last['url'] as String?;
+      }
+
+      // Get navigation endpoint
+      final navEndpoint = renderer['navigationEndpoint'];
+      final browseEndpoint = navEndpoint?['browseEndpoint'];
+      final watchEndpoint = navEndpoint?['watchEndpoint'];
+
+      String? navigationId;
+      String? playlistId;
+      String? videoId;
+      HomeShelfItemType itemType = HomeShelfItemType.unknown;
+      String? artistId;
+
+      if (browseEndpoint != null) {
+        navigationId = browseEndpoint['browseId'] as String?;
+        final pageType =
+            browseEndpoint['browseEndpointContextSupportedConfigs']?['browseEndpointContextMusicConfig']?['pageType']
+                as String?;
+
+        if (pageType == 'MUSIC_PAGE_TYPE_ALBUM') {
+          itemType = HomeShelfItemType.album;
+        } else if (pageType == 'MUSIC_PAGE_TYPE_PLAYLIST') {
+          itemType = shelfType == HomeShelfType.mixedForYou
+              ? HomeShelfItemType.mix
+              : HomeShelfItemType.playlist;
+          // Extract playlist ID from browse ID
+          if (navigationId != null && navigationId.startsWith('VL')) {
+            playlistId = navigationId.substring(2);
+          } else {
+            playlistId = navigationId;
+          }
+        } else if (pageType == 'MUSIC_PAGE_TYPE_ARTIST') {
+          itemType = HomeShelfItemType.artist;
+        } else if (pageType == 'MUSIC_PAGE_TYPE_PODCAST_SHOW_DETAIL_PAGE' ||
+            pageType == 'MUSIC_PAGE_TYPE_PODCAST_EPISODE_DETAIL_PAGE' ||
+            pageType == 'MUSIC_PAGE_TYPE_NON_MUSIC_AUDIO_TRACK_PAGE' ||
+            (navigationId != null &&
+                (navigationId.startsWith('MPSP') ||
+                    navigationId.startsWith('MPED')))) {
+          itemType = HomeShelfItemType.podcast;
+          playlistId = navigationId;
+        }
+      } else if (watchEndpoint != null) {
+        videoId = watchEndpoint['videoId'] as String?;
+        playlistId = watchEndpoint['playlistId'] as String?;
+        navigationId = videoId;
+        itemType = HomeShelfItemType.song;
+      }
+
+      // Check aspect ratio for mix detection
+      final aspectRatio =
+          renderer['thumbnailRenderer']?['musicThumbnailRenderer']?['thumbnailCrop']
+              as String?;
+      if (aspectRatio == 'MUSIC_THUMBNAIL_CROP_CIRCLE') {
+        itemType = HomeShelfItemType.artist;
+      }
+
+      if (shelfType == HomeShelfType.podcasts &&
+          itemType == HomeShelfItemType.unknown) {
+        itemType = HomeShelfItemType.podcast;
+        playlistId = navigationId;
+      }
+
+      Duration? parsedDuration;
+      String displaySubtitle = subtitle;
+      String? itemAlbum;
+      String? itemAlbumId;
+      if (subtitleRuns != null && subtitleRuns.isNotEmpty) {
+        if (itemType == HomeShelfItemType.song) {
+          final parsed = _extractArtistInfoFromSubtitleRuns(subtitleRuns);
+          displaySubtitle = parsed.$1;
+          artistId = parsed.$2;
+          parsedDuration = parsed.$3;
+          itemAlbum = parsed.$4;
+          itemAlbumId = parsed.$5;
+        } else if (itemType == HomeShelfItemType.album ||
+            itemType == HomeShelfItemType.playlist ||
+            itemType == HomeShelfItemType.mix) {
+          displaySubtitle = _sanitizeSubtitleText(
+            subtitleRuns,
+            fallback: subtitle,
+          );
+        }
+      }
+
+      final isExplicit = renderer.toString().contains('MUSIC_EXPLICIT_BADGE');
+
+      return HomeShelfItem(
+        id: navigationId ?? title.hashCode.toString(),
+        title: title,
+        subtitle: displaySubtitle,
+        thumbnailUrl: thumbnailUrl,
+        navigationId: navigationId,
+        itemType: itemType,
+        playlistId: playlistId,
+        videoId: videoId,
+        artistId: artistId,
+        album: itemAlbum,
+        albumId: itemAlbumId,
+        duration: parsedDuration,
+        isExplicit: isExplicit,
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  HomeShelfItem? _parseResponsiveListItem(Map<String, dynamic> renderer) {
+    try {
+      final flexColumns = renderer['flexColumns'] as List?;
+      if (flexColumns == null || flexColumns.isEmpty) return null;
+
+      // Get title
+      final titleRuns =
+          flexColumns[0]['musicResponsiveListItemFlexColumnRenderer']?['text']?['runs']
+              as List?;
+      final title = titleRuns?.map((r) => r['text']).join() ?? 'Unknown';
+
+      // Get artist and artistId
+      String? artist;
+      String? artistId;
+      Duration? parsedDuration;
+      String? itemAlbum;
+      String? itemAlbumId;
+      if (flexColumns.length > 1) {
+        final artistRuns =
+            flexColumns[1]['musicResponsiveListItemFlexColumnRenderer']?['text']?['runs']
+                as List?;
+        if (artistRuns != null && artistRuns.isNotEmpty) {
+          final parsed = _extractArtistInfoFromSubtitleRuns(artistRuns);
+          artist = parsed.$1 == 'Unknown Artist'
+              ? _sanitizeSubtitleText(artistRuns, fallback: parsed.$1)
+              : parsed.$1;
+          artistId = parsed.$2;
+          parsedDuration = parsed.$3;
+          itemAlbum = parsed.$4;
+          itemAlbumId = parsed.$5;
+        }
+      }
+
+      if (flexColumns.length > 2 && itemAlbum == null) {
+        final albumRuns = flexColumns[2]['musicResponsiveListItemFlexColumnRenderer']?['text']?['runs'] as List?;
+        if (albumRuns != null && albumRuns.isNotEmpty) {
+          final run = albumRuns.first;
+          if (run is Map) {
+            itemAlbum = run['text'] as String?;
+            itemAlbumId = run['navigationEndpoint']?['browseEndpoint']?['browseId'] as String?;
+          }
+        }
+      }
+
+      // Get thumbnail
+      final thumbnails =
+          renderer['thumbnail']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+              as List?;
+      String? thumbnailUrl;
+      if (thumbnails != null && thumbnails.isNotEmpty) {
+        thumbnailUrl = thumbnails.last['url'] as String?;
+      }
+
+      // Get video ID
+      final overlay = renderer['overlay']?['musicItemThumbnailOverlayRenderer'];
+      final playEndpoint =
+          overlay?['content']?['musicPlayButtonRenderer']?['playNavigationEndpoint'];
+      final videoId = playEndpoint?['watchEndpoint']?['videoId'] as String?;
+
+      if (videoId == null) return null;
+
+      final isExplicit = renderer.toString().contains('MUSIC_EXPLICIT_BADGE');
+
+      return HomeShelfItem(
+        id: videoId,
+        title: title,
+        subtitle: artist,
+        thumbnailUrl: thumbnailUrl,
+        itemType: HomeShelfItemType.song,
+        videoId: videoId,
+        artistId: artistId,
+        album: itemAlbum,
+        albumId: itemAlbumId,
+        duration: parsedDuration,
+        isExplicit: isExplicit,
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  HomeShelfItem? _parseMusicShelfItem(
+    Map<String, dynamic> content,
+    HomeShelfType shelfType,
+  ) {
+    // Music shelf items are typically tracks
+    return _parseCarouselItem(content, shelfType);
+  }
+
+  HomeShelfItem? _parseNavigationButton(Map<String, dynamic> renderer) {
+    try {
+      final buttonText =
+          renderer['buttonText']?['runs']?[0]?['text'] as String?;
+      if (buttonText == null) return null;
+
+      final browseEndpoint = renderer['clickCommand']?['browseEndpoint'];
+      final browseId = browseEndpoint?['browseId'] as String?;
+
+      return HomeShelfItem(
+        id: browseId ?? buttonText.hashCode.toString(),
+        title: buttonText,
+        navigationId: browseId,
+        itemType: HomeShelfItemType.mood,
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  HomeShelfItem? _parseGridItem(Map<String, dynamic> item) {
+    final renderer = item['musicTwoRowItemRenderer'];
+    if (renderer != null) {
+      return _parseTwoRowItem(renderer, HomeShelfType.unknown);
+    }
+    return null;
+  }
+
+  /// Parse continuation response for home page
+  HomePageContent _parseHomePageContinuation(Map<String, dynamic> response) {
+    final shelves = <HomeShelf>[];
+
+    try {
+      // Continuation responses have a different structure
+      final continuationContents = response['continuationContents'];
+      if (continuationContents == null) return HomePageContent.empty;
+
+      final sectionListContinuation =
+          continuationContents['sectionListContinuation'];
+      if (sectionListContinuation == null) return HomePageContent.empty;
+
+      final contents = sectionListContinuation['contents'] as List?;
+      if (contents == null) return HomePageContent.empty;
+
+      int shelfIndex = 100; // Start from 100 to avoid ID conflicts
+      for (final section in contents) {
+        final shelf = _parseHomeShelf(section, shelfIndex);
+        if (shelf != null && shelf.items.isNotEmpty) {
+          shelves.add(shelf);
+          shelfIndex++;
+        }
+      }
+
+      // Get next continuation token
+      final continuations = sectionListContinuation['continuations'] as List?;
+      String? continuationToken;
+      if (continuations != null && continuations.isNotEmpty) {
+        continuationToken =
+            continuations[0]['nextContinuationData']?['continuation']
+                as String?;
+      }
+
+      if (kDebugMode) {
+        print(
+          'Continuation parsed: ${shelves.length} new shelves, hasMore=${continuationToken != null}',
+        );
+      }
+
+      return HomePageContent(
+        shelves: shelves,
+        continuationToken: continuationToken,
+        fetchedAt: DateTime.now(),
+      );
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing home page continuation: $e');
+      }
+      return HomePageContent.empty;
+    }
+  }
+
+  /// Parse browse shelf result (for "More" / "See all" pages)
+  BrowseShelfResult _parseBrowseShelfResult(
+    Map<String, dynamic> response,
+    String browseId,
+  ) {
+    final items = <HomeShelfItem>[];
+    String? continuationToken;
+    String? title;
+
+    try {
+      // Try to get title from header
+      final header = response['header'];
+      if (header != null) {
+        title =
+            header['musicHeaderRenderer']?['title']?['runs']?[0]?['text']
+                as String?;
+        title ??=
+            header['musicDetailHeaderRenderer']?['title']?['runs']?[0]?['text']
+                as String?;
+      }
+
+      // Navigate to contents - different paths for different browse types
+      final tabs =
+          _navigateJson(response, [
+                'contents',
+                'singleColumnBrowseResultsRenderer',
+                'tabs',
+              ])
+              as List?;
+
+      List? contents;
+
+      if (kDebugMode) {
+        print(
+          'BrowseShelf Parse: tabs=${tabs != null}, tabsLength=${tabs?.length ?? 0}',
+        );
+      }
+
+      if (tabs != null && tabs.isNotEmpty) {
+        // Standard tab structure
+        contents =
+            _navigateJson(tabs[0], [
+                  'tabRenderer',
+                  'content',
+                  'sectionListRenderer',
+                  'contents',
+                ])
+                as List?;
+
+        if (kDebugMode) {
+          print(
+            'BrowseShelf Parse: sectionListContents=${contents?.length ?? 0}',
+          );
+        }
+
+        // Get continuation from sectionListRenderer
+        final continuations =
+            _navigateJson(tabs[0], [
+                  'tabRenderer',
+                  'content',
+                  'sectionListRenderer',
+                  'continuations',
+                ])
+                as List?;
+
+        if (continuations != null && continuations.isNotEmpty) {
+          continuationToken =
+              continuations[0]['nextContinuationData']?['continuation']
+                  as String?;
+        }
+      }
+
+      // Try alternative path for grid results
+      contents ??=
+          _navigateJson(response, [
+                'contents',
+                'twoColumnBrowseResultsRenderer',
+                'tabs',
+                0,
+                'tabRenderer',
+                'content',
+                'sectionListRenderer',
+                'contents',
+              ])
+              as List?;
+
+      // Parse continuation response
+      if (contents == null) {
+        final continuationContents = response['continuationContents'];
+        if (continuationContents != null) {
+          final gridContinuation = continuationContents['gridContinuation'];
+          final musicShelfContinuation =
+              continuationContents['musicShelfContinuation'];
+          final musicPlaylistShelfContinuation =
+              continuationContents['musicPlaylistShelfContinuation'];
+          final sectionListContinuation =
+              continuationContents['sectionListContinuation'];
+
+          if (gridContinuation != null) {
+            contents = gridContinuation['items'] as List?;
+            final conts = gridContinuation['continuations'] as List?;
+            if (conts != null && conts.isNotEmpty) {
+              continuationToken =
+                  conts[0]['nextContinuationData']?['continuation'] as String?;
+            }
+          } else if (musicPlaylistShelfContinuation != null) {
+            // Artist songs continuation uses musicPlaylistShelfContinuation
+            contents = musicPlaylistShelfContinuation['contents'] as List?;
+            final conts =
+                musicPlaylistShelfContinuation['continuations'] as List?;
+            if (conts != null && conts.isNotEmpty) {
+              continuationToken =
+                  conts[0]['nextContinuationData']?['continuation'] as String?;
+            }
+          } else if (musicShelfContinuation != null) {
+            contents = musicShelfContinuation['contents'] as List?;
+            final conts = musicShelfContinuation['continuations'] as List?;
+            if (conts != null && conts.isNotEmpty) {
+              continuationToken =
+                  conts[0]['nextContinuationData']?['continuation'] as String?;
+            }
+          } else if (sectionListContinuation != null) {
+            contents = sectionListContinuation['contents'] as List?;
+            final conts = sectionListContinuation['continuations'] as List?;
+            if (conts != null && conts.isNotEmpty) {
+              continuationToken =
+                  conts[0]['nextContinuationData']?['continuation'] as String?;
+            }
+          }
+        }
+      }
+
+      if (contents != null) {
+        if (kDebugMode) {
+          print(
+            'BrowseShelf Parse: Processing ${contents.length} content items',
+          );
+        }
+        for (final content in contents) {
+          // Log what renderers are in this content
+          final keys = (content as Map<String, dynamic>).keys.toList();
+          if (kDebugMode) {
+            print('BrowseShelf Parse: Content keys: $keys');
+          }
+
+          // Try to parse as different item types
+          final item = _parseBrowseItem(content);
+          if (item != null) {
+            items.add(item);
+          }
+
+          // Handle musicPlaylistShelfRenderer - used by artist songs
+          final playlistShelfContents =
+              content['musicPlaylistShelfRenderer']?['contents'] as List?;
+          if (playlistShelfContents != null) {
+            if (kDebugMode) {
+              print(
+                'BrowseShelf Parse: Found musicPlaylistShelfRenderer with ${playlistShelfContents.length} items',
+              );
+            }
+            // Get continuation from musicPlaylistShelfRenderer
+            final playlistContinuations =
+                content['musicPlaylistShelfRenderer']?['continuations']
+                    as List?;
+            if (playlistContinuations != null &&
+                playlistContinuations.isNotEmpty) {
+              continuationToken =
+                  playlistContinuations[0]['nextContinuationData']?['continuation']
+                      as String?;
+              if (kDebugMode) {
+                print(
+                  'BrowseShelf Parse: Found continuation token: ${continuationToken != null}',
+                );
+              }
+            }
+
+            for (final shelfItem in playlistShelfContents) {
+              final parsedItem = _parseBrowseItem(shelfItem);
+              if (parsedItem != null) {
+                items.add(parsedItem);
+              }
+            }
+          }
+
+          // Also check for nested items in shelf renderers
+          final shelfContents =
+              content['musicShelfRenderer']?['contents'] as List?;
+          if (shelfContents != null) {
+            for (final shelfItem in shelfContents) {
+              final parsedItem = _parseBrowseItem(shelfItem);
+              if (parsedItem != null) {
+                items.add(parsedItem);
+              }
+            }
+          }
+
+          // Check for carousel items
+          final carouselContents =
+              content['musicCarouselShelfRenderer']?['contents'] as List?;
+          if (carouselContents != null) {
+            for (final carouselItem in carouselContents) {
+              final parsedItem = _parseBrowseItem(carouselItem);
+              if (parsedItem != null) {
+                items.add(parsedItem);
+              }
+            }
+          }
+
+          // Check for grid items
+          final gridItems = content['gridRenderer']?['items'] as List?;
+          if (gridItems != null) {
+            for (final gridItem in gridItems) {
+              final parsedItem = _parseBrowseItem(gridItem);
+              if (parsedItem != null) {
+                items.add(parsedItem);
+              }
+            }
+          }
+        }
+      }
+
+      if (kDebugMode) {
+        print(
+          'BrowseShelf: Parsed ${items.length} items, hasMore=${continuationToken != null}',
+        );
+      }
+
+      return BrowseShelfResult(
+        items: items,
+        continuationToken: continuationToken,
+        title: title,
+      );
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error parsing browse shelf result: $e');
+      }
+      return BrowseShelfResult(items: items, continuationToken: null);
+    }
+  }
+
+  /// Parse a single item from browse results
+  HomeShelfItem? _parseBrowseItem(Map<String, dynamic> item) {
+    try {
+      // musicTwoRowItemRenderer - albums, playlists, artists
+      final twoRowRenderer = item['musicTwoRowItemRenderer'];
+      if (twoRowRenderer != null) {
+        final title = twoRowRenderer['title']?['runs']?[0]?['text'] as String?;
+        final subtitle = (twoRowRenderer['subtitle']?['runs'] as List?)
+            ?.map((r) => r['text'])
+            .join('');
+        final thumbnail =
+            twoRowRenderer['thumbnailRenderer']?['musicThumbnailRenderer']?['thumbnail']?['thumbnails']
+                    ?.last['url']
+                as String?;
+
+        final navEndpoint = twoRowRenderer['navigationEndpoint'];
+        final browseEndpoint = navEndpoint?['browseEndpoint'];
+        final watchEndpoint = navEndpoint?['watchEndpoint'];
+
+        final browseId = browseEndpoint?['browseId'] as String?;
+        final videoId = watchEndpoint?['videoId'] as String?;
+        final pageType =
+            browseEndpoint?['browseEndpointContextSupportedConfigs']?['browseEndpointContextMusicConfig']?['pageType']
+                as String?;
+
+        HomeShelfItemType itemType = HomeShelfItemType.unknown;
+        if (pageType == 'MUSIC_PAGE_TYPE_ALBUM') {
+          itemType = HomeShelfItemType.album;
+        } else if (pageType == 'MUSIC_PAGE_TYPE_PLAYLIST') {
+          itemType = HomeShelfItemType.playlist;
+        } else if (pageType == 'MUSIC_PAGE_TYPE_ARTIST') {
+          itemType = HomeShelfItemType.artist;
+        } else if (pageType == 'MUSIC_PAGE_TYPE_PODCAST_SHOW_DETAIL_PAGE' ||
+            pageType == 'MUSIC_PAGE_TYPE_PODCAST_EPISODE_DETAIL_PAGE' ||
+            pageType == 'MUSIC_PAGE_TYPE_NON_MUSIC_AUDIO_TRACK_PAGE' ||
+            (browseId != null &&
+                (browseId.startsWith('MPSP') ||
+                    browseId.startsWith('MPED')))) {
+          itemType = HomeShelfItemType.podcast;
+        } else if (videoId != null) {
+          itemType = HomeShelfItemType.song;
+        }
+
+        if (title != null) {
+          return HomeShelfItem(
+            id: browseId ?? videoId ?? title,
+            title: title,
+            subtitle: subtitle,
+            thumbnailUrl: thumbnail,
+            navigationId: browseId,
+            videoId: videoId,
+            itemType: itemType,
+          );
+        }
+      }
+
+      // musicResponsiveListItemRenderer - songs in lists
+      final responsiveRenderer = item['musicResponsiveListItemRenderer'];
+      if (responsiveRenderer != null) {
+        final track = _parseTrackItem(item);
+        if (track != null) {
+          return HomeShelfItem(
+            id: track.id,
+            title: track.title,
+            subtitle: track.artist,
+            thumbnailUrl: track.thumbnailUrl,
+            videoId: track.id,
+            itemType: HomeShelfItemType.song,
+            artistId: track.artistId.isNotEmpty ? track.artistId : null,
+            album: track.album,
+            albumId: track.albumId,
+            duration: track.duration,
+            isExplicit: track.isExplicit,
+          );
+        }
+      }
+
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+}
+
+/// Top-level function for compute() - decodes JSON in background isolate
+/// Must be top-level to work with compute()
+Map<String, dynamic> _jsonDecodeIsolate(String jsonString) {
+  return jsonDecode(jsonString) as Map<String, dynamic>;
+}

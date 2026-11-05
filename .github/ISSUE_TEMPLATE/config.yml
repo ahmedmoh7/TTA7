@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: Github Discussions
+    url: https://github.com/nirmaleeswar30/Inzx/discussions
+    about: Use Discussions for questions, usage help, or general support.
+
+  - name: Contributing Guide
+    url: https://github.com/nirmaleeswar30/Inzx/blob/main/CONTRIBUTING.md
+    about: Use Discussions for questions, usage help, or general support.

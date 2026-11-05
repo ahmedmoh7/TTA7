@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>/* Relative links need /docs/ (with the slash) to resolve inside docs/. */if(location.pathname.slice(-5)==="/docs")location.replace(location.pathname+"/"+location.search+location.hash);</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Now playing · Inzx Docs</title>
+<meta name="description" content="Now playing layouts, controls, lyrics, Up Next and Related.">
+<meta property="og:title" content="Now playing · Inzx Docs">
+<meta property="og:description" content="Now playing layouts, controls, lyrics, Up Next and Related.">
+<meta property="og:image" content="https://inzx.nirmaleeswar.dev/assets/img/brand.png">
+<link rel="icon" type="image/png" href="../assets/img/logo_transparent.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="docs.css">
+<script src="docs.js" defer></script>
+</head>
+<body>
+<div class="field" aria-hidden="true"></div>
+<header class="docs-top"><div class="in">
+  <a class="brand" href="../index.html" aria-label="Inzx home"><img class="mark" src="../assets/img/logo_transparent.png" alt=""><img class="word" src="../assets/img/text.png" alt="Inzx"><span class="tag">Docs</span></a>
+  <div class="top-actions">
+    <a class="btn hide-sm" href="https://github.com/nirmaleeswar30/Inzx" target="_blank" rel="noopener noreferrer">GitHub</a>
+    <a class="btn btn-primary hide-sm" href="https://github.com/nirmaleeswar30/Inzx/releases/latest" target="_blank" rel="noopener noreferrer">Download</a>
+    <button class="btn menu-btn" id="menu-btn" type="button" aria-controls="docs-nav" aria-expanded="false">Menu</button>
+  </div>
+</div></header>
+<div class="docs-shell">
+  <nav class="docs-nav" id="docs-nav" aria-label="Documentation"><noscript><a href="index.html">All docs</a></noscript></nav>
+  <main class="docs-main">
+    <article class="prose">
+<span class="crumb">Listening</span>
+<h1>Now Playing &amp; Interface</h1>
+<p class="lead">Tap the mini-player or swipe up from the navigation bar to enter the Now Playing console. Personalize the layout in <b>Settings → Appearance → Now Playing style</b>.</p>
+
+<h2 id="layouts">Now Playing Styles</h2>
+<ul>
+  <li><b>Default:</b> A modern, high-contrast rendition of the familiar YouTube Music interface with clean rounded album art and spacious controls.</li>
+  <li><b>Cinematic:</b> Full-bleed widescreen artwork spanning the upper half with atmospheric backdrops, gradient fades, and quick-action like and playlist buttons.</li>
+  <li><b>Ripple:</b> Dynamic wavy organic contours around the album art coupled with an elegant circular seek ring for one-thumb scrubbing.</li>
+  <li><b>OG:</b> The signature vintage Inzx aesthetic featuring centered card art, clean borders, and minimalist typography.</li>
+</ul>
+
+<h2 id="progressbar">Progress Bar &amp; Visualizers</h2>
+<p>Choose how track playback is visualized in <b>Settings → Appearance → Progress style</b>:</p>
+<ul>
+  <li><b>Linear:</b> Sleek, standard scrub bar with responsive drag handles and hover timestamps.</li>
+  <li><b>Waveform:</b> Pre-rendered audio waveform reflecting track dynamics and volume variations.</li>
+  <li><b>Live Spectrum:</b> Real-time responsive graphic equalizer bouncing with live frequency spectrum analysis.</li>
+</ul>
+
+<h2 id="liquidglass">Liquid Glass Navigation</h2>
+<p>Inzx features a floating, frosted liquid-glass bottom bar:</p>
+<ul>
+  <li><b>Mini-Player Vinyl Art:</b> Displays spinning micro album art when playing, pausing when playback stops.</li>
+  <li><b>Lyric Preview Snippet:</b> Displays the current live sung lyric directly above the navigation bar before opening full-screen lyrics.</li>
+  <li><b>Adaptive Theming:</b> The glass surface extracts dynamic accent pigments from the active album cover with 0 ms isolate execution.</li>
+</ul>
+
+<h2 id="controls">Controls &amp; Audio Routing</h2>
+<p>The control row gives you instant access: <b>Lyrics</b> on the far left, previous, play/pause, next, and <b>Up Next (Queue)</b> on the far right. The active audio output device (phone speaker, Bluetooth LDAC/A2DP headset, USB DAC) is shown at the bottom; tap it to open Android's audio switcher.</p>
+
+<h2 id="gestures">Gestures</h2>
+<ul>
+  <li><b>Swipe Left / Right:</b> Swipe across the album artwork to skip to the next or previous track.</li>
+  <li><b>Double-Tap Artwork:</b> Instantly adds the track to your Liked Songs library.</li>
+  <li><b>Swipe Down:</b> Dismisses the Now Playing screen back to your active tab.</li>
+  <li><b>Swipe Up:</b> Reveals the full synchronized lyrics sheet.</li>
+</ul>
+
+    </article>
+    <nav class="pager" id="pager" aria-label="Previous and next page"></nav>
+    <p class="edit">Something wrong or missing? <a href="https://github.com/nirmaleeswar30/Inzx/issues/new/choose" target="_blank" rel="noopener noreferrer">Open an issue on GitHub</a>.</p>
+  </main>
+  <aside class="docs-toc" id="docs-toc" aria-label="On this page"></aside>
+</div>
+</body>
+</html>

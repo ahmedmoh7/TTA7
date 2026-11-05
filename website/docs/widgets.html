@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>/* Relative links need /docs/ (with the slash) to resolve inside docs/. */if(location.pathname.slice(-5)==="/docs")location.replace(location.pathname+"/"+location.search+location.hash);</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Home screen widgets · Inzx Docs</title>
+<meta name="description" content="Inzx's three home screen widgets.">
+<meta property="og:title" content="Home screen widgets · Inzx Docs">
+<meta property="og:description" content="Inzx's three home screen widgets.">
+<meta property="og:image" content="https://inzx.nirmaleeswar.dev/assets/img/brand.png">
+<link rel="icon" type="image/png" href="../assets/img/logo_transparent.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="docs.css">
+<script src="docs.js" defer></script>
+</head>
+<body>
+<div class="field" aria-hidden="true"></div>
+<header class="docs-top"><div class="in">
+  <a class="brand" href="../index.html" aria-label="Inzx home"><img class="mark" src="../assets/img/logo_transparent.png" alt=""><img class="word" src="../assets/img/text.png" alt="Inzx"><span class="tag">Docs</span></a>
+  <div class="top-actions">
+    <a class="btn hide-sm" href="https://github.com/nirmaleeswar30/Inzx" target="_blank" rel="noopener noreferrer">GitHub</a>
+    <a class="btn btn-primary hide-sm" href="https://github.com/nirmaleeswar30/Inzx/releases/latest" target="_blank" rel="noopener noreferrer">Download</a>
+    <button class="btn menu-btn" id="menu-btn" type="button" aria-controls="docs-nav" aria-expanded="false">Menu</button>
+  </div>
+</div></header>
+<div class="docs-shell">
+  <nav class="docs-nav" id="docs-nav" aria-label="Documentation"><noscript><a href="index.html">All docs</a></noscript></nav>
+  <main class="docs-main">
+    <article class="prose">
+<span class="crumb">Around the app</span>
+<h1>Home screen widgets</h1>
+<p class="lead">Inzx includes three high-fidelity home screen widgets designed to blend seamlessly into your Android launcher with dynamic colors, crisp album art, and instant playback controls.</p>
+
+<h2 id="adding">Adding a widget</h2>
+<ol>
+  <li>Long-press any empty space on your Android home screen.</li>
+  <li>Select <b>Widgets</b> from the menu.</li>
+  <li>Scroll down to <b>Inzx</b> and choose from the three available widget layouts.</li>
+  <li>Drag the widget to your desired position on your home screen.</li>
+</ol>
+
+<h2 id="kinds">Available widget layouts</h2>
+<ul>
+  <li>
+    <b>2×2 Square Widget:</b> Compact and art-centric. Displays high-resolution album artwork with frosted translucent playback controls (previous, play/pause, next) and like toggle laid over the cover. Ideal for minimalist grid configurations.
+  </li>
+  <li>
+    <b>4×1 Pill Widget:</b> A slim, low-profile horizontal pill. Shows circular or rounded song thumbnail, track title, artist name, and a responsive play/pause button. Fits cleanly above or below your app dock without consuming vertical space.
+  </li>
+  <li>
+    <b>4×4 (or 4×2) Wide Console Widget:</b> The complete music dashboard for your home screen. Features large full-resolution artwork, detailed track metadata, a seek progress bar with live elapsed time, and a full row of controls: shuffle, previous track, play/pause, next track, and like toggle.
+  </li>
+</ul>
+
+<h2 id="features">Features &amp; optimization</h2>
+<ul>
+  <li><b>Material You Dynamic Colors:</b> On Android 12 and newer, widget backgrounds and accent buttons automatically extract matching palettes from your active wallpaper and current album art.</li>
+  <li><b>Zero Battery Drain:</b> State updates are pushed through Android's native <code>AppWidgetProvider</code> broadcasts only when track state transitions, avoiding battery-draining polling loops.</li>
+  <li><b>Quick Open:</b> Tapping the album artwork or song title anywhere on the widget instantly opens the Inzx Now Playing screen.</li>
+</ul>
+
+    </article>
+    <nav class="pager" id="pager" aria-label="Previous and next page"></nav>
+    <p class="edit">Something wrong or missing? <a href="https://github.com/nirmaleeswar30/Inzx/issues/new/choose" target="_blank" rel="noopener noreferrer">Open an issue on GitHub</a>.</p>
+  </main>
+  <aside class="docs-toc" id="docs-toc" aria-label="On this page"></aside>
+</div>
+</body>
+</html>

@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>/* Relative links need /docs/ (with the slash) to resolve inside docs/. */if(location.pathname.slice(-5)==="/docs")location.replace(location.pathname+"/"+location.search+location.hash);</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Integrations · Inzx Docs</title>
+<meta name="description" content="Discord Rich Presence, backup and Android Auto.">
+<meta property="og:title" content="Integrations · Inzx Docs">
+<meta property="og:description" content="Discord Rich Presence, backup and Android Auto.">
+<meta property="og:image" content="https://inzx.nirmaleeswar.dev/assets/img/brand.png">
+<link rel="icon" type="image/png" href="../assets/img/logo_transparent.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="docs.css">
+<script src="docs.js" defer></script>
+</head>
+<body>
+<div class="field" aria-hidden="true"></div>
+<header class="docs-top"><div class="in">
+  <a class="brand" href="../index.html" aria-label="Inzx home"><img class="mark" src="../assets/img/logo_transparent.png" alt=""><img class="word" src="../assets/img/text.png" alt="Inzx"><span class="tag">Docs</span></a>
+  <div class="top-actions">
+    <a class="btn hide-sm" href="https://github.com/nirmaleeswar30/Inzx" target="_blank" rel="noopener noreferrer">GitHub</a>
+    <a class="btn btn-primary hide-sm" href="https://github.com/nirmaleeswar30/Inzx/releases/latest" target="_blank" rel="noopener noreferrer">Download</a>
+    <button class="btn menu-btn" id="menu-btn" type="button" aria-controls="docs-nav" aria-expanded="false">Menu</button>
+  </div>
+</div></header>
+<div class="docs-shell">
+  <nav class="docs-nav" id="docs-nav" aria-label="Documentation"><noscript><a href="index.html">All docs</a></noscript></nav>
+  <main class="docs-main">
+    <article class="prose">
+<span class="crumb">Around the app</span>
+<h1>Integrations &amp; Ecosystem</h1>
+
+<h2 id="discord">Discord Rich Presence (RPC)</h2>
+<p>Broadcast your current listening status directly to Discord:</p>
+<ul>
+  <li><b>Live Profile Status:</b> Shows "Listening to Inzx" on your Discord profile card.</li>
+  <li><b>Rich Metadata:</b> Broadcasts current song title, performing artist, album name, and cover artwork thumbnail.</li>
+  <li><b>Live Timestamps:</b> Shows elapsed track duration and remaining time in real time.</li>
+  <li><b>Setup:</b> Head to <b>Settings → Discord</b> and log in with your Discord account to authorize Rich Presence updates.</li>
+</ul>
+
+<h2 id="jams">Real-Time Jams</h2>
+<p>Listen together with friends in perfect synchronization:</p>
+<ul>
+  <li><b>Sub-Second Sync:</b> Powered by Supabase Realtime WebSockets with continuous clock drift compensation.</li>
+  <li><b>Collaborative Queues:</b> Anyone in the Jam can propose tracks, reorder upcoming songs, or vote on what plays next.</li>
+  <li><b>Host Permissions:</b> Host can assign DJ privileges or enforce host-only playback controls to avoid tug-of-war.</li>
+  <li><b>Instant Join:</b> Friends can join via a 6-digit room code or a direct deep link shared over chat.</li>
+</ul>
+
+<h2 id="auto">Android Auto</h2>
+<p>Inzx features built-in automotive integration through Android Auto:</p>
+<ul>
+  <li><b>Distraction-Free UI:</b> High-contrast interface with large, generous touch targets for safe interaction while driving.</li>
+  <li><b>Steering-Wheel Media Keys:</b> Full integration with steering-wheel seek, skip, and volume buttons via standard Android MediaSession.</li>
+  <li><b>Car Dashboard Browsing:</b> Browse your Liked Songs, playlists, and cached offline music directly on the vehicle's infotainment screen.</li>
+</ul>
+
+<h2 id="backup">Backup &amp; Restore</h2>
+<p>Export your app configuration and data to a portable file:</p>
+<ul>
+  <li><b>Export Data:</b> <b>Settings → Backup &amp; restore</b> bundles your settings, local custom playlists, search history, and listening statistics into an encrypted JSON backup.</li>
+  <li><b>Restore Anywhere:</b> Easily import your backup when setting up a new phone or migrating builds with zero data loss.</li>
+</ul>
+
+    </article>
+    <nav class="pager" id="pager" aria-label="Previous and next page"></nav>
+    <p class="edit">Something wrong or missing? <a href="https://github.com/nirmaleeswar30/Inzx/issues/new/choose" target="_blank" rel="noopener noreferrer">Open an issue on GitHub</a>.</p>
+  </main>
+  <aside class="docs-toc" id="docs-toc" aria-label="On this page"></aside>
+</div>
+</body>
+</html>

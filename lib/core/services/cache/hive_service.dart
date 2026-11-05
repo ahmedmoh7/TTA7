@@ -1,0 +1,347 @@
+import 'package:hive_flutter/hive_flutter.dart';
+import 'package:inzx/core/services/cache/cache_config.dart';
+import 'package:inzx/data/entities/cache_metadata_entity.dart';
+import 'package:inzx/data/entities/download_entity.dart';
+import 'package:inzx/data/entities/playback_entity.dart';
+import 'package:inzx/data/entities/track_entity.dart';
+import 'package:inzx/data/entities/lyrics_entity.dart';
+import 'package:inzx/data/entities/home_shelf_entity.dart';
+import 'package:inzx/data/entities/album_cache_entity.dart';
+import 'package:inzx/data/entities/artist_cache_entity.dart';
+import 'package:inzx/data/entities/playlist_cache_entity.dart';
+import 'package:inzx/data/entities/color_cache_entity.dart';
+import 'package:inzx/data/entities/stream_cache_entity.dart';
+import 'package:inzx/data/entities/downloaded_playlist_entity.dart';
+
+class HiveService {
+  static const String _tracksBoxName = 'music_tracks';
+  static const String _searchCacheBoxName = 'music_search_cache';
+  static const String _playbackBoxName = 'music_playback';
+  static const String _metadataBoxName = 'cache_metadata';
+  static const String _downloadsBoxName = 'music_downloads';
+  static const String _lyricsBoxName = 'music_lyrics';
+  static const String _homePageBoxName = 'home_page_cache';
+  static const String _albumsBoxName = 'albums_cache';
+  static const String _artistsBoxName = 'artists_cache';
+  static const String _playlistsBoxName = 'playlists_cache';
+  static const String _colorsBoxName = 'colors_cache';
+  static const String _streamCacheBoxName = 'stream_url_cache';
+  static const String _localMusicFoldersBoxName = 'local_music_folders';
+  static const String _localMusicTracksBoxName = 'local_music_tracks';
+  static const String _downloadedPlaylistsBoxName = 'downloaded_playlists';
+
+  static late Box<TrackEntity> _tracksBox;
+  static late Box<dynamic> _searchCacheBox;
+  static late Box<PlaybackEntity> _playbackBox;
+  static late Box<CacheMetadataEntity> _metadataBox;
+  static late Box<DownloadEntity> _downloadsBox;
+  static late Box<LyricsEntity> _lyricsBox;
+  static late Box<HomePageCacheEntity> _homePageBox;
+  static late Box<AlbumCacheEntity> _albumsBox;
+  static late Box<ArtistCacheEntity> _artistsBox;
+  static late Box<PlaylistCacheEntity> _playlistsBox;
+  static late Box<ColorCacheEntity> _colorsBox;
+  static late Box<StreamCacheEntity> _streamCacheBox;
+  static late Box<String> _localMusicFoldersBox;
+  static late Box<TrackEntity> _localMusicTracksBox;
+  static late Box<DownloadedPlaylistEntity> _downloadedPlaylistsBox;
+
+  /// Initialize Hive and all boxes
+  static Future<void> init() async {
+    // Initialize Hive with Flutter support
+    await Hive.initFlutter();
+
+    // Register adapters
+    if (!Hive.isAdapterRegistered(1)) {
+      Hive.registerAdapter(TrackEntityAdapter());
+    }
+    if (!Hive.isAdapterRegistered(2)) {
+      Hive.registerAdapter(PlaybackEntityAdapter());
+    }
+    if (!Hive.isAdapterRegistered(3)) {
+      Hive.registerAdapter(CacheMetadataEntityAdapter());
+    }
+    if (!Hive.isAdapterRegistered(4)) {
+      Hive.registerAdapter(DownloadEntityAdapter());
+    }
+    if (!Hive.isAdapterRegistered(5)) {
+      Hive.registerAdapter(LyricsEntityAdapter());
+    }
+    if (!Hive.isAdapterRegistered(6)) {
+      Hive.registerAdapter(HomePageCacheEntityAdapter());
+    }
+    if (!Hive.isAdapterRegistered(7)) {
+      Hive.registerAdapter(AlbumCacheEntityAdapter());
+    }
+    if (!Hive.isAdapterRegistered(8)) {
+      Hive.registerAdapter(ArtistCacheEntityAdapter());
+    }
+    if (!Hive.isAdapterRegistered(9)) {
+      Hive.registerAdapter(PlaylistCacheEntityAdapter());
+    }
+    if (!Hive.isAdapterRegistered(10)) {
+      Hive.registerAdapter(ColorCacheEntityAdapter());
+    }
+    if (!Hive.isAdapterRegistered(11)) {
+      Hive.registerAdapter(StreamCacheEntityAdapter());
+    }
+    if (!Hive.isAdapterRegistered(12)) {
+      Hive.registerAdapter(DownloadedPlaylistEntityAdapter());
+    }
+
+    // Open boxes
+    _tracksBox = await Hive.openBox<TrackEntity>(_tracksBoxName);
+    _searchCacheBox = await Hive.openBox(_searchCacheBoxName);
+    _playbackBox = await Hive.openBox<PlaybackEntity>(_playbackBoxName);
+    _metadataBox = await Hive.openBox<CacheMetadataEntity>(_metadataBoxName);
+    _downloadsBox = await Hive.openBox<DownloadEntity>(_downloadsBoxName);
+    _lyricsBox = await Hive.openBox<LyricsEntity>(_lyricsBoxName);
+    _homePageBox = await Hive.openBox<HomePageCacheEntity>(_homePageBoxName);
+    _albumsBox = await Hive.openBox<AlbumCacheEntity>(_albumsBoxName);
+    _artistsBox = await Hive.openBox<ArtistCacheEntity>(_artistsBoxName);
+    _playlistsBox = await Hive.openBox<PlaylistCacheEntity>(_playlistsBoxName);
+    // One-time migration: earlier builds cached playlists before ownership info
+    // (isEditable/privacy) existed, so every cached playlist reads as
+    // non-editable. Clear the playlist cache once so owned playlists re-fetch
+    // and light up the edit/reorder UI.
+    const playlistEditableMigrationKey = 'playlist_cache_editable_migration_v1';
+    try {
+      if (_searchCacheBox.get(playlistEditableMigrationKey) != true) {
+        await _playlistsBox.clear();
+        await _searchCacheBox.put(playlistEditableMigrationKey, true);
+      }
+    } catch (_) {}
+    _colorsBox = await Hive.openBox<ColorCacheEntity>(_colorsBoxName);
+    _streamCacheBox = await Hive.openBox<StreamCacheEntity>(
+      _streamCacheBoxName,
+    );
+    _localMusicFoldersBox = await Hive.openBox<String>(
+      _localMusicFoldersBoxName,
+    );
+    _localMusicTracksBox = await Hive.openBox<TrackEntity>(
+      _localMusicTracksBoxName,
+    );
+    _downloadedPlaylistsBox = await Hive.openBox<DownloadedPlaylistEntity>(
+      _downloadedPlaylistsBoxName,
+    );
+
+    // Clean up expired cache entries and enforce limits on init
+    _cleanupExpiredEntries();
+    _enforceAllEntryLimits();
+  }
+
+  /// Clean up expired cache entries
+  static Future<void> _cleanupExpiredEntries() async {
+    final expiredKeys = <String>[];
+    for (final entry in _metadataBox.values) {
+      if (entry.isExpired()) {
+        expiredKeys.add(entry.key);
+      }
+    }
+
+    for (final key in expiredKeys) {
+      await _searchCacheBox.delete(key);
+      await _metadataBox.delete(key);
+    }
+
+    // Clean up expired lyrics
+    final expiredLyrics = <String>[];
+    for (final entry in _lyricsBox.values) {
+      if (entry.isExpired) {
+        expiredLyrics.add(entry.trackId);
+      }
+    }
+    for (final key in expiredLyrics) {
+      await _lyricsBox.delete(key);
+    }
+
+    // Clean up expired albums
+    final expiredAlbums = <String>[];
+    for (final entry in _albumsBox.values) {
+      if (entry.isExpired) {
+        expiredAlbums.add(entry.albumId);
+      }
+    }
+    for (final key in expiredAlbums) {
+      await _albumsBox.delete(key);
+    }
+
+    // Clean up expired artists
+    final expiredArtists = <String>[];
+    for (final entry in _artistsBox.values) {
+      if (entry.isExpired) {
+        expiredArtists.add(entry.artistId);
+      }
+    }
+    for (final key in expiredArtists) {
+      await _artistsBox.delete(key);
+    }
+
+    // Clean up expired playlists
+    final expiredPlaylists = <String>[];
+    for (final entry in _playlistsBox.values) {
+      if (entry.isExpired) {
+        expiredPlaylists.add(entry.playlistId);
+      }
+    }
+    for (final key in expiredPlaylists) {
+      await _playlistsBox.delete(key);
+    }
+
+    // Clean up expired stream cache entries
+    final expiredStreams = <String>[];
+    for (final entry in _streamCacheBox.values) {
+      if (entry.isExpired) {
+        expiredStreams.add(entry.videoId);
+      }
+    }
+    for (final key in expiredStreams) {
+      await _streamCacheBox.delete(key);
+    }
+
+    // Clean up expired colors cache (older than 90 days)
+    final cutoffDate = DateTime.now().subtract(
+      Duration(days: CacheLimits.maxAgeDays),
+    );
+    final expiredColors = <String>[];
+    for (final entry in _colorsBox.values) {
+      if (entry.cachedAt.isBefore(cutoffDate)) {
+        expiredColors.add(entry.imageUrl);
+      }
+    }
+    for (final key in expiredColors) {
+      await _colorsBox.delete(key);
+    }
+  }
+
+  /// Enforce entry limits on all boxes (LRU eviction)
+  static Future<void> _enforceAllEntryLimits() async {
+    // Tracks box
+    await _enforceEntryLimit(
+      _tracksBox,
+      CacheLimits.maxTracksEntries,
+      (e) => e.id,
+    );
+
+    // Albums box
+    await _enforceEntryLimit(
+      _albumsBox,
+      CacheLimits.maxAlbumsEntries,
+      (e) => e.albumId,
+    );
+
+    // Artists box
+    await _enforceEntryLimit(
+      _artistsBox,
+      CacheLimits.maxArtistsEntries,
+      (e) => e.artistId,
+    );
+
+    // Playlists box
+    await _enforceEntryLimit(
+      _playlistsBox,
+      CacheLimits.maxPlaylistsEntries,
+      (e) => e.playlistId,
+    );
+
+    // Lyrics box
+    await _enforceEntryLimit(
+      _lyricsBox,
+      CacheLimits.maxLyricsEntries,
+      (e) => e.trackId,
+    );
+
+    // Stream cache box
+    await _enforceEntryLimit(
+      _streamCacheBox,
+      CacheLimits.maxStreamCacheEntries,
+      (e) => e.videoId,
+    );
+
+    // Colors box
+    await _enforceEntryLimit(
+      _colorsBox,
+      CacheLimits.maxColorsEntries,
+      (e) => e.imageUrl,
+    );
+  }
+
+  /// Enforce entry limit on a single box by removing oldest entries
+  static Future<void> _enforceEntryLimit<T>(
+    Box<T> box,
+    int maxEntries,
+    String Function(T) getKey,
+  ) async {
+    if (box.length <= maxEntries) return;
+
+    // Get all keys (oldest first based on insertion order)
+    final keys = box.keys.toList();
+    final entriesToRemove = keys.length - maxEntries;
+
+    // Remove oldest entries
+    for (int i = 0; i < entriesToRemove; i++) {
+      await box.delete(keys[i]);
+    }
+  }
+
+  // ============ Getters ============
+  static Box<TrackEntity> get tracksBox => _tracksBox;
+  static Box<dynamic> get searchCacheBox => _searchCacheBox;
+  static Box<PlaybackEntity> get playbackBox => _playbackBox;
+  static Box<CacheMetadataEntity> get metadataBox => _metadataBox;
+  static Box<DownloadEntity> get downloadsBox => _downloadsBox;
+  static Box<LyricsEntity> get lyricsBox => _lyricsBox;
+  static Box<HomePageCacheEntity> get homePageBox => _homePageBox;
+  static Box<AlbumCacheEntity> get albumsBox => _albumsBox;
+  static Box<ArtistCacheEntity> get artistsBox => _artistsBox;
+  static Box<PlaylistCacheEntity> get playlistsBox => _playlistsBox;
+  static Box<ColorCacheEntity> get colorsBox => _colorsBox;
+  static Box<StreamCacheEntity> get streamCacheBox => _streamCacheBox;
+  static Box<String> get localMusicFoldersBox => _localMusicFoldersBox;
+  static Box<TrackEntity> get localMusicTracksBox => _localMusicTracksBox;
+  static Box<DownloadedPlaylistEntity> get downloadedPlaylistsBox =>
+      _downloadedPlaylistsBox;
+
+  // ============ Cleanup ============
+  static Future<void> closeAllBoxes() async {
+    await Hive.close();
+  }
+
+  static Future<void> clearAllBoxes() async {
+    await _tracksBox.clear();
+    await _searchCacheBox.clear();
+    await _playbackBox.clear();
+    await _metadataBox.clear();
+    await _downloadsBox.clear();
+    await _lyricsBox.clear();
+    await _homePageBox.clear();
+    await _albumsBox.clear();
+    await _artistsBox.clear();
+    await _playlistsBox.clear();
+    await _colorsBox.clear();
+    await _streamCacheBox.clear();
+    await _localMusicFoldersBox.clear();
+    await _localMusicTracksBox.clear();
+    await _downloadedPlaylistsBox.clear();
+  }
+
+  /// Compact all boxes to reclaim disk space from deleted entries
+  /// Call this periodically (e.g., monthly) or after major cleanup
+  static Future<void> compactAllBoxes() async {
+    await _tracksBox.compact();
+    await _searchCacheBox.compact();
+    await _playbackBox.compact();
+    await _metadataBox.compact();
+    await _downloadsBox.compact();
+    await _lyricsBox.compact();
+    await _homePageBox.compact();
+    await _albumsBox.compact();
+    await _artistsBox.compact();
+    await _playlistsBox.compact();
+    await _colorsBox.compact();
+    await _streamCacheBox.compact();
+    await _localMusicFoldersBox.compact();
+    await _localMusicTracksBox.compact();
+    await _downloadedPlaylistsBox.compact();
+  }
+}

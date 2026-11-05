@@ -1,0 +1,57 @@
+name: Feature request
+description: Suggest an idea or improvement
+title: "feature: "
+labels: [enhancement]
+
+body:
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: "Before submitting, please confirm:"
+      options:
+        - label: This feature has not already been requested (open or closed).
+          required: true
+        - label: This request aligns with the scope of the project.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: Clearly describe the problem or limitation you are experiencing.
+      placeholder: |
+        The current workflow requires multiple manual steps.
+        /
+        It is difficult to configure the application for large-scale usage.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Describe the feature or improvement you would like to see.
+      placeholder: |
+        Introduce a configuration option to automate common setup tasks.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe any alternative solutions or approaches you have considered.
+      placeholder: |
+        Manual configuration or external tooling.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Add any other relevant information, references, or mockups.
+      placeholder: |
+        Links to related issues, documentation, or examples from similar projects.
+    validations:
+      required: false

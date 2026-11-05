@@ -1,0 +1,1631 @@
+import 'dart:ui';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import '../../services/album_color_extractor.dart';
+import 'package:share_plus/share_plus.dart';
+import '../../core/design_system/design_system.dart';
+import '../../core/l10n/app_localizations_x.dart';
+import '../../models/models.dart';
+import '../../providers/providers.dart';
+import '../../services/artist_service.dart';
+import '../../services/deep_link_handler.dart';
+import '../../services/download_service.dart';
+import '../../services/local_music_scanner.dart';
+import 'track_options_sheet.dart';
+import 'album_screen.dart';
+import 'playlist_screen.dart';
+import 'podcast_screen.dart';
+import 'mini_player.dart';
+import 'now_playing_screen.dart';
+import 'shelf_details_screen.dart';
+
+import 'package:skeletonizer/skeletonizer.dart';
+
+// ============ PROVIDERS ============
+
+/// Artist service provider
+final artistServiceProvider = Provider<ArtistService>((ref) {
+  final innerTube = ref.watch(innerTubeServiceProvider);
+  return ArtistService(innerTube);
+});
+
+/// Enhanced artist page data provider
+final artistPageProvider = FutureProvider.autoDispose
+    .family<ArtistPageData, String>((ref, artistId) async {
+      // Get local library for merged results
+      final downloadedTracks =
+          ref.read(downloadedTracksProvider).valueOrNull ?? [];
+      final localTracks = ref.read(localTracksProvider);
+      final allLocalTracks = [...downloadedTracks, ...localTracks];
+
+      final artistService = ref.read(artistServiceProvider);
+      return artistService.getArtist(
+        artistId,
+        localLibrary: allLocalTracks.isNotEmpty ? allLocalTracks : null,
+      );
+    });
+
+final artistSubscribeBusyProvider = StateProvider.autoDispose
+    .family<bool, String>((ref, artistId) => false);
+
+final artistSubscribeOptimisticProvider = StateProvider.autoDispose
+    .family<bool?, String>((ref, artistId) => null);
+
+final artistDescriptionExpandedProvider = StateProvider.autoDispose
+    .family<bool, String>((ref, artistId) => false);
+
+/// Page palette extracted from the artist image (same extractor as the
+/// player, so the page is tinted the way the artist's photo is).
+final artistColorsProvider =
+    FutureProvider.autoDispose.family<AlbumColors?, String?>((
+      ref,
+      imageUrl,
+    ) async {
+      if (imageUrl == null || imageUrl.isEmpty) return null;
+      try {
+        final colors = await AlbumColorExtractor.extractFromUrl(imageUrl);
+        return colors.isDefault ? null : colors;
+      } catch (_) {
+        return null;
+      }
+    });
+
+// ============ ARTIST SCREEN ============
+
+/// OuterTune-style Artist/Channel screen
+///
+/// Key design principles:
+/// 1. Uses browseId, not artist names
+/// 2. Renders YTM shelves faithfully (songs, albums, singles, etc.)
+/// 3. Dynamic theming from artist image
+/// 4. Local tracks shown separately (additive, not merged)
+/// 5. Supports pagination for large catalogs
+/// 6. Distinguishes music artists from generic channels
+class ArtistPageScreen extends ConsumerStatefulWidget {
+  final String artistId;
+  final String? artistName;
+  final String? thumbnailUrl;
+
+  const ArtistPageScreen({
+    super.key,
+    required this.artistId,
+    this.artistName,
+    this.thumbnailUrl,
+  });
+
+  static void open(
+    BuildContext context, {
+    required String artistId,
+    String? name,
+    String? thumbnailUrl,
+  }) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => ArtistPageScreen(
+          artistId: artistId,
+          artistName: name,
+          thumbnailUrl: thumbnailUrl,
+        ),
+      ),
+    );
+  }
+
+  @override
+  ConsumerState<ArtistPageScreen> createState() => _ArtistPageScreenState();
+}
+
+class _ArtistPageScreenState extends ConsumerState<ArtistPageScreen> {
+  @override
+  Widget build(BuildContext context) {
+    final l10n = context.l10n;
+    final artistAsync = ref.watch(artistPageProvider(widget.artistId));
+    final playerService = ref.read(audioPlayerServiceProvider);
+    final playbackState = ref.watch(playbackStateProvider);
+    final currentTrack = ref.watch(currentTrackProvider);
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return Scaffold(
+      backgroundColor: isDark ? Colors.black : colorScheme.surface,
+      body: artistAsync.when(
+        loading: () => _buildLoadingState(),
+        error: (e, _) => _buildErrorState(l10n.errorLoadingArtist),
+        data: (artistData) => _ArtistContent(
+          artistData: artistData,
+          playerService: playerService,
+          playbackState: playbackState,
+          currentTrack: currentTrack,
+          initialThumbnail: widget.thumbnailUrl,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLoadingState() {
+    final l10n = context.l10n;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
+    return CustomScrollView(
+      slivers: [
+        SliverAppBar(
+          backgroundColor: Colors.transparent,
+          leading: IconButton(
+            icon: Icon(
+              Icons.arrow_back,
+              color: isDark ? Colors.white : colorScheme.onSurface,
+            ),
+            onPressed: () => Navigator.pop(context),
+          ),
+        ),
+        SliverToBoxAdapter(
+          child: Column(
+            children: [
+              const SizedBox(height: 40),
+              // Placeholder image
+              Container(
+                width: 200,
+                height: 200,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: isDark ? Colors.grey[900] : Colors.grey[200],
+                ),
+                child: widget.thumbnailUrl != null
+                    ? ClipOval(
+                        child: CachedNetworkImage(
+                          imageUrl: widget.thumbnailUrl!,
+                          fit: BoxFit.cover,
+                        ),
+                      )
+                    : Icon(
+                        Icons.person,
+                        size: 80,
+                        color: isDark
+                            ? Colors.white24
+                            : colorScheme.onSurface.withValues(alpha: 0.24),
+                      ),
+              ),
+              const SizedBox(height: 24),
+              Text(
+                widget.artistName ?? l10n.loading,
+                style: TextStyle(
+                  color: isDark ? Colors.white : colorScheme.onSurface,
+                  fontSize: 28,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 40),
+            ],
+          ),
+        ),
+        SliverSkeletonizer(
+          enabled: true,
+          child: SliverList(
+            delegate: SliverChildBuilderDelegate(
+              (context, index) => ListTile(
+                leading: Skeleton.replace(
+                  width: 48,
+                  height: 48,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: Colors.grey,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                  ),
+                ),
+                title: Text(BoneMock.name),
+                subtitle: Text(BoneMock.words(2)),
+                trailing: const Icon(Icons.more_vert),
+              ),
+              childCount: 5,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildErrorState(String message) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(
+            Icons.error_outline,
+            size: 64,
+            color: isDark
+                ? Colors.white38
+                : colorScheme.onSurface.withValues(alpha: 0.38),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            message,
+            style: TextStyle(
+              color: isDark
+                  ? Colors.white70
+                  : colorScheme.onSurface.withValues(alpha: 0.7),
+            ),
+          ),
+          const SizedBox(height: 24),
+          TextButton(
+            onPressed: () =>
+                ref.invalidate(artistPageProvider(widget.artistId)),
+            child: Text(context.l10n.retry),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Artist content widget with dynamic theming
+class _ArtistContent extends ConsumerWidget {
+  final ArtistPageData artistData;
+  final dynamic playerService;
+  final AsyncValue playbackState;
+  final Track? currentTrack;
+  final String? initialThumbnail;
+
+  const _ArtistContent({
+    required this.artistData,
+    required this.playerService,
+    required this.playbackState,
+    required this.currentTrack,
+    this.initialThumbnail,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final hasCurrentTrack = currentTrack != null;
+    final authState = ref.watch(ytMusicAuthStateProvider);
+    final subscribedArtists = ref.watch(ytMusicLibrarySubscriptionsProvider);
+    final subscribeBusy = ref.watch(artistSubscribeBusyProvider(artistData.id));
+    final optimisticSubscribed = ref.watch(
+      artistSubscribeOptimisticProvider(artistData.id),
+    );
+    final isDescriptionExpanded = ref.watch(
+      artistDescriptionExpandedProvider(artistData.id),
+    );
+    final isSubscribed =
+        optimisticSubscribed ??
+        subscribedArtists.valueOrNull?.any(
+          (artist) => artist.id == artistData.id,
+        ) ??
+        false;
+
+    // Get dynamic theme color from artist image
+    final themeColorAsync = ref.watch(
+      artistColorsProvider(artistData.thumbnailUrl ?? initialThumbnail),
+    );
+    final rawArtistColors = themeColorAsync.valueOrNull;
+    final artistColors = rawArtistColors == null
+        ? null
+        : (isDark ? rawArtistColors : rawArtistColors.toLightMode());
+    final themeColor = artistColors?.accent ?? colorScheme.primary;
+
+    // Check if this artist's tracks are currently playing
+    final queueSourceId = ref.watch(queueSourceIdProvider);
+    final isArtistPlaying = queueSourceId == artistData.id;
+    final playingState = playbackState.whenOrNull(data: (s) => s.isPlaying);
+    final isPlaying = (playingState is bool) ? playingState : false;
+
+    return Stack(
+      children: [
+        // Dynamic background gradient
+        _buildBackground(
+          context,
+          artistData.thumbnailUrl,
+          themeColor,
+          artistColors,
+        ),
+
+        Column(
+          children: [
+            Expanded(
+              child: CustomScrollView(
+                physics: const BouncingScrollPhysics(),
+                slivers: [
+                  // App bar
+                  SliverAppBar(
+                    backgroundColor: Colors.transparent,
+                    elevation: 0,
+                    pinned: false,
+                    leading: IconButton(
+                      icon: Icon(
+                        Icons.arrow_back,
+                        color: isDark ? Colors.white : colorScheme.onSurface,
+                      ),
+                      onPressed: () => Navigator.pop(context),
+                    ),
+                    actions: [
+                      IconButton(
+                        icon: Icon(
+                          Icons.more_vert,
+                          color: isDark ? Colors.white : colorScheme.onSurface,
+                        ),
+                        onPressed: () => _showOptionsSheet(context, ref),
+                      ),
+                    ],
+                  ),
+
+                  // Header section
+                  SliverToBoxAdapter(
+                    child: _buildHeader(
+                      context,
+                      ref,
+                      themeColor,
+                      isArtistPlaying,
+                      isPlaying,
+                      authState.isLoggedIn,
+                      isSubscribed,
+                      subscribeBusy,
+                      isDescriptionExpanded,
+                    ),
+                  ),
+
+                  // Local tracks section (if any)
+                  if (artistData.localTracks.isNotEmpty)
+                    ..._buildLocalTracksSection(context, ref),
+
+                  // Render each shelf from YouTube Music
+                  for (final shelf in artistData.shelves)
+                    ..._buildShelfSection(context, ref, shelf, themeColor),
+
+                  // Bottom padding
+                  const SliverPadding(padding: EdgeInsets.only(bottom: 120)),
+                ],
+              ),
+            ),
+
+          ],
+        ),
+        // Mini player: floats over the list (which scrolls behind it).
+        if (hasCurrentTrack)
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: MusicMiniPlayer(onTap: () => NowPlayingScreen.show(context)),
+          ),
+      ],
+    );
+  }
+
+  String _localizedShelfTitle(BuildContext context, ArtistShelf shelf) {
+    switch (shelf.type) {
+      case ArtistShelfType.songs:
+        return context.l10n.songs;
+      case ArtistShelfType.albums:
+        return context.l10n.albums;
+      case ArtistShelfType.singles:
+      case ArtistShelfType.eps:
+        return context.l10n.singlesAndEps;
+      case ArtistShelfType.appearsOn:
+      case ArtistShelfType.featuredOn:
+        return context.l10n.appearsOn;
+      case ArtistShelfType.playlists:
+        return context.l10n.playlists;
+      case ArtistShelfType.similar:
+      case ArtistShelfType.fans:
+        return context.l10n.fansAlsoLike;
+      default:
+        return shelf.title;
+    }
+  }
+
+  Widget _buildBackground(
+    BuildContext context,
+    String? imageUrl,
+    Color themeColor,
+    AlbumColors? artistColors,
+  ) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
+    final pageBase = artistColors?.backgroundPrimary ??
+        (isDark ? Colors.black : colorScheme.surface);
+    final pageEnd = artistColors?.backgroundSecondary ?? pageBase;
+
+    return Positioned.fill(
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          // Whole page tinted with the colours extracted from the artist image
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 450),
+            curve: Curves.easeOutCubic,
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [pageBase, pageEnd],
+              ),
+            ),
+          ),
+          if (imageUrl != null)
+            CachedNetworkImage(
+              imageUrl: imageUrl,
+              fit: BoxFit.cover,
+              alignment: Alignment.topCenter,
+              memCacheWidth: 100,
+              color: pageBase.withValues(alpha: 0.55),
+              colorBlendMode: BlendMode.srcOver,
+            ),
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  themeColor.withValues(alpha: isDark ? 0.3 : 0.14),
+                  pageBase.withValues(alpha: 0.75),
+                  pageEnd,
+                ],
+                stops: const [0.0, 0.4, 1.0],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHeader(
+    BuildContext context,
+    WidgetRef ref,
+    Color themeColor,
+    bool isArtistPlaying,
+    bool isPlaying,
+    bool isLoggedIn,
+    bool isSubscribed,
+    bool subscribeBusy,
+    bool isDescriptionExpanded,
+  ) {
+    final l10n = context.l10n;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
+    final topTracks = artistData.topTracks;
+    final playIconColor =
+        ThemeData.estimateBrightnessForColor(themeColor) == Brightness.dark
+        ? Colors.white
+        : Colors.black;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24),
+      child: Column(
+        children: [
+          const SizedBox(height: 10),
+
+          // Artist image (circular)
+          Container(
+            width: 200,
+            height: 200,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: themeColor.withValues(alpha: 0.4),
+                  blurRadius: 30,
+                  offset: const Offset(0, 10),
+                ),
+              ],
+            ),
+            child: ClipOval(
+              child: artistData.thumbnailUrl != null
+                  ? CachedNetworkImage(
+                      imageUrl: artistData.thumbnailUrl!.replaceAll(
+                        'w120-h120',
+                        'w400-h400',
+                      ),
+                      fit: BoxFit.cover,
+                      placeholder: (_, _) => Container(
+                        color: isDark ? Colors.grey[900] : Colors.grey[200],
+                      ),
+                      errorWidget: (_, _, _) => Container(
+                        color: isDark ? Colors.grey[900] : Colors.grey[200],
+                      ),
+                    )
+                  : Container(
+                      color: isDark ? Colors.grey[900] : Colors.grey[200],
+                      child: Icon(
+                        Icons.person,
+                        color: isDark
+                            ? Colors.white38
+                            : colorScheme.onSurface.withValues(alpha: 0.38),
+                        size: 80,
+                      ),
+                    ),
+            ),
+          ),
+          const SizedBox(height: 24),
+
+          // Artist name
+          Text(
+            artistData.name,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: isDark ? Colors.white : colorScheme.onSurface,
+              fontSize: 28,
+              fontWeight: FontWeight.bold,
+              letterSpacing: -0.5,
+            ),
+          ),
+          const SizedBox(height: 8),
+
+          // Subscriber count
+          if (artistData.subscriberCount != null)
+            Text(
+              l10n.subscribersCount(
+                _formatNumber(context, artistData.subscriberCount!),
+              ),
+              style: TextStyle(
+                color: isDark
+                    ? Colors.white70
+                    : colorScheme.onSurface.withValues(alpha: 0.7),
+                fontSize: 16,
+              ),
+            ),
+
+          // Description
+          if (artistData.description != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: artistData.description!.trim().isEmpty
+                    ? null
+                    : () {
+                        ref
+                                .read(
+                                  artistDescriptionExpandedProvider(
+                                    artistData.id,
+                                  ).notifier,
+                                )
+                                .state =
+                            !isDescriptionExpanded;
+                      },
+                child: Text(
+                  artistData.description!,
+                  textAlign: TextAlign.center,
+                  maxLines: isDescriptionExpanded ? null : 3,
+                  overflow: isDescriptionExpanded
+                      ? TextOverflow.visible
+                      : TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: isDark
+                        ? Colors.white54
+                        : colorScheme.onSurface.withValues(alpha: 0.54),
+                    fontSize: 14,
+                  ),
+                ),
+              ),
+            ),
+
+          // Entity type badge (for channels)
+          if (!artistData.isMusicArtist)
+            Container(
+              margin: const EdgeInsets.only(top: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              decoration: BoxDecoration(
+                color: isDark
+                    ? Colors.white.withValues(alpha: 0.1)
+                    : Colors.black.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Text(
+                l10n.channel,
+                style: TextStyle(
+                  color: isDark
+                      ? Colors.white54
+                      : colorScheme.onSurface.withValues(alpha: 0.54),
+                  fontSize: 12,
+                ),
+              ),
+            ),
+
+          const SizedBox(height: 32),
+
+          Center(
+            child: FilledButton.tonalIcon(
+              onPressed: subscribeBusy
+                  ? null
+                  : () => _toggleSubscription(
+                      context,
+                      ref,
+                      isLoggedIn: isLoggedIn,
+                      isSubscribed: isSubscribed,
+                    ),
+              icon: subscribeBusy
+                  ? SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: isDark ? Colors.white : colorScheme.onSurface,
+                      ),
+                    )
+                  : Icon(
+                      isSubscribed ? Icons.check_rounded : Icons.add_rounded,
+                    ),
+              label: Text(
+                isLoggedIn
+                    ? (isSubscribed ? l10n.following : l10n.follow)
+                    : l10n.follow,
+              ),
+              style: FilledButton.styleFrom(
+                backgroundColor: isDark
+                    ? Colors.white.withValues(alpha: 0.12)
+                    : Colors.black.withValues(alpha: 0.08),
+                foregroundColor: isDark ? Colors.white : colorScheme.onSurface,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 18,
+                  vertical: 12,
+                ),
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 24),
+
+          // Action buttons (from YTM navigation endpoints)
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _buildActionButton(context, Icons.shuffle, l10n.shuffle, () {
+                if (topTracks.isNotEmpty) {
+                  final shuffled = List<Track>.from(topTracks)..shuffle();
+                  playerService.playQueue(
+                    shuffled,
+                    startIndex: 0,
+                    sourceId: artistData.id,
+                  );
+                }
+              }),
+
+              // Main play button
+              Container(
+                height: 64,
+                width: 64,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: themeColor,
+                ),
+                child: IconButton(
+                  icon: Icon(
+                    isArtistPlaying && isPlaying
+                        ? Icons.pause_rounded
+                        : Icons.play_arrow_rounded,
+                    color: playIconColor,
+                  ),
+                  iconSize: 36,
+                  onPressed: () {
+                    if (topTracks.isNotEmpty) {
+                      if (isArtistPlaying && isPlaying) {
+                        playerService.pause();
+                      } else {
+                        playerService.playQueue(
+                          topTracks,
+                          startIndex: 0,
+                          sourceId: artistData.id,
+                        );
+                      }
+                    }
+                  },
+                ),
+              ),
+
+              _buildActionButton(context, Icons.radio, l10n.radio, () {
+                if (topTracks.isNotEmpty) {
+                  playerService.startRadio(topTracks.first);
+                }
+              }),
+            ],
+          ),
+
+          const SizedBox(height: 32),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _toggleSubscription(
+    BuildContext context,
+    WidgetRef ref, {
+    required bool isLoggedIn,
+    required bool isSubscribed,
+  }) async {
+    if (!isLoggedIn) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(context.l10n.connectYtMusicToFollowArtists)),
+      );
+      return;
+    }
+
+    final busyNotifier = ref.read(
+      artistSubscribeBusyProvider(artistData.id).notifier,
+    );
+    final optimisticNotifier = ref.read(
+      artistSubscribeOptimisticProvider(artistData.id).notifier,
+    );
+    final subscribeAction = ref.read(ytMusicSubscribeActionProvider);
+    final nextSubscribed = !isSubscribed;
+
+    busyNotifier.state = true;
+    optimisticNotifier.state = nextSubscribed;
+
+    try {
+      final success = nextSubscribed
+          ? await subscribeAction.subscribe(artistData.id)
+          : await subscribeAction.unsubscribe(artistData.id);
+
+      if (!context.mounted) return;
+
+      if (!success) {
+        optimisticNotifier.state = isSubscribed;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              nextSubscribed
+                  ? context.l10n.couldNotFollowArtist(artistData.name)
+                  : context.l10n.couldNotUnfollowArtist(artistData.name),
+            ),
+          ),
+        );
+        return;
+      }
+
+      ref.invalidate(ytMusicLibrarySubscriptionsProvider);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            nextSubscribed
+                ? context.l10n.followingArtist(artistData.name)
+                : context.l10n.unfollowedArtist(artistData.name),
+          ),
+        ),
+      );
+    } finally {
+      busyNotifier.state = false;
+    }
+  }
+
+  Widget _buildActionButton(
+    BuildContext context,
+    IconData icon,
+    String label,
+    VoidCallback onTap,
+  ) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        children: [
+          Container(
+            width: 48,
+            height: 48,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: isDark
+                  ? Colors.white.withValues(alpha: 0.1)
+                  : Colors.black.withValues(alpha: 0.1),
+            ),
+            child: Icon(
+              icon,
+              color: isDark ? Colors.white : colorScheme.onSurface,
+              size: 24,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            label,
+            style: TextStyle(
+              color: isDark
+                  ? Colors.white70
+                  : colorScheme.onSurface.withValues(alpha: 0.7),
+              fontSize: 12,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<Widget> _buildLocalTracksSection(BuildContext context, WidgetRef ref) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
+    return [
+      SliverToBoxAdapter(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+          child: Row(
+            children: [
+              Icon(Icons.download_done, size: 18, color: Colors.green[400]),
+              const SizedBox(width: 8),
+              Text(
+                context.l10n.downloadedSection,
+                style: TextStyle(
+                  color: isDark ? Colors.white : colorScheme.onSurface,
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+      SliverList(
+        delegate: SliverChildBuilderDelegate((context, index) {
+          final track = artistData.localTracks[index];
+          return _buildTrackTile(
+            context,
+            ref,
+            track,
+            artistData.localTracks,
+            index,
+          );
+        }, childCount: artistData.localTracks.take(3).length),
+      ),
+      if (artistData.localTracks.length > 3)
+        SliverToBoxAdapter(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: TextButton(
+              onPressed: () {
+                // Show all local tracks
+              },
+              child: Text(
+                context.l10n.showAllDownloaded(artistData.localTracks.length),
+              ),
+            ),
+          ),
+        ),
+      SliverToBoxAdapter(
+        child: Divider(
+          color: isDark
+              ? Colors.white24
+              : colorScheme.onSurface.withValues(alpha: 0.24),
+          height: 32,
+        ),
+      ),
+    ];
+  }
+
+  List<Widget> _buildShelfSection(
+    BuildContext context,
+    WidgetRef ref,
+    ArtistShelf shelf,
+    Color themeColor,
+  ) {
+    if (shelf.isEmpty) return [];
+
+    switch (shelf.type) {
+      case ArtistShelfType.songs:
+        return _buildSongsShelf(context, ref, shelf);
+      case ArtistShelfType.albums:
+      case ArtistShelfType.singles:
+      case ArtistShelfType.eps:
+      case ArtistShelfType.appearsOn:
+        return _buildAlbumsShelf(context, shelf);
+      case ArtistShelfType.playlists:
+        return _buildPlaylistsShelf(context, shelf);
+      case ArtistShelfType.similar:
+        return _buildSimilarArtistsShelf(context, shelf);
+      default:
+        return [];
+    }
+  }
+
+  List<Widget> _buildSongsShelf(
+    BuildContext context,
+    WidgetRef ref,
+    ArtistShelf shelf,
+  ) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
+    final tracks = shelf.tracks;
+    final displayTitle = _localizedShelfTitle(context, shelf);
+
+    return [
+      SliverToBoxAdapter(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                displayTitle,
+                style: TextStyle(
+                  color: isDark ? Colors.white : colorScheme.onSurface,
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              if (shelf.hasMore)
+                TextButton(
+                  onPressed: () {
+                    // Navigate to full songs list
+                    final songsShelf = HomeShelf(
+                      id: shelf.browseId ?? artistData.id,
+                      title: '${artistData.name} - $displayTitle',
+                      type: HomeShelfType.unknown,
+                      items: tracks
+                          .map(
+                            (t) => HomeShelfItem(
+                              id: t.id,
+                              title: t.title,
+                              subtitle: t.artist,
+                              thumbnailUrl: t.thumbnailUrl,
+                              itemType: HomeShelfItemType.song,
+                              videoId: t.id,
+                            ),
+                          )
+                          .toList(),
+                      browseId: shelf.browseId,
+                      params: shelf.params,
+                    );
+                    ShelfDetailsScreen.open(context, songsShelf);
+                  },
+                  child: Text(
+                    context.l10n.seeAll,
+                    style: TextStyle(
+                      color: isDark
+                          ? Colors.white70
+                          : colorScheme.onSurface.withValues(alpha: 0.7),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+      SliverFixedExtentList(
+        itemExtent: 72,
+        delegate: SliverChildBuilderDelegate((context, index) {
+          final track = tracks[index];
+          return _buildTrackTile(context, ref, track, tracks, index);
+        }, childCount: tracks.take(5).length),
+      ),
+    ];
+  }
+
+  Widget _buildTrackTile(
+    BuildContext context,
+    WidgetRef ref,
+    Track track,
+    List<Track> queue,
+    int index,
+  ) {
+    final isTrackPlaying = currentTrack?.id == track.id;
+    final colorScheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return ListTile(
+      contentPadding: const EdgeInsets.fromLTRB(16, 4, 4, 4),
+      selected: isTrackPlaying,
+      selectedTileColor: isDark
+          ? Colors.white.withValues(alpha: 0.1)
+          : Colors.black.withValues(alpha: 0.1),
+      leading: ClipRRect(
+        borderRadius: BorderRadius.circular(4),
+        child: SizedBox(
+          width: 48,
+          height: 48,
+          child: track.thumbnailUrl != null
+              ? CachedNetworkImage(
+                  imageUrl: track.thumbnailUrl!,
+                  fit: BoxFit.cover,
+                  memCacheWidth: 96,
+                  memCacheHeight: 96,
+                )
+              : Container(color: isDark ? Colors.grey[800] : Colors.grey[300]),
+        ),
+      ),
+      title: Text(
+        track.title,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          color: isTrackPlaying
+              ? colorScheme.primary
+              : (isDark ? Colors.white : colorScheme.onSurface),
+          fontWeight: isTrackPlaying ? FontWeight.bold : FontWeight.w500,
+        ),
+      ),
+      subtitle: Text(
+        context.trackSubtitle(track.artist, track.formattedDuration),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          color: isTrackPlaying
+              ? colorScheme.primary.withValues(alpha: 0.7)
+              : (isDark
+                    ? Colors.white60
+                    : colorScheme.onSurface.withValues(alpha: 0.6)),
+        ),
+      ),
+      trailing: IconButton(
+        icon: Icon(
+          Icons.more_vert,
+          color: isDark
+              ? Colors.white54
+              : colorScheme.onSurface.withValues(alpha: 0.54),
+        ),
+        onPressed: () => TrackOptionsSheet.show(context, track),
+      ),
+      onTap: () {
+        playerService.playQueue(
+          queue,
+          startIndex: index,
+          sourceId: artistData.id,
+        );
+      },
+    );
+  }
+
+  List<Widget> _buildAlbumsShelf(BuildContext context, ArtistShelf shelf) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
+    final albums = shelf.albums;
+    final displayTitle = _localizedShelfTitle(context, shelf);
+
+    return [
+      SliverToBoxAdapter(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 24, 16, 8),
+          child: Text(
+            displayTitle,
+            style: TextStyle(
+              color: isDark ? Colors.white : colorScheme.onSurface,
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+      ),
+      SliverToBoxAdapter(
+        child: SizedBox(
+          height: 200,
+          child: ListView.builder(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            scrollDirection: Axis.horizontal,
+            itemCount: albums.length,
+            itemBuilder: (context, index) {
+              final album = albums[index];
+              return _buildAlbumCard(context, album);
+            },
+          ),
+        ),
+      ),
+    ];
+  }
+
+  Widget _buildAlbumCard(BuildContext context, Album album) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
+    return GestureDetector(
+      onTap: () => AlbumScreen.open(
+        context,
+        albumId: album.id,
+        title: album.title,
+        thumbnailUrl: album.thumbnailUrl,
+      ),
+      child: Container(
+        width: 140,
+        margin: const EdgeInsets.only(right: 16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: SizedBox(
+                width: 140,
+                height: 140,
+                child: album.thumbnailUrl != null
+                    ? CachedNetworkImage(
+                        imageUrl: album.thumbnailUrl!,
+                        fit: BoxFit.cover,
+                      )
+                    : Container(
+                        color: isDark ? Colors.grey[800] : Colors.grey[300],
+                      ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              album.title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: isDark ? Colors.white : colorScheme.onSurface,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            Text(
+              album.year ?? context.l10n.album,
+              maxLines: 1,
+              style: TextStyle(
+                color: isDark
+                    ? Colors.white60
+                    : colorScheme.onSurface.withValues(alpha: 0.6),
+                fontSize: 12,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _buildPlaylistsShelf(BuildContext context, ArtistShelf shelf) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
+    final playlists = shelf.playlists;
+    final displayTitle = _localizedShelfTitle(context, shelf);
+
+    return [
+      SliverToBoxAdapter(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 24, 16, 8),
+          child: Text(
+            displayTitle,
+            style: TextStyle(
+              color: isDark ? Colors.white : colorScheme.onSurface,
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+      ),
+      SliverList(
+        delegate: SliverChildBuilderDelegate((context, index) {
+          final playlist = playlists[index];
+          return ListTile(
+            leading: ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: SizedBox(
+                width: 48,
+                height: 48,
+                child: playlist.thumbnailUrl != null
+                    ? CachedNetworkImage(
+                        imageUrl: playlist.thumbnailUrl!,
+                        fit: BoxFit.cover,
+                      )
+                    : Container(
+                        color: isDark ? Colors.grey[800] : Colors.grey[300],
+                      ),
+              ),
+            ),
+            title: Text(
+              playlist.title,
+              style: TextStyle(
+                color: isDark ? Colors.white : colorScheme.onSurface,
+              ),
+            ),
+            subtitle: Text(
+              playlist.author ?? context.l10n.playlist,
+              style: TextStyle(
+                color: isDark
+                    ? Colors.white60
+                    : colorScheme.onSurface.withValues(alpha: 0.6),
+              ),
+            ),
+            onTap: () {
+              if (playlist.isPodcast || playlist.id.startsWith('MPSP')) {
+                PodcastScreen.open(
+                  context,
+                  podcastId: playlist.id,
+                  title: playlist.title,
+                  thumbnailUrl: playlist.thumbnailUrl,
+                );
+              } else {
+                PlaylistScreen.open(
+                  context,
+                  playlistId: playlist.id,
+                  title: playlist.title,
+                  thumbnailUrl: playlist.thumbnailUrl,
+                );
+              }
+            },
+          );
+        }, childCount: playlists.length),
+      ),
+    ];
+  }
+
+  List<Widget> _buildSimilarArtistsShelf(
+    BuildContext context,
+    ArtistShelf shelf,
+  ) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
+    final artists = shelf.artists;
+    final displayTitle = _localizedShelfTitle(context, shelf);
+
+    return [
+      SliverToBoxAdapter(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 24, 16, 8),
+          child: Text(
+            displayTitle,
+            style: TextStyle(
+              color: isDark ? Colors.white : colorScheme.onSurface,
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+      ),
+      SliverToBoxAdapter(
+        child: SizedBox(
+          height: 160,
+          child: ListView.builder(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            scrollDirection: Axis.horizontal,
+            itemCount: artists.length,
+            itemBuilder: (context, index) {
+              final artist = artists[index];
+              return GestureDetector(
+                onTap: () => ArtistPageScreen.open(
+                  context,
+                  artistId: artist.id,
+                  name: artist.name,
+                  thumbnailUrl: artist.thumbnailUrl,
+                ),
+                child: Container(
+                  width: 120,
+                  margin: const EdgeInsets.only(right: 16),
+                  child: Column(
+                    children: [
+                      ClipOval(
+                        child: SizedBox(
+                          width: 100,
+                          height: 100,
+                          child: artist.thumbnailUrl != null
+                              ? CachedNetworkImage(
+                                  imageUrl: artist.thumbnailUrl!,
+                                  fit: BoxFit.cover,
+                                )
+                              : Container(
+                                  color: isDark
+                                      ? Colors.grey[800]
+                                      : Colors.grey[300],
+                                ),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        artist.name,
+                        maxLines: 2,
+                        textAlign: TextAlign.center,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: isDark ? Colors.white : colorScheme.onSurface,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    ];
+  }
+
+  Widget _buildSheetActionTile({
+    required IconData icon,
+    required Color iconColor,
+    required String title,
+    required Color textColor,
+    required VoidCallback onTap,
+  }) {
+    return BouncyTouch(
+      style: BouncyStyle.card,
+      customScale: 0.98,
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: Colors.transparent,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 36,
+              height: 36,
+              decoration: BoxDecoration(
+                color: iconColor.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Center(
+                child: Icon(icon, color: iconColor, size: 18),
+              ),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Text(
+                title,
+                style: TextStyle(
+                  color: textColor,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ),
+            Icon(
+              Icons.chevron_right_rounded,
+              color: textColor.withValues(alpha: 0.25),
+              size: 20,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showOptionsSheet(BuildContext context, WidgetRef ref) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final topTracks = artistData.topTracks;
+    final l10n = context.l10n;
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) {
+        return Consumer(
+          builder: (context, refConsumer, child) {
+            final liveAccent = refConsumer.watch(effectiveAccentColorProvider);
+            final sheetBg = isDark
+                ? const Color(0xFF141414).withValues(alpha: 0.92)
+                : Colors.white.withValues(alpha: 0.95);
+            final textColor = isDark ? Colors.white : Colors.black87;
+            final secondaryColor = textColor.withValues(alpha: 0.55);
+
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(28),
+                  child: BackdropFilter(
+                    filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: sheetBg,
+                        borderRadius: BorderRadius.circular(28),
+                        border: Border.all(
+                          color: liveAccent.withValues(alpha: 0.22),
+                          width: 1.0,
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.35),
+                            blurRadius: 32,
+                            spreadRadius: 4,
+                          ),
+                        ],
+                      ),
+                      child: SingleChildScrollView(
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 12,
+                          ),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              // Drag handle
+                              Center(
+                                child: Container(
+                                  width: 36,
+                                  height: 4,
+                                  margin: const EdgeInsets.only(bottom: 12),
+                                  decoration: BoxDecoration(
+                                    color: textColor.withValues(alpha: 0.25),
+                                    borderRadius: BorderRadius.circular(2),
+                                  ),
+                                ),
+                              ),
+
+                              // Artist Header Card
+                              Container(
+                                padding: const EdgeInsets.all(10),
+                                decoration: BoxDecoration(
+                                  color: textColor.withValues(alpha: 0.05),
+                                  borderRadius: BorderRadius.circular(16),
+                                  border: Border.all(
+                                    color: liveAccent.withValues(alpha: 0.15),
+                                    width: 0.8,
+                                  ),
+                                ),
+                                child: Row(
+                                  children: [
+                                    ClipOval(
+                                      child: SizedBox(
+                                        width: 50,
+                                        height: 50,
+                                        child: artistData.thumbnailUrl != null
+                                            ? CachedNetworkImage(
+                                                imageUrl:
+                                                    artistData.thumbnailUrl!,
+                                                fit: BoxFit.cover,
+                                              )
+                                            : Container(
+                                                color: isDark
+                                                    ? Colors.grey[800]
+                                                    : Colors.grey[300],
+                                                child: const Icon(Icons.person),
+                                              ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            artistData.name,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(
+                                              fontSize: 15,
+                                              fontWeight: FontWeight.bold,
+                                              color: textColor,
+                                            ),
+                                          ),
+                                          if (artistData.subscriberCount !=
+                                              null) ...[
+                                            const SizedBox(height: 3),
+                                            Text(
+                                              context.l10n.subscribersCount(
+                                                _formatNumber(
+                                                  context,
+                                                  artistData.subscriberCount!,
+                                                ),
+                                              ),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: TextStyle(
+                                                fontSize: 12.5,
+                                                color: secondaryColor,
+                                              ),
+                                            ),
+                                          ],
+                                        ],
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+
+                              const SizedBox(height: 14),
+
+                              // Section: ARTIST ACTIONS
+                              Padding(
+                                padding:
+                                    const EdgeInsets.only(left: 6, bottom: 4),
+                                child: Text(
+                                  'ARTIST ACTIONS',
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.w700,
+                                    letterSpacing: 1.2,
+                                    color: secondaryColor,
+                                  ),
+                                ),
+                              ),
+                              Container(
+                                decoration: BoxDecoration(
+                                  color: textColor.withValues(alpha: 0.04),
+                                  borderRadius: BorderRadius.circular(20),
+                                ),
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 4,
+                                  horizontal: 4,
+                                ),
+                                child: Column(
+                                  children: [
+                                    _buildSheetActionTile(
+                                      icon: Icons.play_arrow_rounded,
+                                      iconColor: liveAccent,
+                                      title: l10n.playAll,
+                                      textColor: textColor,
+                                      onTap: () {
+                                        Navigator.pop(ctx);
+                                        if (topTracks.isNotEmpty) {
+                                          playerService.playQueue(
+                                            topTracks,
+                                            startIndex: 0,
+                                            sourceId: artistData.id,
+                                          );
+                                        }
+                                      },
+                                    ),
+                                    _buildSheetActionTile(
+                                      icon: Icons.shuffle_rounded,
+                                      iconColor: liveAccent,
+                                      title: l10n.shuffleAll,
+                                      textColor: textColor,
+                                      onTap: () {
+                                        Navigator.pop(ctx);
+                                        if (topTracks.isNotEmpty) {
+                                          final shuffled =
+                                              List<Track>.from(topTracks)
+                                                ..shuffle();
+                                          playerService.playQueue(
+                                            shuffled,
+                                            startIndex: 0,
+                                            sourceId: artistData.id,
+                                          );
+                                        }
+                                      },
+                                    ),
+                                    _buildSheetActionTile(
+                                      icon: Icons.radio_rounded,
+                                      iconColor: liveAccent,
+                                      title: l10n.startRadio,
+                                      textColor: textColor,
+                                      onTap: () {
+                                        Navigator.pop(ctx);
+                                        if (topTracks.isNotEmpty) {
+                                          playerService.startRadio(
+                                            topTracks.first,
+                                          );
+                                        }
+                                      },
+                                    ),
+                                    _buildSheetActionTile(
+                                      icon: Icons.share_rounded,
+                                      iconColor: liveAccent,
+                                      title: l10n.share,
+                                      textColor: textColor,
+                                      onTap: () {
+                                        Navigator.pop(ctx);
+                                        final url =
+                                            DeepLinkHandler.createShareUrl(
+                                              'artist',
+                                              artistData.id,
+                                            );
+                                        SharePlus.instance.share(
+                                          ShareParams(
+                                            text: context.l10n.shareArtistText(
+                                              artistData.name,
+                                              url,
+                                            ),
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  String _formatNumber(BuildContext context, int number) {
+    return context.compactNumber(number);
+  }
+}

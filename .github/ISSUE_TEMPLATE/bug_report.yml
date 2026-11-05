@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a problem to help us improve the music player
+title: "bug: "
+labels: [bug]
+
+body:
+  - type: checkboxes
+    id: duplication
+    attributes:
+      label: "Before submitting an issue, please confirm:"
+      options:
+        - label: This issue has not already been reported (open or closed).
+          required: true
+        - label: I am using the latest released version of the app.
+          required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: Provide a clear and concise description of the issue.
+      placeholder: |
+        The app crashes immediately after pressing Play.
+        /
+        Music stops playing when switching between playlists.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Describe what you expected to happen instead.
+      placeholder: |
+        The selected song should start playing normally without crashing.
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or recordings
+      description: If applicable, add screenshots or screen recordings to help explain the issue.
+      placeholder: |
+        now_playing_screen.png
+        playlist_view_error.png
+        crash_message.png
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Add any other helpful information about the problem.
+      placeholder: |
+        Crash logs, device model, OS version, or steps to reproduce the issue (if applicable).
+    validations:
+      required: false
