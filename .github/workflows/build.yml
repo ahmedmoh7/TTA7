@@ -25,19 +25,37 @@ jobs:
           channel: stable
           cache: true
 
-        
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
           accept-android-sdk-licenses: false
           log-accepted-android-sdk-licenses: false
           packages: platform-tools
-          
+
       - name: Accept Android licenses
         run: yes | sdkmanager --licenses
 
       - name: Install CMake
         run: sdkmanager "cmake;3.22.1"
+
+      - name: Configure Android release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          test -n "$ANDROID_KEYSTORE_BASE64"
+          test -n "$ANDROID_KEY_ALIAS"
+          test -n "$ANDROID_KEY_PASSWORD"
+          test -n "$ANDROID_STORE_PASSWORD"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/tta7-release-key.jks
+          cat > android/key.properties <<EOF
+          storeFile=../tta7-release-key.jks
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
+          storePassword=$ANDROID_STORE_PASSWORD
+          EOF
 
       - name: Create environment file
         env:
