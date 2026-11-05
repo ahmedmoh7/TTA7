@@ -114,7 +114,6 @@ flutter:
   assets:
     - assets/icon/
     - assets/splash/
-    - assets/upi.jpeg
     - assets/logo_transparent.png
     - .env
     - shorebird.yaml
