@@ -31,7 +31,8 @@ jobs:
         with:
           accept-android-sdk-licenses: false
           log-accepted-android-sdk-licenses: false
-
+          packages: platform-tools
+          
       - name: Accept Android licenses
         run: yes | sdkmanager --licenses
 
