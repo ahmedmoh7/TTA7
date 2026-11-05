@@ -25,8 +25,12 @@ jobs:
           channel: stable
           cache: true
 
+        
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: false
+          log-accepted-android-sdk-licenses: false
 
       - name: Accept Android licenses
         run: yes | sdkmanager --licenses
