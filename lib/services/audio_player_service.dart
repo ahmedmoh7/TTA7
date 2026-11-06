@@ -3580,7 +3580,10 @@ class AudioPlayerService {
     try {
       final trackId = _currentTrack!.id;
       final stopwatch = Stopwatch()..start();
-      await _inactivePlayer.stop();
+      // Stop the currently audible player as soon as a new track is chosen.
+      // Stop both engines in parallel so the outgoing song cannot continue
+      // while the incoming stream URL is being resolved.
+      await Future.wait([_player.stop(), _inactivePlayer.stop()]);
       if (!isLatestRequest()) return;
       await _player.setVolume(1.0);
       if (!isLatestRequest()) return;
