@@ -308,9 +308,8 @@ class LocalArtworkService {
         }
       }
 
-      // Data saver: skip multi-provider online metadata searches for local
-      // files. An existing artwork URL can still be downloaded above when
-      // the artwork is actually requested.
+      // Data saver: skip multi-provider metadata searches for local files.
+      // Existing artwork URLs can still be downloaded above when requested.
 
       // Negative cache to prevent hammering APIs on subsequent rebuilds
       _notFoundCache.add(trimmedPath);
@@ -387,7 +386,7 @@ class LocalArtworkService {
 
             return OnlineTrackMetadata(
               artworkUrl: art100 != null && art100.isNotEmpty
-                  ? art100.replaceAll('100x100bb', '100x100bb')
+                  ? art100
                   : null,
               artist: artistName,
               title: trackName,
@@ -410,14 +409,8 @@ class LocalArtworkService {
           .timeout(const Duration(seconds: 5));
       if (results.tracks.isNotEmpty) {
         final track = results.tracks.first;
-        var thumb = track.bestThumbnail;
-        if (thumb != null && thumb.isNotEmpty) {
-          if (thumb.contains('w120-h120')) {
-            thumb = thumb.replaceAll('w120-h120', 'w120-h120');
-          } else if (thumb.contains('=w60-h60')) {
-            thumb = thumb.replaceAll('=w60-h60', '=w120-h120');
-          }
-        }
+        final thumb = track.bestThumbnail;
+        // Keep the provider's small thumbnail URL; do not upscale it.
         return OnlineTrackMetadata(
           artworkUrl: thumb,
           artist: track.artist,
@@ -440,9 +433,7 @@ class LocalArtworkService {
         final song = saavnSongs.first;
         var img = song.image;
         if (img != null && img.isNotEmpty) {
-          img = img
-              .replaceAll('150x150', '150x150')
-              .replaceAll('50x50', '150x150');
+          img = img.replaceAll('50x50', '150x150');
         }
         return OnlineTrackMetadata(
           artworkUrl: img,

@@ -97,7 +97,8 @@ class MusicRepository {
     String query, {
     CacheConfig? config,
   }) async {
-    final cacheConfig = config ?? CacheConfig.networkWithFallback();
+    // Reuse cached search results until their cache entry expires.
+    final cacheConfig = config ?? CacheConfig.cacheFirst(ttlMinutes: 60);
 
     return switch (cacheConfig.policy) {
       CachePolicy.networkFirst => _networkFirstSearch(query, cacheConfig),
@@ -232,7 +233,8 @@ class MusicRepository {
 
   /// Get trending tracks with cache strategy
   Future<Result<List<Track>>> getTrendingTracks({CacheConfig? config}) async {
-    final cacheConfig = config ?? CacheConfig.networkWithFallback();
+    // Trending results are cached for two hours; avoid refreshing on every view.
+    final cacheConfig = config ?? CacheConfig.cacheFirst(ttlMinutes: 120);
 
     return switch (cacheConfig.policy) {
       CachePolicy.networkFirst => _networkFirstTrending(cacheConfig),

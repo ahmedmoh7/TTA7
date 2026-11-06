@@ -920,8 +920,6 @@ class AudioPlayerService {
       if (await localFile.exists()) {
         final fileSize = await localFile.length();
         if (fileSize >= 10000) {
-          if (LocalArtworkService.isArtistMissing(track.artist)) {
-              }
           final playbackData = await _resolvePlaybackDataForLocalTrack(
             track,
             localFile,
@@ -1076,7 +1074,7 @@ class AudioPlayerService {
       );
       _saveQueueDebounced();
       _prefetchNextTrack();
-  
+
       AudioRoutingService.reapplyAudioRoute();
       unawaited(incomingPlayer.play());
       for (int i = 1; i <= 6; i++) {
@@ -2452,7 +2450,7 @@ class AudioPlayerService {
       }
       _saveQueueDebounced();
       _prefetchNextTrack();
-        if (_currentTrack != null) {
+      if (_currentTrack != null) {
         unawaited(_upgradeTrackQualityIfPossible(_currentTrack!));
         // Gapless auto-advance starts the next track on whatever the
         // playlist was built with; it gets its second look too.
@@ -2865,29 +2863,7 @@ class AudioPlayerService {
   /// Pre-fetch the next track's stream URL for seamless playback
   /// Only triggers ONCE per track to avoid repeated calls
   void _prefetchNextTrackIfNeeded(Duration currentPosition) {
-    if (_prefetchTriggered) return; // Already triggered for this track
-
-    final duration = _player.duration;
-    if (duration == null || duration.inSeconds < 60) return;
-
-    final remainingTime = duration - currentPosition;
-    if (remainingTime.inSeconds <= 30 && remainingTime.inSeconds > 0) {
-      _prefetchTriggered = true; // Mark as triggered
-
-      // Pre-fetch next track
-      if (_currentIndex < _queue.length - 1) {
-        final nextTrack = _queue[_currentIndex + 1];
-        if (!_isLocalTrack(nextTrack)) {
-          if (kDebugMode) {
-            print('AudioPlayerService: Pre-fetching next track: ${nextTrack.id}');
-          }
-
-          // Fire and forget - just warm up the cache
-          _ytPlayerUtils.prefetchNext(nextTrack.id, quality: _audioQuality);
-        }
-        _schedulePrecacheAhead();
-      }
-    }
+    // Intentionally disabled: never resolve the next track before playback.
   }
 
   /// Handle playback errors with fallback
@@ -2965,7 +2941,7 @@ class AudioPlayerService {
         quality: _audioQuality,
       );
       if (!playerResult.isSuccess || playerResult.data == null) return;
-      
+
       final fetchedDuration = playerResult.data!.videoDetails?.duration ?? Duration.zero;
       if (fetchedDuration <= Duration.zero) return;
 
@@ -3122,8 +3098,8 @@ class AudioPlayerService {
 
       _saveQueueDebounced();
 
-      // Immediately fetch upcoming radio tracks in background
-      unawaited(_fetchRadioTracks());
+      // Data saver: wait until the current radio track is nearly finished
+      // before requesting recommendation metadata.
     } else {
       await playTrack(track, enableRadio: true);
     }
@@ -3225,14 +3201,14 @@ class AudioPlayerService {
         );
       }
       // Data saver: do not resolve or download tracks that are not playing.
-      // Radio discovery is deferred until the current track is nearly finished.
+      // Radio discovery remains deferred until the queue actually needs more items.
     });
   }
 
   /// Public method to prefetch tracks (called by TrackPrefetchManager)
   /// This resolves stream URLs so play taps are instant
   Future<void> prefetchTracks(List<String> videoIds) async {
-    // Data saver: visible/queued tracks are resolved only when played.
+    // Data saver: resolve a stream only after the user starts that track.
     return;
   }
 
@@ -3254,11 +3230,11 @@ class AudioPlayerService {
   /// Prefetch all tracks in queue (OuterTune approach)
   /// This resolves stream URLs in background
   void _prefetchAllTracks() {
-    // Intentionally disabled: no stream URLs are resolved before playback.
+    // Data saver: no stream URLs are resolved speculatively.
   }
 
   void _scheduleLyricsPrefetchAroundCurrent() {
-    // Lyrics are fetched only when the user explicitly opens the lyrics view.
+    // Lyrics are loaded on demand, only when the user opens the lyrics view.
   }
 
   Future<void> _prefetchLyricsForTracks(List<Track> tracks) async {
@@ -3416,7 +3392,7 @@ class AudioPlayerService {
 
     _crossfadeTriggeredForTrack = false;
     _currentTrack = _queue[_currentIndex];
-    
+
     // --- SMART AUTO-SWAP (Prefer Audio Versions) ---
     if (_preferAudioVersions && _currentTrack != null && !_isLocalTrack(_currentTrack!)) {
       final t = _currentTrack!;
@@ -3437,7 +3413,7 @@ class AudioPlayerService {
                   if (kDebugMode) print('AudioPlayerService: Swapped ${t.id} for ${best.id}');
                   _currentTrack = best.copyWith(setVideoId: t.setVideoId);
                   _queue[_currentIndex] = _currentTrack!;
-                  
+
                   // Update the original queue too if it's there
                   final origIdx = _originalQueue.indexWhere((x) => x.id == t.id);
                   if (origIdx != -1) _originalQueue[origIdx] = _currentTrack!;
@@ -3452,7 +3428,6 @@ class AudioPlayerService {
     }
     // ---------------------------------------------
 
-    final trackForLyrics = _currentTrack!;
     _currentPlaybackData = null;
     if (_pendingSeekTrackId != null &&
         _pendingSeekTrackId != _currentTrack!.id) {
@@ -3471,7 +3446,7 @@ class AudioPlayerService {
       currentPlaybackData: null,
     );
 
-    // Data saver: no external lyrics lookup is started during playback.
+    // Data saver: do not query external lyrics providers during playback.
 
     try {
       final trackId = _currentTrack!.id;
@@ -3518,9 +3493,7 @@ class AudioPlayerService {
               );
             }
           } else {
-            // Enrich track metadata (artist, album, artwork) in background if missing
-            if (LocalArtworkService.isArtistMissing(_currentTrack!.artist)) {
-                      }
+            // Online metadata enrichment is skipped in data-saver mode.
             try {
               // Use Uri.file for proper file:// URI on Android
               final fileUri = Uri.file(resolvedLocalPath);
@@ -4866,8 +4839,8 @@ class AudioPlayerService {
     // Calculate remaining tracks
     final remaining = _queue.length - _currentIndex - 1;
 
-    // Fetch more tracks when 5 or fewer tracks remaining (more aggressive for seamless experience)
-    if (remaining <= 5) {
+    // Data saver: request the next radio batch only when the queue is almost empty.
+    if (remaining <= 1) {
       if (kDebugMode) {
         print(
           'AudioPlayerService: $remaining tracks remaining, fetching more radio...',
@@ -4925,7 +4898,7 @@ class AudioPlayerService {
       // Request more tracks for better queue building
       final radioTracks = await _innerTubeService!.getWatchPlaylist(
         sourceId,
-        limit: 25, // Request more for better selection
+        limit: 10, // Smaller radio batches reduce metadata traffic
       );
 
       if (!_isRadioMode) {
@@ -4964,12 +4937,8 @@ class AudioPlayerService {
           _updateState(queue: _queue, queueRevision: _queueRevision);
 
           // Prefetch new tracks for instant playback
-          _ytPlayerUtils.prefetch(
-            newTracks.map((t) => t.id).toList(),
-            quality: _audioQuality,
-          );
           _schedulePrecacheAhead();
-      
+
           // Update radio source for next fetch - use track from new batch
           if (newTracks.length > 2) {
             _radioSourceTrackId = newTracks[newTracks.length ~/ 2].id;
