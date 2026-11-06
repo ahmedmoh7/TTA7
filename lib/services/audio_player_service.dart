@@ -730,7 +730,9 @@ class AudioPlayerService {
     required AudioPlayer outgoing,
     required AudioPlayer incoming,
     required Duration duration,
+    bool Function()? shouldContinue,
   }) async {
+    if (shouldContinue != null && !shouldContinue()) return;
     if (duration <= Duration.zero) {
       await Future.wait(<Future<void>>[
         _setVolumeSafely(outgoing, 0.0, context: 'fade-immediate-out'),
@@ -747,6 +749,7 @@ class AudioPlayerService {
     final stepDelay = Duration(milliseconds: stepDelayMs);
     try {
       for (int step = 1; step <= steps; step++) {
+        if (shouldContinue != null && !shouldContinue()) break;
         final t = step / steps;
         // Equal-power curve avoids perceived dip/silence in the middle.
         final outgoingGain = cos(t * pi * 0.5);
@@ -766,6 +769,8 @@ class AudioPlayerService {
         await Future.delayed(stepDelay);
       }
     } finally {
+      // Do not touch a player after a newer manual request took ownership.
+      if (shouldContinue != null && !shouldContinue()) return;
       // Always force final settled volumes even if ramp loop is interrupted.
       await Future.wait(<Future<void>>[
         _setVolumeSafely(outgoing, 0.0, context: 'fade-final-out'),
@@ -774,7 +779,10 @@ class AudioPlayerService {
     }
   }
 
-  Future<void> _stabilizeIncomingAfterCrossfade(AudioPlayer incoming) async {
+  Future<void> _stabilizeIncomingAfterCrossfade(
+    AudioPlayer incoming, {
+    int? generation,
+  }) async {
     // Re-apply audio route natively in case just_audio or OS dropped it during player switch
     AudioRoutingService.reapplyAudioRoute();
     // Some devices/platform stacks can briefly re-emit stale low volume state
@@ -784,7 +792,8 @@ class AudioPlayerService {
       if (delayMs > 0) {
         await Future.delayed(Duration(milliseconds: delayMs));
       }
-      if (!identical(_player, incoming)) return;
+      if (!identical(_player, incoming) ||
+          (generation != null && generation != _playbackGeneration)) return;
       if (!incoming.playing) {
         unawaited(incoming.play());
       }
@@ -1031,8 +1040,11 @@ class AudioPlayerService {
       final built = await _buildSourceForTrack(targetTrack);
       if (generation != _playbackGeneration) return;
       await incomingPlayer.stop();
+      if (generation != _playbackGeneration) return;
       await incomingPlayer.setLoopMode(_nativeLoopModeFor(_loopMode));
+      if (generation != _playbackGeneration) return;
       await incomingPlayer.setSpeed(outgoingPlayer.speed);
+      if (generation != _playbackGeneration) return;
       final sourceReady = await _runPlaybackSourceMutation(
         generation,
         () => incomingPlayer.setAudioSource(built.source, preload: true),
@@ -1043,6 +1055,7 @@ class AudioPlayerService {
         0.12,
         context: 'crossfade-bootstrap',
       );
+      if (generation != _playbackGeneration) return;
 
       if (generation != _playbackGeneration) return;
       _player = incomingPlayer;
@@ -1127,6 +1140,7 @@ class AudioPlayerService {
         outgoing: outgoingPlayer,
         incoming: incomingPlayer,
         duration: _crossfadeDuration,
+        shouldContinue: () => generation == _playbackGeneration && identical(_player, incomingPlayer),
       );
       if (generation != _playbackGeneration) return;
 
@@ -1144,7 +1158,7 @@ class AudioPlayerService {
       if (!incomingPlayer.playing) {
         unawaited(incomingPlayer.play());
       }
-      await _stabilizeIncomingAfterCrossfade(incomingPlayer);
+      await _stabilizeIncomingAfterCrossfade(incomingPlayer, generation: generation);
       if (kDebugMode) {
         print(
           'AudioPlayerService: Crossfade completed on ${targetTrack.id}, incomingVolume=${incomingPlayer.volume.toStringAsFixed(2)}',
@@ -4241,12 +4255,18 @@ class AudioPlayerService {
       final built = await _buildSourceForTrack(track);
       if (generation != _playbackGeneration || index >= _queue.length || _queue[index].id != track.id) return;
       await player.setLoopMode(_nativeLoopModeFor(_loopMode));
+      if (generation != _playbackGeneration) return;
       await _setVolumeSafely(player, 0.0, context: 'automix-arm');
-      await player.setAudioSource(
-        built.source,
-        initialPosition: Duration(milliseconds: cueMs),
-        preload: true,
+      if (generation != _playbackGeneration) return;
+      final sourceReady = await _runPlaybackSourceMutation(
+        generation,
+        () => player.setAudioSource(
+          built.source,
+          initialPosition: Duration(milliseconds: cueMs),
+          preload: true,
+        ),
       );
+      if (!sourceReady) return;
       if (generation != _playbackGeneration || index >= _queue.length || _queue[index].id != track.id) {
         await player.stop();
         return;
