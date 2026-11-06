@@ -3509,7 +3509,8 @@ class AudioPlayerService {
 
     _crossfadeTriggeredForTrack = false;
     _currentTrack = _queue[_currentIndex];
-    
+    unawaited(AutomixService.instance.skip());
+
     // --- SMART AUTO-SWAP (Prefer Audio Versions) ---
     if (_preferAudioVersions && _currentTrack != null && !_isLocalTrack(_currentTrack!)) {
       final t = _currentTrack!;
@@ -3828,6 +3829,7 @@ class AudioPlayerService {
                 fallbackSaavn,
                 _currentTrack!,
                 resolveTimeMs: stopwatch.elapsedMilliseconds,
+                generation: requestGeneration,
               );
               return;
             }
@@ -4022,7 +4024,9 @@ class AudioPlayerService {
     JioSaavnStream saavnStream,
     Track track, {
     int? resolveTimeMs,
+    int? generation,
   }) async {
+    if (generation != null && !_isPlaybackRequestCurrent(generation, track.id)) return;
     if (kDebugMode) {
       print(
         'AudioPlayerService: Playing JioSaavn 320kbps stream (${saavnStream.streamUrl})',
@@ -4050,8 +4054,10 @@ class AudioPlayerService {
       tag: track,
     );
     await _player.setAudioSource(saavnSource, preload: true);
+    if (generation != null && !_isPlaybackRequestCurrent(generation, track.id)) return;
     if (_pendingSeekPosition != null && _pendingSeekTrackId == track.id) {
       await _player.seek(_pendingSeekPosition);
+      if (generation != null && !_isPlaybackRequestCurrent(generation, track.id)) return;
       _positionController.add(_pendingSeekPosition!);
       _updateState(position: _pendingSeekPosition);
       _pendingSeekPosition = null;
@@ -4197,12 +4203,14 @@ class AudioPlayerService {
   /// and paused; the engine starts it at the blend.
   Future<void> _automixLoad(String playerId, int index, int cueMs) async {
     if (index < 0 || index >= _queue.length) return;
+    final generation = _playbackGeneration;
     final player = _playerById(playerId);
     if (identical(player, _player)) return; // never load over the song
     _automixMixing = true;
     final track = _queue[index];
     try {
       final built = await _buildSourceForTrack(track);
+      if (generation != _playbackGeneration || index >= _queue.length || _queue[index].id != track.id) return;
       await player.setLoopMode(_nativeLoopModeFor(_loopMode));
       await _setVolumeSafely(player, 0.0, context: 'automix-arm');
       await player.setAudioSource(
@@ -4210,6 +4218,10 @@ class AudioPlayerService {
         initialPosition: Duration(milliseconds: cueMs),
         preload: true,
       );
+      if (generation != _playbackGeneration || index >= _queue.length || _queue[index].id != track.id) {
+        await player.stop();
+        return;
+      }
       _automixIncomingData = built.playbackData;
       _automixIncomingIndex = index;
       await AutomixService.instance.loaded(playerId, index);
@@ -4406,6 +4418,7 @@ class AudioPlayerService {
   /// Every guard here errs towards not swapping — a missed upgrade is
   /// silent, an interrupted song isn't.
   Future<void> _upgradeToLosslessIfPossible(Track track) async {
+    final generation = _playbackGeneration;
     final addons = AddonService.instance;
     if (!_qualityAllowsLossless) {
       _logLossless('Off: lossless needs Max quality, or Auto on Wi-Fi');
@@ -4425,6 +4438,7 @@ class AudioPlayerService {
     try {
       _logLossless('Looking for a lossless copy of "${track.title}"');
       var match = await addons.matchFor(track);
+      if (generation != _playbackGeneration || _currentTrack?.id != track.id) return;
       // A slow or dropped connection isn't a verdict on the track: look
       // again while the song plays, until the addon actually answers.
       for (final wait in _losslessLookRetries) {
@@ -4434,11 +4448,12 @@ class AudioPlayerService {
           'trying again in ${wait.inSeconds}s',
         );
         await Future.delayed(wait);
-        if (_currentTrack?.id != track.id) {
+        if (generation != _playbackGeneration || _currentTrack?.id != track.id) {
           _logLossless('Stopped looking for "${track.title}": the song changed');
           return;
         }
         match = await addons.matchFor(track);
+        if (generation != _playbackGeneration || _currentTrack?.id != track.id) return;
       }
       if (match == null) {
         _logLossless('No matching lossless copy for "${track.title}"');
@@ -4478,7 +4493,9 @@ class AudioPlayerService {
 
     final handOverId = ++_losslessUpgradeId;
     _losslessHandOverTrackId = track.id;
+    final playbackGeneration = _playbackGeneration;
     bool stillWanted() =>
+        playbackGeneration == _playbackGeneration &&
         handOverId == _losslessUpgradeId &&
         _currentTrack?.id == track.id &&
         _currentPlaybackData?.format.isLossless != true;
