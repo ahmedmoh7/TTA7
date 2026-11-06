@@ -954,7 +954,7 @@ class AudioPlayerService {
     final result = await _ytPlayerUtils.playerResponseForPlayback(
       track.id,
       quality: _audioQuality,
-      isMetered: false,
+      isMetered: !_onUnmeteredNetwork,
     );
     if (!result.isSuccess || result.data == null) {
       throw Exception(
@@ -1914,7 +1914,7 @@ class AudioPlayerService {
         final result = await _ytPlayerUtils.playerResponseForPlayback(
           track.id,
           quality: _audioQuality,
-          isMetered: false,
+          isMetered: !_onUnmeteredNetwork,
         );
         if (!result.isSuccess || result.data == null) continue;
         candidates.add((track: track, playbackData: result.data!));
@@ -2173,7 +2173,7 @@ class AudioPlayerService {
         final refreshed = await _ytPlayerUtils.playerResponseForPlayback(
           track.id,
           quality: _audioQuality,
-          isMetered: false,
+          isMetered: !_onUnmeteredNetwork,
         );
 
         if (refreshed.isSuccess && refreshed.data != null) {
@@ -3278,22 +3278,28 @@ class AudioPlayerService {
   /// Prefetch all tracks in queue (OuterTune approach)
   /// This resolves stream URLs in background
   void _prefetchAllTracks() {
-    if (_queue.isEmpty) return;
+    if (_queue.isEmpty || _currentIndex < 0) return;
 
-    // Prefetch all tracks, but prioritize current and next, filtering out local tracks
-    final allIds = _queue
-        .where((t) => !_isLocalTrack(t))
-        .map((t) => t.id)
+    // Keep foreground playback responsive: resolve only the next two remote
+    // tracks instead of flooding the network with the entire queue.
+    final start = _currentIndex + 1;
+    final end = min(_queue.length, start + 2);
+    if (start >= end) return;
+
+    final nextIds = _queue
+        .sublist(start, end)
+        .where((track) => !_isLocalTrack(track))
+        .map((track) => track.id)
         .toList();
-        
-    if (allIds.isEmpty) return;
-    
+
+    if (nextIds.isEmpty) return;
+
     if (kDebugMode) {
-      print('AudioPlayerService: Prefetching ${allIds.length} remote tracks');
+      print('AudioPlayerService: Prefetching ${nextIds.length} upcoming tracks');
     }
 
-    // Fire and forget - prefetch happens in background
-    _ytPlayerUtils.prefetch(allIds, quality: _audioQuality);
+    // Fire and forget; current-track resolution always has priority.
+    unawaited(_ytPlayerUtils.prefetch(nextIds, quality: _audioQuality));
   }
 
   void _scheduleLyricsPrefetchAroundCurrent() {
@@ -3732,7 +3738,7 @@ class AudioPlayerService {
       final ytFuture = _ytPlayerUtils.playerResponseForPlayback(
         trackId,
         quality: _audioQuality,
-        isMetered: false,
+        isMetered: !_onUnmeteredNetwork,
       );
 
       PlaybackResult? ytResult;
@@ -4288,7 +4294,7 @@ class AudioPlayerService {
       final result = await _ytPlayerUtils.playerResponseForPlayback(
         videoId,
         quality: _audioQuality,
-        isMetered: false,
+        isMetered: !_onUnmeteredNetwork,
       );
       final data = result.data;
       if (!result.isSuccess || data == null) return;
