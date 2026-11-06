@@ -138,10 +138,17 @@ final showNerdStatsProvider = Provider<bool>((ref) {
   return state.whenOrNull(data: (s) => s.showNerdStats) ?? false;
 });
 
-/// Provider for JioSaavn source setting
-final jioSaavnEnabledProvider = Provider<bool>((ref) {
+/// Unified online audio source preference.
+final audioSourceModeProvider = Provider<player.AudioSourceMode>((ref) {
   final state = ref.watch(playbackStateProvider);
-  return state.whenOrNull(data: (s) => s.jioSaavnEnabled) ?? true;
+  return state.whenOrNull(data: (s) => s.audioSourceMode) ??
+      player.AudioSourceMode.automatic;
+});
+
+/// Backwards-compatible derived value for older UI consumers.
+final jioSaavnEnabledProvider = Provider<bool>((ref) {
+  return ref.watch(audioSourceModeProvider) !=
+      player.AudioSourceMode.youtubeOnly;
 });
 
 /// Colours from the playing song's artwork, always — what Now Playing (and
