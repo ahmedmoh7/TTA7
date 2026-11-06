@@ -311,41 +311,13 @@ class YTPlayerUtils {
     // This prevents race conditions on app startup
     await _ensurePoTokensInitialized();
 
-    // Ensure poToken is generated BEFORE attempting any requests
-    // This is critical - OuterTune always generates tokens upfront
-    String? streamingPoToken;
-    String? visitorData;
-
-    if (!_poToken.hasValidTokens) {
-      if (kDebugMode) {
-        print('YTPlayerUtils: Generating poToken upfront...');
-      }
-      final tokenGenerated = await _poToken.generateTokens();
-      if (tokenGenerated) {
-        streamingPoToken = _poToken.streamingPoToken;
-        visitorData = _poToken.visitorData;
-        if (kDebugMode) {
-          print(
-            'YTPlayerUtils: poToken ready, visitorData: ${visitorData?.substring(0, min(20, visitorData.length))}...',
-          );
-        }
-      } else {
-        if (kDebugMode) {
-          print('YTPlayerUtils: poToken generation failed, proceeding without');
-        }
-      }
-    } else {
-      streamingPoToken = _poToken.streamingPoToken;
-      visitorData = _poToken.visitorData;
-    }
-
-    // Every client is bot-checked ("Sign in to confirm you're not a bot")
-    // without a visitor id. The PoToken WebView is the usual source of one;
-    // when it fails, take one from the YT Music page itself rather than send
-    // every request bare.
-    if (visitorData == null || visitorData.isEmpty) {
-      visitorData = await _fallbackVisitorData();
-    }
+    // Reuse a valid session token when available, but do not launch a
+    // WebView challenge or fetch the YouTube Music homepage on every cold
+    // playback. Most direct InnerTube clients can resolve a stream without
+    // either; generate tokens only when a client explicitly reports bot
+    // protection below.
+    String? streamingPoToken = _poToken.streamingPoToken;
+    String? visitorData = _poToken.visitorData;
 
     // Content-aware fallback:
     // Start with default clients, detect content type on first failure,
@@ -450,9 +422,8 @@ class YTPlayerUtils {
           streamingPoToken = _poToken.streamingPoToken;
           visitorData = _poToken.visitorData;
 
-          // Wait a bit before retry
-          await Future.delayed(const Duration(milliseconds: 1500));
-
+          // Retry immediately; token generation already includes the
+          // WebView challenge wait, so an extra fixed delay only slows startup.
           final retryResult = await _tryClient(
             videoId,
             playlistId: playlistId,
