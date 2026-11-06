@@ -3,7 +3,7 @@ name: Build TTA7 APK
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches: [main, master, audio-source-modes-from-build12]
 
 jobs:
   build:
