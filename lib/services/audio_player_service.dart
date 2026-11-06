@@ -3263,7 +3263,7 @@ class AudioPlayerService {
   /// Public method to prefetch tracks (called by TrackPrefetchManager)
   /// This resolves stream URLs so play taps are instant
   Future<void> prefetchTracks(List<String> videoIds) async {
-    if (videoIds.isEmpty) return;
+    if (videoIds.isEmpty || !_onUnmeteredNetwork) return;
     if (kDebugMode) {
       print(
         'AudioPlayerService: Prefetching ${videoIds.length} visible tracks',
@@ -3450,6 +3450,7 @@ class AudioPlayerService {
     if (index < 0 || index >= _queue.length) return;
     if (index == _currentIndex) return;
 
+    unawaited(AutomixService.instance.skip());
     final generation = ++_playbackGeneration;
     _currentIndex = index;
     _currentTrack = _queue[index];
@@ -3706,6 +3707,7 @@ class AudioPlayerService {
               cachedLossless,
               _currentTrack!,
               resolveTimeMs: stopwatch.elapsedMilliseconds,
+              generation: requestGeneration,
             );
             return;
           } catch (e) {
@@ -3794,12 +3796,13 @@ class AudioPlayerService {
             final lossless = await AddonService.instance
                 .matchFor(_currentTrack!)
                 .timeout(const Duration(seconds: 8));
-            if (lossless != null && _currentTrack?.id == trackId) {
+            if (lossless != null && _isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) {
               _logLossless('YouTube failed; playing the lossless copy instead');
               await _playAddonStream(
                 lossless,
                 _currentTrack!,
                 resolveTimeMs: stopwatch.elapsedMilliseconds,
+                generation: requestGeneration,
               );
               return;
             }
@@ -4013,7 +4016,7 @@ class AudioPlayerService {
     if (generation != null && !_isPlaybackRequestCurrent(generation, track.id)) return;
     if (kDebugMode) {
       print(
-        'AudioPlayerService: Playing JioSaavn 320kbps stream (${saavnStream.streamUrl})',
+        'AudioPlayerService: Playing JioSaavn 320kbps stream',
       );
     }
     final saavnPlaybackData = PlaybackData(
@@ -4363,7 +4366,9 @@ class AudioPlayerService {
     AddonMatch match,
     Track track, {
     int? resolveTimeMs,
+    int? generation,
   }) async {
+    if (generation != null && !_isPlaybackRequestCurrent(generation, track.id)) return;
     if (kDebugMode) {
       print(
         'AudioPlayerService: Playing ${match.stream.formatLabel} from ${match.addonName}',
@@ -4371,6 +4376,7 @@ class AudioPlayerService {
     }
     final playbackData = _addonPlaybackData(match);
     await _player.setAudioSource(_addonAudioSource(match, track), preload: true);
+    if (generation != null && !_isPlaybackRequestCurrent(generation, track.id)) return;
     _currentPlaybackData = playbackData;
     _activeSourceQueueIndices = <int>[_currentIndex];
     _activeSourcePlaybackDataByQueueIndex = <int, PlaybackData>{
@@ -4378,6 +4384,7 @@ class AudioPlayerService {
     };
     if (_pendingSeekPosition != null && _pendingSeekTrackId == track.id) {
       await _player.seek(_pendingSeekPosition);
+      if (generation != null && !_isPlaybackRequestCurrent(generation, track.id)) return;
       _positionController.add(_pendingSeekPosition!);
       _updateState(position: _pendingSeekPosition);
       _pendingSeekPosition = null;
