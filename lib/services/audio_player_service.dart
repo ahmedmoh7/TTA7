@@ -4011,6 +4011,37 @@ class AudioPlayerService {
       }
     } catch (e) {
       if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
+
+      // A valid YouTube URL can still fail when ExoPlayer prepares the source.
+      // Make one bounded JioSaavn fallback attempt before surfacing the error.
+      if (_jioSaavnEnabled &&
+          !_isLocalTrack(_currentTrack!) &&
+          (_audioQuality == AudioQuality.high ||
+              _audioQuality == AudioQuality.max ||
+              _audioQuality == AudioQuality.auto)) {
+        try {
+          final fallback = await JioSaavnService.instance
+              .getBestStreamForTrack(_currentTrack!)
+              .timeout(const Duration(seconds: 8));
+          if (fallback != null &&
+              fallback.bitrateKbps >= 320 &&
+              _isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) {
+            await _playJioSaavnStream(
+              fallback,
+              _currentTrack!,
+              resolveTimeMs: 0,
+              generation: requestGeneration,
+            );
+            return;
+          }
+        } catch (fallbackError) {
+          if (kDebugMode) {
+            print('AudioPlayerService: JioSaavn fallback failed: $fallbackError');
+          }
+        }
+      }
+
+      if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
       unawaited(_player.setVolume(1.0));
       if (kDebugMode) {
         print('AudioPlayerService: Error: $e');
