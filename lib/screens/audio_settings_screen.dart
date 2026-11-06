@@ -6,6 +6,7 @@ import '../core/l10n/app_localizations_x.dart';
 import '../../core/providers/theme_provider.dart';
 import '../providers/providers.dart';
 import '../services/playback/playback_data.dart';
+import '../services/audio_player_service.dart' show AudioSourceMode;
 import 'widgets/addon_source_card.dart';
 import 'widgets/audio_output_card.dart';
 import 'widgets/automix_settings_card.dart';
@@ -43,7 +44,7 @@ class AudioSettingsScreen extends ConsumerWidget {
     );
     final crossfadeDurationMs = ref.watch(crossfadeDurationMsProvider);
     final streamCacheUsageAsync = ref.watch(streamAudioCacheUsageBytesProvider);
-    final jioSaavnEnabled = ref.watch(jioSaavnEnabledProvider);
+    final audioSourceMode = ref.watch(audioSourceModeProvider);
     final preferAudioVersions = ref.watch(preferAudioVersionsProvider);
     final showSmartAudioRouting = ref.watch(showSmartAudioRoutingProvider);
     final playerService = ref.watch(audioPlayerServiceProvider);
@@ -99,9 +100,12 @@ class AudioSettingsScreen extends ConsumerWidget {
             listenable: AddonService.instance,
             builder: (context, _) {
               final hasLossless = AddonService.instance.isEnabled;
-              final bestLossy = jioSaavnEnabled
-                  ? 'up to 320 kbps (JioSaavn) or ~160 kbps Opus'
-                  : '~160 kbps Opus';
+              final bestLossy = switch (audioSourceMode) {
+                AudioSourceMode.youtubeOnly => '~160 kbps Opus (YouTube)',
+                AudioSourceMode.jioSaavnOnly => 'Best available JioSaavn stream',
+                AudioSourceMode.automatic =>
+                  'up to 320 kbps (JioSaavn) or ~160 kbps Opus',
+              };
               return Column(
                 children: [
                   _buildQualityOption(
@@ -181,9 +185,9 @@ class AudioSettingsScreen extends ConsumerWidget {
 
           const SizedBox(height: 32),
 
-          // JioSaavn source section
+          // One source selector controls online playback for High, Max and Auto.
           Text(
-            'High Quality Sources',
+            'Audio Source',
             style: TextStyle(
               fontSize: 18,
               fontWeight: FontWeight.bold,
@@ -192,21 +196,18 @@ class AudioSettingsScreen extends ConsumerWidget {
           ),
           const SizedBox(height: 8),
           Text(
-            'Enable external studio-quality sources for matching tracks',
+            'Low and Medium always use YouTube. This choice applies to High, Max and Auto.',
             style: TextStyle(
               fontSize: 14,
               color: isDark ? Colors.white54 : InzxColors.textSecondary,
             ),
           ),
           const SizedBox(height: 16),
-          _buildJioSaavnSection(
-            context: context,
+          _buildAudioSourceModeSection(
             isDark: isDark,
             accentColor: accentColor,
-            jioSaavnEnabled: jioSaavnEnabled,
-            onChanged: (enabled) async {
-              await playerService.setJioSaavnEnabled(enabled);
-            },
+            selectedMode: audioSourceMode,
+            onChanged: playerService.setAudioSourceMode,
           ),
           const SizedBox(height: 12),
           AddonSourceCard(
@@ -573,15 +574,16 @@ class AudioSettingsScreen extends ConsumerWidget {
     );
   }
 
-  Widget _buildJioSaavnSection({
-    required BuildContext context,
+  Widget _buildAudioSourceModeSection({
     required bool isDark,
     required Color accentColor,
-    required bool jioSaavnEnabled,
-    required ValueChanged<bool> onChanged,
+    required AudioSourceMode selectedMode,
+    required ValueChanged<AudioSourceMode> onChanged,
   }) {
+    final textColor = isDark ? Colors.white : InzxColors.textPrimary;
+    final subtitleColor =
+        isDark ? Colors.white54 : InzxColors.textSecondary;
     return Container(
-      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: isDark
             ? Colors.white.withValues(alpha: 0.05)
@@ -591,74 +593,47 @@ class AudioSettingsScreen extends ConsumerWidget {
           color: isDark ? Colors.white12 : accentColor.withValues(alpha: 0.2),
         ),
       ),
-      child: Row(
+      child: Column(
         children: [
-          Container(
-            width: 40,
-            height: 40,
-            decoration: BoxDecoration(
-              color: jioSaavnEnabled
-                  ? accentColor.withValues(alpha: 0.2)
-                  : isDark
-                      ? Colors.white.withValues(alpha: 0.1)
-                      : Colors.grey.shade200,
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: Opacity(
-                opacity: jioSaavnEnabled ? 1.0 : 0.4,
-                child: Image.asset(
-                  'assets/icon/JioSaavn.png',
-                  width: 40,
-                  height: 40,
-                  fit: BoxFit.cover,
-                  errorBuilder: (context, error, stackTrace) => Center(
-                    child: Icon(
-                      Iconsax.music_dashboard,
-                      color: jioSaavnEnabled
-                          ? accentColor
-                          : (isDark ? Colors.white54 : Colors.grey.shade600),
-                    ),
-                  ),
-                ),
-              ),
+          RadioListTile<AudioSourceMode>(
+            value: AudioSourceMode.automatic,
+            groupValue: selectedMode,
+            activeColor: accentColor,
+            onChanged: (value) {
+              if (value != null) onChanged(value);
+            },
+            title: Text('Automatic', style: TextStyle(color: textColor)),
+            subtitle: Text(
+              'Choose the best available source; JioSaavn can upgrade YouTube.',
+              style: TextStyle(fontSize: 12, color: subtitleColor),
             ),
           ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'JioSaavn',
-                  style: TextStyle(
-                    fontWeight: FontWeight.w600,
-                    color: isDark ? Colors.white : InzxColors.textPrimary,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  'Stream in 320 kbps studio quality',
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: isDark ? Colors.white54 : InzxColors.textSecondary,
-                  ),
-                ),
-              ],
-            ),
+          RadioListTile<AudioSourceMode>(
+            value: AudioSourceMode.youtubeOnly,
+            groupValue: selectedMode,
+            activeColor: accentColor,
+            onChanged: (value) {
+              if (value != null) onChanged(value);
+            },
+            title: Text('YouTube only', style: TextStyle(color: textColor)),
           ),
-          _buildCustomSwitch(
-            value: jioSaavnEnabled,
-            accentColor: accentColor,
-            isDark: isDark,
-            onChanged: onChanged,
+          RadioListTile<AudioSourceMode>(
+            value: AudioSourceMode.jioSaavnOnly,
+            groupValue: selectedMode,
+            activeColor: accentColor,
+            onChanged: (value) {
+              if (value != null) onChanged(value);
+            },
+            title: Text('JioSaavn only', style: TextStyle(color: textColor)),
+            subtitle: Text(
+              'No YouTube fallback if a matching track is unavailable.',
+              style: TextStyle(fontSize: 12, color: subtitleColor),
+            ),
           ),
         ],
       ),
     );
   }
-
 
   Widget _buildInfoCard(
     BuildContext context, {
