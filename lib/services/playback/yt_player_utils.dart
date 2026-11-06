@@ -79,7 +79,7 @@ class YTPlayerUtils {
   final Map<String, DateTime> _clientLastRequest = {};
 
   /// Minimum interval between requests to same client (ms)
-  static const int _minRequestIntervalMs = 1500;
+  static const int _minRequestIntervalMs = 500;
 
   /// Base backoff delay (ms)
   static const int _baseBackoffMs = 2000;
@@ -580,10 +580,15 @@ class YTPlayerUtils {
         }
 
         // Validate URL with HEAD request
-        final isValid = await _api.validateStreamUrl(
-          streamUrl,
-          visitorData: visitorData,
-        );
+        // Keep validation for clearly invalid URLs, but do not let a slow
+        // HEAD response hold playback hostage. If the probe itself times out,
+        // allow just_audio to attempt the stream and handle any real failure.
+        final isValid = await _api
+            .validateStreamUrl(streamUrl, visitorData: visitorData)
+            .timeout(
+              const Duration(seconds: 2),
+              onTimeout: () => true,
+            );
         if (!isValid) {
           if (kDebugMode) {
             print(
