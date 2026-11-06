@@ -918,7 +918,7 @@ class TrackPrefetchManager {
   /// Prefetch tracks when they become visible on screen
   /// This is called by home page widgets when shelves are displayed
   void prefetchVisibleTracks(List<Track> tracks) {
-    if (tracks.isEmpty || _isPrefetching) return;
+    if (tracks.isEmpty || _isPrefetching || !_playerService.canPrefetch) return;
 
     // Filter out already prefetched tracks
     final newTracks = tracks
