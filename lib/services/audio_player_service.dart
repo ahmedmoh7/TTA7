@@ -3729,6 +3729,7 @@ class AudioPlayerService {
             cachedSaavnStream,
             _currentTrack!,
             resolveTimeMs: stopwatch.elapsedMilliseconds,
+            requestId: requestId,
           );
           return;
         }
@@ -3795,6 +3796,7 @@ class AudioPlayerService {
           directSaavnStream,
           _currentTrack!,
           resolveTimeMs: stopwatch.elapsedMilliseconds,
+          requestId: requestId,
         );
         return;
       }
@@ -3811,6 +3813,7 @@ class AudioPlayerService {
       }
 
       if (!ytResult.isSuccess) {
+        if (!isLatestRequest()) return;
         if (kDebugMode) {
           print(
             'AudioPlayerService: Failed to get stream URL: ${ytResult.error}',
@@ -3826,6 +3829,7 @@ class AudioPlayerService {
                 fallbackSaavn,
                 _currentTrack!,
                 resolveTimeMs: stopwatch.elapsedMilliseconds,
+                requestId: requestId,
               );
               return;
             }
@@ -3848,6 +3852,7 @@ class AudioPlayerService {
             }
           } catch (_) {}
         }
+        if (!isLatestRequest()) return;
         _updateState(
           error: ytResult.error ?? 'Could not get stream URL',
           isLoading: false,
@@ -4031,7 +4036,10 @@ class AudioPlayerService {
     JioSaavnStream saavnStream,
     Track track, {
     int? resolveTimeMs,
+    int? requestId,
   }) async {
+    bool isLatestRequest() => requestId == null || requestId == _playRequestId;
+    if (!isLatestRequest()) return;
     if (kDebugMode) {
       print(
         'AudioPlayerService: Playing JioSaavn 320kbps stream (${saavnStream.streamUrl})',
@@ -4059,6 +4067,7 @@ class AudioPlayerService {
       tag: track,
     );
     await _player.setAudioSource(saavnSource, preload: true);
+    if (!isLatestRequest()) return;
     if (_pendingSeekPosition != null && _pendingSeekTrackId == track.id) {
       await _player.seek(_pendingSeekPosition);
       _positionController.add(_pendingSeekPosition!);
@@ -4066,6 +4075,7 @@ class AudioPlayerService {
       _pendingSeekPosition = null;
       _pendingSeekTrackId = null;
     }
+    if (!isLatestRequest()) return;
     _startPlayback();
     _updateState(isLoading: false, currentPlaybackData: saavnPlaybackData);
     if (_activePlaybackTracking == null && !track.id.startsWith('local_')) {
