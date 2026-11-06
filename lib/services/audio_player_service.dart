@@ -2487,9 +2487,8 @@ class AudioPlayerService {
       _prefetchNextTrack();
       _scheduleLyricsPrefetchAroundCurrent();
       if (_currentTrack != null) {
-        unawaited(_upgradeTrackQualityIfPossible(_currentTrack!));
-        // Gapless auto-advance starts the next track on whatever the
-        // playlist was built with; it gets its second look too.
+        // Gapless auto-advance keeps the active source; do not start a
+        // competing JioSaavn quality swap in the background.
         if (playbackData?.format.isLossless != true &&
             _currentPlaybackData?.isLive != true) {
           unawaited(_upgradeToLosslessIfPossible(_currentTrack!));
@@ -4455,6 +4454,7 @@ class AudioPlayerService {
   /// Every guard here errs towards not swapping — a missed upgrade is
   /// silent, an interrupted song isn't.
   Future<void> _upgradeToLosslessIfPossible(Track track) async {
+    if (!_onUnmeteredNetwork) return;
     final generation = _playbackGeneration;
     final addons = AddonService.instance;
     if (!_qualityAllowsLossless) {
@@ -4511,6 +4511,7 @@ class AudioPlayerService {
   /// (on a lossy stream), move onto it now — whichever lookup asked, and
   /// whatever became of that lookup since.
   void _onLosslessFound(({String trackId, AddonMatch match}) found) {
+    if (!_onUnmeteredNetwork) return;
     final track = _currentTrack;
     if (track == null || track.id != found.trackId) return;
     if (!_qualityAllowsLossless) return;
@@ -4520,6 +4521,7 @@ class AudioPlayerService {
   /// Moves the playing [track] onto [match] mid-song. Only one hand-over
   /// runs per song; a newer one for another song takes over.
   Future<void> _beginLosslessHandOver(Track track, AddonMatch match) async {
+    if (!_onUnmeteredNetwork) return;
     if (_losslessHandOverTrackId == track.id) return; // already under way
     if (_currentTrack?.id != track.id) {
       _logLossless('Not upgrading "${track.title}": the song changed');
