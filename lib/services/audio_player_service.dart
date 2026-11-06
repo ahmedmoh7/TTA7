@@ -3598,10 +3598,10 @@ class AudioPlayerService {
       ),
     );
 
+    var saavnFallbackAttempted = false;
     try {
       final trackId = _currentTrack!.id;
       final stopwatch = Stopwatch()..start();
-      var saavnFallbackAttempted = false;
       await _inactivePlayer.stop();
       if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
       await _player.setVolume(1.0);
