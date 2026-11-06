@@ -2916,12 +2916,10 @@ class AudioPlayerService {
             print('AudioPlayerService: Pre-fetching next track: ${nextTrack.id}');
           }
 
-          // Fire and forget - just warm up the cache
-          if (_onUnmeteredNetwork) {
+          // Fire and forget - just warm up the cache on unmetered networks.
           if (_onUnmeteredNetwork) {
             _ytPlayerUtils.prefetchNext(nextTrack.id, quality: _audioQuality);
           }
-        }
         }
         _schedulePrecacheAhead();
       }
@@ -3778,7 +3776,7 @@ class AudioPlayerService {
       final ytFuture = _ytPlayerUtils.playerResponseForPlayback(
         trackId,
         quality: _audioQuality,
-        isMetered: false,
+        isMetered: !_onUnmeteredNetwork,
       );
 
       final ytResult = await ytFuture;
@@ -4806,8 +4804,10 @@ class AudioPlayerService {
           print('AudioPlayerService: Prefetching next track: ${nextTrack.title}');
         }
 
-        // Fire and forget - don't await
-        _ytPlayerUtils.prefetchNext(nextTrack.id, quality: _audioQuality);
+        // Fire and forget - don't await; avoid optional mobile-data lookups.
+        if (_onUnmeteredNetwork) {
+          _ytPlayerUtils.prefetchNext(nextTrack.id, quality: _audioQuality);
+        }
       }
       _schedulePrecacheAhead();
       unawaited(
