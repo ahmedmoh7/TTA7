@@ -410,7 +410,7 @@ class AudioPlayerService {
 
   /// Wi-Fi or ethernet right now, kept current by a connectivity listener
   /// so quality checks don't have to wait on the platform.
-  bool _onUnmeteredNetwork = true;
+  bool _onUnmeteredNetwork = false;
   bool _streamCacheWifiOnly = false;
   int _streamCacheSizeLimitMb = kDefaultStreamCacheSizeLimitMb;
   int _streamCacheMaxConcurrent = kDefaultStreamCacheMaxConcurrent;
@@ -1938,7 +1938,7 @@ class AudioPlayerService {
         final result = await _ytPlayerUtils.playerResponseForPlayback(
           track.id,
           quality: _audioQuality,
-          isMetered: false,
+          isMetered: !_onUnmeteredNetwork,
         );
         if (!result.isSuccess || result.data == null) continue;
         candidates.add((track: track, playbackData: result.data!));
@@ -2917,7 +2917,11 @@ class AudioPlayerService {
           }
 
           // Fire and forget - just warm up the cache
-          _ytPlayerUtils.prefetchNext(nextTrack.id, quality: _audioQuality);
+          if (_onUnmeteredNetwork) {
+          if (_onUnmeteredNetwork) {
+            _ytPlayerUtils.prefetchNext(nextTrack.id, quality: _audioQuality);
+          }
+        }
         }
         _schedulePrecacheAhead();
       }
