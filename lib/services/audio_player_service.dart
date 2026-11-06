@@ -1864,7 +1864,7 @@ class AudioPlayerService {
   }
 
   void _schedulePrecacheAhead() {
-    if (_isPrecachingAhead) return;
+    if (!_shouldUseYoutube || _isPrecachingAhead) return;
     if (kDebugMode) {
       print(
         'AudioPlayerService: Scheduling pre-cache ahead (index=$_currentIndex, queue=${_queue.length})',
@@ -1874,7 +1874,7 @@ class AudioPlayerService {
   }
 
   Future<void> _precacheAheadTracks() async {
-    if (_isPrecachingAhead) return;
+    if (!_shouldUseYoutube || _isPrecachingAhead) return;
     if (_currentIndex < 0 || _queue.isEmpty) {
       if (kDebugMode) {
         print(
