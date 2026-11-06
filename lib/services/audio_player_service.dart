@@ -2935,7 +2935,7 @@ class AudioPlayerService {
       // Pre-fetch next track
       if (_currentIndex < _queue.length - 1) {
         final nextTrack = _queue[_currentIndex + 1];
-        if (!_isLocalTrack(nextTrack)) {
+        if (!_isLocalTrack(nextTrack) && _shouldUseYoutube) {
           if (kDebugMode) {
             print('AudioPlayerService: Pre-fetching next track: ${nextTrack.id}');
           }
@@ -4355,6 +4355,10 @@ class AudioPlayerService {
         ? _currentTrack
         : _queue.where((t) => t.id == videoId).firstOrNull;
     if (track == null || _isLocalTrack(track)) return;
+    // In strict JioSaavn mode, don't silently download a YouTube copy for
+    // Automix analysis; keep the selected online source isolated.
+    if (_isHighQualityStreaming &&
+        _audioSourceMode == AudioSourceMode.jioSaavnOnly) return;
     try {
       final result = await _ytPlayerUtils.playerResponseForPlayback(
         videoId,
@@ -5174,10 +5178,12 @@ class AudioPlayerService {
           _updateState(queue: _queue, queueRevision: _queueRevision);
 
           // Prefetch new tracks for instant playback
-          _ytPlayerUtils.prefetch(
-            newTracks.map((t) => t.id).toList(),
-            quality: _audioQuality,
-          );
+          if (_shouldUseYoutube) {
+            _ytPlayerUtils.prefetch(
+              newTracks.map((t) => t.id).toList(),
+              quality: _audioQuality,
+            );
+          }
           _schedulePrecacheAhead();
           _scheduleLyricsPrefetchAroundCurrent();
 
