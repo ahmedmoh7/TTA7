@@ -5267,6 +5267,8 @@ class AudioPlayerService {
 
   /// Stop playback
   Future<void> stop() async {
+    // Invalidate any in-flight load before stopping either player.
+    _playbackGeneration++;
     final position = _player.position;
     unawaited(_sendYoutubeWatchtime(state: 'paused', force: true));
     _stopYoutubeWatchtimeTimer();
@@ -5327,8 +5329,11 @@ class AudioPlayerService {
       return;
     }
 
+    final generation = ++_playbackGeneration;
     _currentIndex = newIndex;
-    await _loadAndPlayCurrent();
+    await Future.wait([_player.stop(), _inactivePlayer.stop()]);
+    if (generation != _playbackGeneration) return;
+    await _loadAndPlayCurrent(generation: generation);
   }
 
   /// Skip to previous track
@@ -5352,8 +5357,11 @@ class AudioPlayerService {
       return;
     }
 
+    final generation = ++_playbackGeneration;
     _currentIndex = newIndex;
-    await _loadAndPlayCurrent();
+    await Future.wait([_player.stop(), _inactivePlayer.stop()]);
+    if (generation != _playbackGeneration) return;
+    await _loadAndPlayCurrent(generation: generation);
   }
 
   /// Set loop mode
