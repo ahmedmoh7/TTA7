@@ -3756,53 +3756,6 @@ class AudioPlayerService {
 
       final ytResult = await ytFuture;
       if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
-        // Race JioSaavn against YouTube
-        final first = await Future.any<dynamic>([
-          saavnFuture
-              .then((s) => ('saavn', s))
-              .catchError((_) => ('saavn', null)),
-          ytFuture
-              .then((r) => ('yt', r))
-              .catchError((e) => ('yt', PlaybackResult.failure(e.toString()))),
-        ]);
-
-        if (first.$1 == 'saavn') {
-          final s = first.$2 as JioSaavnStream?;
-          if (s != null && s.bitrateKbps >= 320) {
-            directSaavnStream = s;
-          } else {
-            ytResult = await ytFuture;
-          }
-        } else {
-          ytResult = first.$2 as PlaybackResult;
-          // If YouTube finished first, give JioSaavn a short 400ms bounded race window
-          try {
-            final quickSaavn =
-                await saavnFuture.timeout(const Duration(milliseconds: 400));
-            if (quickSaavn != null && quickSaavn.bitrateKbps >= 320) {
-              directSaavnStream = quickSaavn;
-            }
-          } catch (_) {
-            // Still pending or timed out, will be handed to background upgrade
-          }
-        }
-      } else {
-        ytResult = await ytFuture;
-      }
-      if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
-
-      // If JioSaavn won the race, play directly with 320kbps!
-      if (directSaavnStream != null && directSaavnStream.bitrateKbps >= 320) {
-        await _playJioSaavnStream(
-          directSaavnStream,
-          _currentTrack!,
-          resolveTimeMs: stopwatch.elapsedMilliseconds,
-        );
-        return;
-      }
-
-      // Otherwise proceed with YouTube stream
-      ytResult ??= await ytFuture;
 
       final urlResolveTime = stopwatch.elapsedMilliseconds;
       if (kDebugMode) {
