@@ -380,6 +380,24 @@ class AudioPlayerService {
   int _currentIndex = -1;
   // Invalidates stale manual playback requests when the user changes tracks.
   int _playbackGeneration = 0;
+  Future<void> _sourceMutationTail = Future<void>.value();
+
+  Future<bool> _runPlaybackSourceMutation(
+    int generation,
+    Future<void> Function() mutation,
+  ) async {
+    final previous = _sourceMutationTail;
+    final release = Completer<void>();
+    _sourceMutationTail = release.future;
+    await previous;
+    try {
+      if (generation != _playbackGeneration) return false;
+      await mutation();
+      return generation == _playbackGeneration;
+    } finally {
+      release.complete();
+    }
+  }
 
   bool _isPlaybackRequestCurrent(int generation, String trackId) {
     return generation == _playbackGeneration && _currentTrack?.id == trackId;
@@ -3648,10 +3666,13 @@ class AudioPlayerService {
               if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
               _currentPlaybackData = localPlaybackData;
 
-              await _player.setAudioSource(
-                AudioSource.uri(fileUri, tag: _currentTrack),
+              final sourceReady = await _runPlaybackSourceMutation(
+                requestGeneration,
+                () => _player.setAudioSource(
+                  AudioSource.uri(fileUri, tag: _currentTrack),
+                ),
               );
-              if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
+              if (!sourceReady || !_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
               _activeSourceQueueIndices = <int>[_currentIndex];
               if (localPlaybackData != null) {
                 _activeSourcePlaybackDataByQueueIndex = <int, PlaybackData>{
@@ -3893,18 +3914,21 @@ class AudioPlayerService {
 
       try {
         if (source is ConcatenatingAudioSource) {
-          await _player.setAudioSource(
-            source,
-            // Pre-buffer ahead for smoother playback
-            preload: true,
-            initialIndex: 0,
+          final sourceReady = await _runPlaybackSourceMutation(
+            requestGeneration,
+            () => _player.setAudioSource(
+              source,
+              preload: true,
+              initialIndex: 0,
+            ),
           );
+          if (!sourceReady) return;
         } else {
-          await _player.setAudioSource(
-            source,
-            // Pre-buffer ahead for smoother playback
-            preload: true,
+          final sourceReady = await _runPlaybackSourceMutation(
+            requestGeneration,
+            () => _player.setAudioSource(source, preload: true),
           );
+          if (!sourceReady) return;
         }
       } catch (e) {
         // ignore: experimental_member_use
@@ -3919,13 +3943,17 @@ class AudioPlayerService {
           _activeSourcePlaybackDataByQueueIndex = <int, PlaybackData>{
             _currentIndex: playbackData,
           };
-          await _player.setAudioSource(
-            AudioSource.uri(
-              Uri.parse(playbackData.streamUrl),
-              tag: _currentTrack,
+          final fallbackSourceReady = await _runPlaybackSourceMutation(
+            requestGeneration,
+            () => _player.setAudioSource(
+              AudioSource.uri(
+                Uri.parse(playbackData.streamUrl),
+                tag: _currentTrack,
+              ),
+              preload: true,
             ),
-            preload: true,
           );
+          if (!fallbackSourceReady) return;
         } else {
           rethrow;
         }
@@ -4040,7 +4068,15 @@ class AudioPlayerService {
       Uri.parse(saavnStream.streamUrl),
       tag: track,
     );
-    await _player.setAudioSource(saavnSource, preload: true);
+    if (generation != null) {
+      final sourceReady = await _runPlaybackSourceMutation(
+        generation,
+        () => _player.setAudioSource(saavnSource, preload: true),
+      );
+      if (!sourceReady) return;
+    } else {
+      await _player.setAudioSource(saavnSource, preload: true);
+    }
     if (generation != null && !_isPlaybackRequestCurrent(generation, track.id)) return;
     if (_pendingSeekPosition != null && _pendingSeekTrackId == track.id) {
       await _player.seek(_pendingSeekPosition);
@@ -4375,7 +4411,15 @@ class AudioPlayerService {
       );
     }
     final playbackData = _addonPlaybackData(match);
-    await _player.setAudioSource(_addonAudioSource(match, track), preload: true);
+    if (generation != null) {
+      final sourceReady = await _runPlaybackSourceMutation(
+        generation,
+        () => _player.setAudioSource(_addonAudioSource(match, track), preload: true),
+      );
+      if (!sourceReady) return;
+    } else {
+      await _player.setAudioSource(_addonAudioSource(match, track), preload: true);
+    }
     if (generation != null && !_isPlaybackRequestCurrent(generation, track.id)) return;
     _currentPlaybackData = playbackData;
     _activeSourceQueueIndices = <int>[_currentIndex];
