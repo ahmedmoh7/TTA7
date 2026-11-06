@@ -770,12 +770,13 @@ class AudioPlayerService {
       }
     } finally {
       // Do not touch a player after a newer manual request took ownership.
-      if (shouldContinue != null && !shouldContinue()) return;
-      // Always force final settled volumes even if ramp loop is interrupted.
-      await Future.wait(<Future<void>>[
-        _setVolumeSafely(outgoing, 0.0, context: 'fade-final-out'),
-        _setVolumeSafely(incoming, 1.0, context: 'fade-final-in'),
-      ]);
+      if (shouldContinue == null || shouldContinue()) {
+        // Always force final settled volumes even if ramp loop is interrupted.
+        await Future.wait(<Future<void>>[
+          _setVolumeSafely(outgoing, 0.0, context: 'fade-final-out'),
+          _setVolumeSafely(incoming, 1.0, context: 'fade-final-in'),
+        ]);
+      }
     }
   }
 
