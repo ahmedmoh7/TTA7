@@ -2414,6 +2414,9 @@ class AudioPlayerService {
   /// Current index in queue
   int get currentIndex => _currentIndex;
 
+  /// Whether optional stream URL prefetch is allowed on the current network.
+  bool get canPrefetch => _onUnmeteredNetwork;
+
   /// Current audio quality setting
   AudioQuality get audioQuality => _audioQuality;
 
