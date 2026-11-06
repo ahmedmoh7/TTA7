@@ -308,53 +308,9 @@ class LocalArtworkService {
         }
       }
 
-      // Search online using sanitized title and artist
-      final cleanQuery = sanitizeTrackQuery(track.title, track.artist);
-      if (cleanQuery.isNotEmpty) {
-        final onlineMeta = await _lookupOnlineMetadata(cleanQuery);
-        if (onlineMeta != null) {
-          Uint8List? downloaded;
-          if (onlineMeta.hasArtwork) {
-            downloaded = await _downloadArtworkBytes(onlineMeta.artworkUrl!);
-            if (downloaded != null && downloaded.isNotEmpty) {
-              _setMemoryCache(trimmedPath, downloaded);
-              _saveToDiskCache(trimmedPath, downloaded);
-            }
-          }
-
-          var updated = track;
-          bool changed = false;
-          if (isArtistMissing(updated.artist) && onlineMeta.hasArtist) {
-            updated = updated.copyWith(artist: onlineMeta.artist!.trim());
-            changed = true;
-          }
-          if ((updated.album == null || updated.album!.trim().isEmpty) &&
-              onlineMeta.album != null &&
-              onlineMeta.album!.trim().isNotEmpty) {
-            updated = updated.copyWith(album: onlineMeta.album!.trim());
-            changed = true;
-          }
-          if ((updated.thumbnailUrl == null || updated.thumbnailUrl!.trim().isEmpty) &&
-              onlineMeta.hasArtwork) {
-            updated = updated.copyWith(
-              thumbnailUrl: onlineMeta.artworkUrl,
-              highResThumbnailUrl: onlineMeta.artworkUrl,
-            );
-            changed = true;
-          }
-
-          if (changed) {
-            _updateHiveTrackMetadata(updated);
-            _trackEnrichedController.add(updated);
-          } else if (onlineMeta.hasArtwork) {
-            _updateHiveTrackThumbnail(track, onlineMeta.artworkUrl!);
-          }
-
-          if (downloaded != null && downloaded.isNotEmpty) {
-            return downloaded;
-          }
-        }
-      }
+      // Data saver: skip multi-provider online metadata searches for local
+      // files. An existing artwork URL can still be downloaded above when
+      // the artwork is actually requested.
 
       // Negative cache to prevent hammering APIs on subsequent rebuilds
       _notFoundCache.add(trimmedPath);
@@ -431,7 +387,7 @@ class LocalArtworkService {
 
             return OnlineTrackMetadata(
               artworkUrl: art100 != null && art100.isNotEmpty
-                  ? art100.replaceAll('100x100bb', '600x600bb')
+                  ? art100.replaceAll('100x100bb', '100x100bb')
                   : null,
               artist: artistName,
               title: trackName,
@@ -457,9 +413,9 @@ class LocalArtworkService {
         var thumb = track.bestThumbnail;
         if (thumb != null && thumb.isNotEmpty) {
           if (thumb.contains('w120-h120')) {
-            thumb = thumb.replaceAll('w120-h120', 'w600-h600');
+            thumb = thumb.replaceAll('w120-h120', 'w120-h120');
           } else if (thumb.contains('=w60-h60')) {
-            thumb = thumb.replaceAll('=w60-h60', '=w600-h600');
+            thumb = thumb.replaceAll('=w60-h60', '=w120-h120');
           }
         }
         return OnlineTrackMetadata(
@@ -485,8 +441,8 @@ class LocalArtworkService {
         var img = song.image;
         if (img != null && img.isNotEmpty) {
           img = img
-              .replaceAll('150x150', '500x500')
-              .replaceAll('50x50', '500x500');
+              .replaceAll('150x150', '150x150')
+              .replaceAll('50x50', '150x150');
         }
         return OnlineTrackMetadata(
           artworkUrl: img,

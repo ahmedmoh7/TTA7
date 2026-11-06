@@ -128,6 +128,8 @@ class LyricsWarmupService {
     required int durationSeconds,
     String? localFilePath,
   }) async {
+    // Data saver: lyric provider requests are made only on explicit user demand.
+    return;
     if (videoId.isEmpty) return;
     if (_inFlight.contains(videoId)) return;
     if (_hasCachedLyrics(videoId)) return;

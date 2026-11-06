@@ -11,8 +11,8 @@ class CacheWarmingService {
   /// Warm cache by pre-loading trending and liked songs
   /// Runs in background without blocking UI
   Future<void> warmCache({
-    bool preTrendingMusic = true,
-    bool prelikedSongs = true,
+    bool preTrendingMusic = false,
+    bool prelikedSongs = false,
   }) async {
     try {
       final futures = <Future<dynamic>>[];

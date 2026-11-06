@@ -921,8 +921,7 @@ class AudioPlayerService {
         final fileSize = await localFile.length();
         if (fileSize >= 10000) {
           if (LocalArtworkService.isArtistMissing(track.artist)) {
-            unawaited(LocalArtworkService.fetchOnlineMetadata(track));
-          }
+              }
           final playbackData = await _resolvePlaybackDataForLocalTrack(
             track,
             localFile,
@@ -1077,8 +1076,7 @@ class AudioPlayerService {
       );
       _saveQueueDebounced();
       _prefetchNextTrack();
-      _scheduleLyricsPrefetchAroundCurrent();
-
+  
       AudioRoutingService.reapplyAudioRoute();
       unawaited(incomingPlayer.play());
       for (int i = 1; i <= 6; i++) {
@@ -1815,13 +1813,7 @@ class AudioPlayerService {
   }
 
   void _schedulePrecacheAhead() {
-    if (_isPrecachingAhead) return;
-    if (kDebugMode) {
-      print(
-        'AudioPlayerService: Scheduling pre-cache ahead (index=$_currentIndex, queue=${_queue.length})',
-      );
-    }
-    unawaited(_precacheAheadTracks());
+    // Data saver: do not download audio for upcoming tracks.
   }
 
   Future<void> _precacheAheadTracks() async {
@@ -2460,8 +2452,7 @@ class AudioPlayerService {
       }
       _saveQueueDebounced();
       _prefetchNextTrack();
-      _scheduleLyricsPrefetchAroundCurrent();
-      if (_currentTrack != null) {
+        if (_currentTrack != null) {
         unawaited(_upgradeTrackQualityIfPossible(_currentTrack!));
         // Gapless auto-advance starts the next track on whatever the
         // playlist was built with; it gets its second look too.
@@ -3221,7 +3212,6 @@ class AudioPlayerService {
 
     // Persist queue state (debounced)
     _saveQueueDebounced();
-    _scheduleLyricsPrefetchAroundCurrent();
 
     // Fire and forget - start playback without blocking caller
     // This allows UI to remain responsive while audio loads
@@ -3234,30 +3224,16 @@ class AudioPlayerService {
           'AudioPlayerService: Running delayed work, _isRadioMode=$_isRadioMode, queue.length=${_queue.length}',
         );
       }
-      // Start prefetching ALL tracks in background
-      _prefetchAllTracks();
-      // Playlist build removed to fix native ExoPlayer leaks
-      // If radio mode is on and queue is short, immediately fetch related tracks
-      // This ensures the queue is populated right away, not just after first song ends
-      if (_isRadioMode && _queue.length <= 2) {
-        if (kDebugMode) {
-          print('AudioPlayerService: Triggering immediate radio fetch');
-        }
-        _fetchRadioTracks();
-      }
+      // Data saver: do not resolve or download tracks that are not playing.
+      // Radio discovery is deferred until the current track is nearly finished.
     });
   }
 
   /// Public method to prefetch tracks (called by TrackPrefetchManager)
   /// This resolves stream URLs so play taps are instant
   Future<void> prefetchTracks(List<String> videoIds) async {
-    if (videoIds.isEmpty) return;
-    if (kDebugMode) {
-      print(
-        'AudioPlayerService: Prefetching ${videoIds.length} visible tracks',
-      );
-    }
-    await _ytPlayerUtils.prefetch(videoIds, quality: _audioQuality);
+    // Data saver: visible/queued tracks are resolved only when played.
+    return;
   }
 
   bool _isLocalTrack(Track track) {
@@ -3278,37 +3254,11 @@ class AudioPlayerService {
   /// Prefetch all tracks in queue (OuterTune approach)
   /// This resolves stream URLs in background
   void _prefetchAllTracks() {
-    if (_queue.isEmpty) return;
-
-    // Prefetch all tracks, but prioritize current and next, filtering out local tracks
-    final allIds = _queue
-        .where((t) => !_isLocalTrack(t))
-        .map((t) => t.id)
-        .toList();
-        
-    if (allIds.isEmpty) return;
-    
-    if (kDebugMode) {
-      print('AudioPlayerService: Prefetching ${allIds.length} remote tracks');
-    }
-
-    // Fire and forget - prefetch happens in background
-    _ytPlayerUtils.prefetch(allIds, quality: _audioQuality);
+    // Intentionally disabled: no stream URLs are resolved before playback.
   }
 
   void _scheduleLyricsPrefetchAroundCurrent() {
-    if (_queue.isEmpty) return;
-    final start = _currentIndex < 0 ? 0 : _currentIndex;
-    final end = min(_queue.length, start + kLyricsPrefetchAheadTrackCount);
-    if (start >= end) return;
-
-    final tracks = _queue.sublist(start, end);
-    if (kDebugMode) {
-      print(
-        'AudioPlayerService: Prefetching lyrics for ${tracks.length} tracks (from index $start)',
-      );
-    }
-    unawaited(_prefetchLyricsForTracks(tracks));
+    // Lyrics are fetched only when the user explicitly opens the lyrics view.
   }
 
   Future<void> _prefetchLyricsForTracks(List<Track> tracks) async {
@@ -3333,28 +3283,7 @@ class AudioPlayerService {
     _updateState(queue: _queue, queueRevision: _queueRevision);
     _saveQueueDebounced();
 
-    // Prefetch newly added tracks
-    if (tracks.isNotEmpty) {
-      _ytPlayerUtils.prefetch(
-        tracks.map((t) => t.id).toList(),
-        quality: _audioQuality,
-      );
-      if (_jioSaavnEnabled &&
-          (_audioQuality == AudioQuality.high ||
-              _audioQuality == AudioQuality.max ||
-              _audioQuality == AudioQuality.auto)) {
-        for (final track in tracks.take(3)) {
-          unawaited(JioSaavnService.instance.getBestStreamForTrack(track));
-        }
-      }
-      _schedulePrecacheAhead();
-      _scheduleLyricsPrefetchAroundCurrent();
-
-      // If we were at the end of the queue, the immediate next track is now available
-      if (_currentIndex >= _queue.length - tracks.length - 1) {
-        _prefetchNextTrack();
-      }
-    }
+    // Data saver: newly queued tracks are resolved only when playback reaches them.
   }
 
   /// Insert track to play next
@@ -3370,16 +3299,7 @@ class AudioPlayerService {
     _updateState(queue: _queue, queueRevision: _queueRevision);
     _saveQueueDebounced();
 
-    // Prefetch the track that will play next
-    _ytPlayerUtils.prefetchNext(track.id, quality: _audioQuality);
-    if (_jioSaavnEnabled &&
-        (_audioQuality == AudioQuality.high ||
-            _audioQuality == AudioQuality.max ||
-            _audioQuality == AudioQuality.auto)) {
-      unawaited(JioSaavnService.instance.getBestStreamForTrack(track));
-    }
-    _schedulePrecacheAhead();
-    _scheduleLyricsPrefetchAroundCurrent();
+    // Data saver: the next track is resolved only when playback reaches it.
   }
 
   /// Remove track from queue
@@ -3551,16 +3471,7 @@ class AudioPlayerService {
       currentPlaybackData: null,
     );
 
-    // Warm lyrics cache immediately when track changes.
-    unawaited(
-      _lyricsWarmupService.prefetchForTrack(
-        videoId: trackForLyrics.id,
-        title: trackForLyrics.title,
-        artist: trackForLyrics.artist,
-        album: trackForLyrics.album,
-        durationSeconds: trackForLyrics.duration.inSeconds,
-      ),
-    );
+    // Data saver: no external lyrics lookup is started during playback.
 
     try {
       final trackId = _currentTrack!.id;
@@ -3609,8 +3520,7 @@ class AudioPlayerService {
           } else {
             // Enrich track metadata (artist, album, artwork) in background if missing
             if (LocalArtworkService.isArtistMissing(_currentTrack!.artist)) {
-              unawaited(LocalArtworkService.fetchOnlineMetadata(_currentTrack!));
-            }
+                      }
             try {
               // Use Uri.file for proper file:// URI on Android
               final fileUri = Uri.file(resolvedLocalPath);
@@ -4241,7 +4151,6 @@ class AudioPlayerService {
     _startYoutubePlaybackTracking();
     _saveQueueDebounced();
     _prefetchNextTrack();
-    _scheduleLyricsPrefetchAroundCurrent();
     AudioRoutingService.reapplyAudioRoute();
     _syncAutomix();
     if (kDebugMode) {
@@ -4719,59 +4628,8 @@ class AudioPlayerService {
   /// Prefetch next track in background (OuterTune approach)
   /// This is called after current track starts playing
   void _prefetchNextTrack() {
-    // Automix reads both sides of the coming transition: the playing
-    // track's ending and the next one's opening.
-    final playing = _currentTrack;
-    if (playing != null) _requestAutomixAnalysis(playing);
-    if (_currentIndex < _queue.length - 1) {
-      _requestAutomixAnalysis(_queue[_currentIndex + 1]);
-    }
-    if (_currentIndex < _queue.length - 1) {
-      final nextTrack = _queue[_currentIndex + 1];
-      if (!_isLocalTrack(nextTrack)) {
-        if (kDebugMode) {
-          print('AudioPlayerService: Prefetching next track: ${nextTrack.title}');
-        }
-
-        // Fire and forget - don't await
-        _ytPlayerUtils.prefetchNext(nextTrack.id, quality: _audioQuality);
-      }
-      _schedulePrecacheAhead();
-      unawaited(
-        _lyricsWarmupService.prefetchForTrack(
-          videoId: nextTrack.id,
-          title: nextTrack.title,
-          artist: nextTrack.artist,
-          album: nextTrack.album,
-          durationSeconds: nextTrack.duration.inSeconds,
-        ),
-      );
-
-      // Resolve the next track's lossless copy now, so it can start on it.
-      if (_qualityAllowsLossless && AddonService.instance.isEnabled) {
-        unawaited(AddonService.instance.matchFor(nextTrack));
-      }
-
-      // Prefetch JioSaavn 320kbps stream in background if enabled
-      if (_jioSaavnEnabled &&
-          (_audioQuality == AudioQuality.high ||
-              _audioQuality == AudioQuality.max ||
-              _audioQuality == AudioQuality.auto)) {
-        unawaited(JioSaavnService.instance.getBestStreamForTrack(nextTrack));
-        if (_currentIndex < _queue.length - 2) {
-          final subsequentTrack = _queue[_currentIndex + 2];
-          unawaited(JioSaavnService.instance.getBestStreamForTrack(subsequentTrack));
-        }
-      }
-
-      // Pre-extract colors for upcoming tracks so song change is instant 0ms
-      for (int i = 1; i <= 3 && (_currentIndex + i) < _queue.length; i++) {
-        final t = _queue[_currentIndex + i];
-        if (t.thumbnailUrl != null) {
-          unawaited(AlbumColorExtractor.extractFromUrl(t.thumbnailUrl));
-        }
-      }
-    }
+    // Data saver: no speculative stream, lyrics, artwork, addon, or analysis
+    // requests for upcoming tracks. They are resolved only when played.
   }
 
   /// Seamlessly upgrade the current playing track to JioSaavn 320kbps if available
@@ -5111,8 +4969,7 @@ class AudioPlayerService {
             quality: _audioQuality,
           );
           _schedulePrecacheAhead();
-          _scheduleLyricsPrefetchAroundCurrent();
-
+      
           // Update radio source for next fetch - use track from new batch
           if (newTracks.length > 2) {
             _radioSourceTrackId = newTracks[newTracks.length ~/ 2].id;

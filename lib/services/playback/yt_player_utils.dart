@@ -216,6 +216,29 @@ class YTPlayerUtils {
   bool _hasPlaybackTracking(PlaybackData data) =>
       data.playbackTracking?.hasStatsUrls == true;
 
+  /// A cached high-bitrate URL must not bypass the user's current data-saving
+  /// quality. Auto is low on metered networks and medium on unmetered ones.
+  bool _matchesRequestedQuality(
+    PlaybackData data, {
+    required AudioQuality quality,
+    required bool isMetered,
+  }) {
+    final effectiveQuality = quality == AudioQuality.auto
+        ? (isMetered ? AudioQuality.low : AudioQuality.medium)
+        : quality;
+    final bitrate = data.format.bitrate;
+    switch (effectiveQuality) {
+      case AudioQuality.low:
+        return bitrate <= 80000;
+      case AudioQuality.medium:
+        return bitrate <= 160000;
+      case AudioQuality.high:
+      case AudioQuality.max:
+      case AudioQuality.auto:
+        return true;
+    }
+  }
+
   void _discardUntrackedCache(String videoId) {
     _cache.remove(videoId);
     unawaited(HiveService.streamCacheBox.delete(videoId));
@@ -260,6 +283,15 @@ class YTPlayerUtils {
           );
         }
         _discardUntrackedCache(videoId);
+      } else if (!_matchesRequestedQuality(
+        normalized,
+        quality: quality,
+        isMetered: isMetered,
+      )) {
+        if (kDebugMode) {
+          print('YTPlayerUtils: Cached stream exceeds requested data-saving quality');
+        }
+        _discardUntrackedCache(videoId);
       } else {
         if (!identical(normalized, cached)) {
           _cache[videoId] = normalized;
@@ -289,6 +321,15 @@ class YTPlayerUtils {
           print(
             'YTPlayerUtils: Ignoring disk playback cache without tracking URLs',
           );
+        }
+        _discardUntrackedCache(videoId);
+      } else if (!_matchesRequestedQuality(
+        normalized,
+        quality: quality,
+        isMetered: isMetered,
+      )) {
+        if (kDebugMode) {
+          print('YTPlayerUtils: Disk cache exceeds requested data-saving quality');
         }
         _discardUntrackedCache(videoId);
       } else {
@@ -1010,7 +1051,7 @@ class YTPlayerUtils {
 
     // Resolve auto quality based on connection
     final effectiveQuality = (quality == AudioQuality.auto)
-        ? (isMetered ? AudioQuality.medium : AudioQuality.high)
+        ? (isMetered ? AudioQuality.low : AudioQuality.medium)
         : quality;
 
     // Sort by quality preference
