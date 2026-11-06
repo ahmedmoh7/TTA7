@@ -4267,7 +4267,10 @@ class AudioPlayerService {
           preload: true,
         ),
       );
-      if (!sourceReady) return;
+      if (!sourceReady) {
+        if (generation != _playbackGeneration) await player.stop();
+        return;
+      }
       if (generation != _playbackGeneration || index >= _queue.length || _queue[index].id != track.id) {
         await player.stop();
         return;
