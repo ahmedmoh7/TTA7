@@ -926,8 +926,8 @@ class TrackPrefetchManager {
         .toList();
     if (newTracks.isEmpty) return;
 
-    // Mark as prefetching (limit to first 20 for performance)
-    final toPrefetch = newTracks.take(20).toList();
+    // Resolve only the first two visible tracks to avoid queue-wide URL lookups.
+    final toPrefetch = newTracks.take(2).toList();
     for (final track in toPrefetch) {
       _prefetchedIds.add(track.id);
     }
