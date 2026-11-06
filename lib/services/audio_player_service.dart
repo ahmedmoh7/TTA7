@@ -1019,6 +1019,7 @@ class AudioPlayerService {
       return;
     }
 
+    final generation = _playbackGeneration;
     _isCrossfading = true;
     var crossfadeSucceeded = false;
     final outgoingPlayer = _player;
@@ -1028,16 +1029,22 @@ class AudioPlayerService {
 
     try {
       final built = await _buildSourceForTrack(targetTrack);
+      if (generation != _playbackGeneration) return;
       await incomingPlayer.stop();
       await incomingPlayer.setLoopMode(_nativeLoopModeFor(_loopMode));
       await incomingPlayer.setSpeed(outgoingPlayer.speed);
-      await incomingPlayer.setAudioSource(built.source, preload: true);
+      final sourceReady = await _runPlaybackSourceMutation(
+        generation,
+        () => incomingPlayer.setAudioSource(built.source, preload: true),
+      );
+      if (!sourceReady || generation != _playbackGeneration) return;
       await _setVolumeSafely(
         incomingPlayer,
         0.12,
         context: 'crossfade-bootstrap',
       );
 
+      if (generation != _playbackGeneration) return;
       _player = incomingPlayer;
       _currentIndex = targetIndex;
       var enrichedTrack = targetTrack;
@@ -1110,6 +1117,7 @@ class AudioPlayerService {
       }
 
       await Future.delayed(const Duration(milliseconds: 90));
+      if (generation != _playbackGeneration) return;
       if (kDebugMode) {
         print(
           'AudioPlayerService: Crossfade started $sourceTrackId -> ${targetTrack.id} (${_crossfadeDurationMs}ms)',
@@ -1120,6 +1128,7 @@ class AudioPlayerService {
         incoming: incomingPlayer,
         duration: _crossfadeDuration,
       );
+      if (generation != _playbackGeneration) return;
 
       await outgoingPlayer.stop();
       await _setVolumeSafely(
@@ -1143,6 +1152,7 @@ class AudioPlayerService {
       }
       crossfadeSucceeded = true;
     } catch (e) {
+      if (generation != _playbackGeneration) return;
       if (kDebugMode) {
         print(
           'AudioPlayerService: Crossfade failed, fallback to hard switch: $e',
@@ -4148,6 +4158,7 @@ class AudioPlayerService {
   bool _automixMixing = false;
   PlaybackData? _automixIncomingData;
   int _automixIncomingIndex = -1;
+  int? _automixIncomingGeneration;
   bool _automixSyncScheduled = false;
 
   bool get _automixOn => AutomixService.instance.enabled && !_jamsModeEnabled;
@@ -4242,6 +4253,7 @@ class AudioPlayerService {
       }
       _automixIncomingData = built.playbackData;
       _automixIncomingIndex = index;
+      _automixIncomingGeneration = generation;
       await AutomixService.instance.loaded(playerId, index);
       if (kDebugMode) {
         print('AudioPlayerService: Automix armed ${track.id} at ${cueMs}ms');
@@ -4254,6 +4266,7 @@ class AudioPlayerService {
 
   /// The blend's midpoint: the incoming player is the song now.
   void _automixHandoff(String from, String to, int index) {
+    if (_automixIncomingGeneration != _playbackGeneration) return;
     if (index < 0 || index >= _queue.length) return;
     _flushWatchtimeForCurrentTrackBeforeSwitch();
     final incoming = _playerById(to);
