@@ -378,6 +378,12 @@ class AudioPlayerService {
   int _queueRevision =
       0; // Incremented on every queue change to force UI updates
   int _currentIndex = -1;
+  // Invalidates stale manual playback requests when the user changes tracks.
+  int _playbackGeneration = 0;
+
+  bool _isPlaybackRequestCurrent(int generation, String trackId) {
+    return generation == _playbackGeneration && _currentTrack?.id == trackId;
+  }
   bool _shuffleEnabled = false;
   LoopMode _loopMode = LoopMode.off;
   Track? _currentTrack;
@@ -3182,6 +3188,11 @@ class AudioPlayerService {
     }
     if (tracks.isEmpty) return;
 
+    final generation = ++_playbackGeneration;
+    // Stop audible audio immediately on an explicit queue selection.
+    await Future.wait([_player.stop(), _inactivePlayer.stop()]);
+    if (generation != _playbackGeneration) return;
+
     // Disable radio mode when playing from a playlist/album (unless it's a radio queue extension)
     if (!isRadioQueue) {
       _isRadioMode = tracks.length == 1; // Only enable radio for single tracks
@@ -3225,7 +3236,7 @@ class AudioPlayerService {
 
     // Fire and forget - start playback without blocking caller
     // This allows UI to remain responsive while audio loads
-    unawaited(_loadAndPlayCurrent());
+    unawaited(_loadAndPlayCurrent(generation: generation));
 
     // Delay heavy background work to let UI settle (500ms after play starts)
     Future.delayed(const Duration(milliseconds: 500), () {
@@ -3439,13 +3450,16 @@ class AudioPlayerService {
   }
 
   /// Jump to specific index in queue
-  void skipToIndex(int index) {
+  Future<void> skipToIndex(int index) async {
     if (index < 0 || index >= _queue.length) return;
     if (index == _currentIndex) return;
 
+    final generation = ++_playbackGeneration;
     _currentIndex = index;
     _currentTrack = _queue[index];
-    unawaited(_loadAndPlayCurrent());
+    await Future.wait([_player.stop(), _inactivePlayer.stop()]);
+    if (generation != _playbackGeneration) return;
+    await _loadAndPlayCurrent(generation: generation);
   }
 
   /// Clear the queue
@@ -3490,8 +3504,11 @@ class AudioPlayerService {
   /// 1. Using audio-only streams (smaller)
   /// 2. Pre-resolving URLs before play is tapped
   /// 3. Not re-validating on play (validation done during prefetch)
-  Future<void> _loadAndPlayCurrent() async {
+  Future<void> _loadAndPlayCurrent({int? generation}) async {
     if (_currentIndex < 0 || _currentIndex >= _queue.length) return;
+    final requestGeneration = generation ?? ++_playbackGeneration;
+    final requestedTrackId = _queue[_currentIndex].id;
+    if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
     _flushWatchtimeForCurrentTrackBeforeSwitch();
 
     _crossfadeTriggeredForTrack = false;
@@ -3508,6 +3525,7 @@ class AudioPlayerService {
             final query = "${t.title} ${t.artist} song";
             if (kDebugMode) print('AudioPlayerService: Auto-swapping to audio version for $query...');
             final results = await _innerTubeService!.search(query, filter: 'songs');
+            if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
             if (results.tracks.isNotEmpty) {
               final best = results.tracks.first;
               if (best.id != t.id) {
@@ -3566,7 +3584,9 @@ class AudioPlayerService {
       final trackId = _currentTrack!.id;
       final stopwatch = Stopwatch()..start();
       await _inactivePlayer.stop();
+      if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
       await _player.setVolume(1.0);
+      if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
 
       if (kDebugMode) {
         print(
@@ -3580,6 +3600,7 @@ class AudioPlayerService {
         try {
           if (!Hive.isBoxOpen('music_downloads')) {
             await Hive.openBox<DownloadEntity>('music_downloads');
+            if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
           }
           final box = Hive.box<DownloadEntity>('music_downloads');
           final entity = box.values.where((e) => e.trackId == _currentTrack!.id).firstOrNull;
@@ -3592,7 +3613,9 @@ class AudioPlayerService {
       if (resolvedLocalPath != null) {
         final localFile = File(resolvedLocalPath);
         if (await localFile.exists()) {
+          if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
           final fileSize = await localFile.length();
+          if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
           if (kDebugMode) {
             print(
               'AudioPlayerService: Playing local file: $resolvedLocalPath (${(fileSize / 1024 / 1024).toStringAsFixed(2)} MB)',
@@ -3623,11 +3646,13 @@ class AudioPlayerService {
                 localFile,
                 fileSize,
               );
+              if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
               _currentPlaybackData = localPlaybackData;
 
               await _player.setAudioSource(
                 AudioSource.uri(fileUri, tag: _currentTrack),
               );
+              if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
               _activeSourceQueueIndices = <int>[_currentIndex];
               if (localPlaybackData != null) {
                 _activeSourcePlaybackDataByQueueIndex = <int, PlaybackData>{
@@ -3640,6 +3665,7 @@ class AudioPlayerService {
               if (_pendingSeekPosition != null &&
                   _pendingSeekTrackId == _currentTrack!.id) {
                 await _player.seek(_pendingSeekPosition);
+                if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
                 _positionController.add(_pendingSeekPosition!);
                 _updateState(position: _pendingSeekPosition);
                 _pendingSeekPosition = null;
@@ -3772,6 +3798,7 @@ class AudioPlayerService {
       } else {
         ytResult = await ytFuture;
       }
+      if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
 
       // If JioSaavn won the race, play directly with 320kbps!
       if (directSaavnStream != null && directSaavnStream.bitrateKbps >= 320) {
@@ -3908,6 +3935,7 @@ class AudioPlayerService {
         _currentTrack!,
         playbackData,
       );
+      if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
       final source = sourcePlan.source;
       _activeSourceQueueIndices = sourcePlan.queueIndices;
       _activeSourcePlaybackDataByQueueIndex =
@@ -3952,10 +3980,12 @@ class AudioPlayerService {
           rethrow;
         }
       }
+      if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
 
       if (_pendingSeekPosition != null &&
           _pendingSeekTrackId == _currentTrack!.id) {
         await _player.seek(_pendingSeekPosition);
+        if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
         _positionController.add(_pendingSeekPosition!);
         _updateState(position: _pendingSeekPosition);
         _pendingSeekPosition = null;
@@ -3996,6 +4026,7 @@ class AudioPlayerService {
         unawaited(_upgradeToLosslessIfPossible(_currentTrack!));
       }
     } catch (e) {
+      if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
       unawaited(_player.setVolume(1.0));
       if (kDebugMode) {
         print('AudioPlayerService: Error: $e');
