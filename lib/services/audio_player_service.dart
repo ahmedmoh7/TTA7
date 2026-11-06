@@ -2242,6 +2242,9 @@ class AudioPlayerService {
   }
 
   // YouTube Radio mode - auto-fetches related tracks when queue runs low
+  // Incremented for every requested track load so stale async work cannot
+  // replace a newer selection.
+  int _playRequestId = 0;
   bool _isRadioMode = false;
   String? _radioSourceTrackId;
   bool _isFetchingRadio = false;
@@ -3498,11 +3501,16 @@ class AudioPlayerService {
   /// 3. Not re-validating on play (validation done during prefetch)
   Future<void> _loadAndPlayCurrent() async {
     if (_currentIndex < 0 || _currentIndex >= _queue.length) return;
+    final requestId = ++_playRequestId;
+    bool isLatestRequest() => requestId == _playRequestId;
     _flushWatchtimeForCurrentTrackBeforeSwitch();
 
     _crossfadeTriggeredForTrack = false;
     _currentTrack = _queue[_currentIndex];
-    
+    _positionController.add(Duration.zero);
+    _bufferedPositionController.add(Duration.zero);
+    _updateState(position: Duration.zero, bufferedPosition: Duration.zero);
+
     // --- SMART AUTO-SWAP (Prefer Audio Versions) ---
     if (_preferAudioVersions && _currentTrack != null && !_isLocalTrack(_currentTrack!)) {
       final t = _currentTrack!;
@@ -3514,6 +3522,7 @@ class AudioPlayerService {
             final query = "${t.title} ${t.artist} song";
             if (kDebugMode) print('AudioPlayerService: Auto-swapping to audio version for $query...');
             final results = await _innerTubeService!.search(query, filter: 'songs');
+            if (!isLatestRequest()) return;
             if (results.tracks.isNotEmpty) {
               final best = results.tracks.first;
               if (best.id != t.id) {
@@ -3572,7 +3581,9 @@ class AudioPlayerService {
       final trackId = _currentTrack!.id;
       final stopwatch = Stopwatch()..start();
       await _inactivePlayer.stop();
+      if (!isLatestRequest()) return;
       await _player.setVolume(1.0);
+      if (!isLatestRequest()) return;
 
       if (kDebugMode) {
         print(
@@ -3586,6 +3597,7 @@ class AudioPlayerService {
         try {
           if (!Hive.isBoxOpen('music_downloads')) {
             await Hive.openBox<DownloadEntity>('music_downloads');
+            if (!isLatestRequest()) return;
           }
           final box = Hive.box<DownloadEntity>('music_downloads');
           final entity = box.values.where((e) => e.trackId == _currentTrack!.id).firstOrNull;
@@ -3598,7 +3610,9 @@ class AudioPlayerService {
       if (resolvedLocalPath != null) {
         final localFile = File(resolvedLocalPath);
         if (await localFile.exists()) {
+          if (!isLatestRequest()) return;
           final fileSize = await localFile.length();
+          if (!isLatestRequest()) return;
           if (kDebugMode) {
             print(
               'AudioPlayerService: Playing local file: $resolvedLocalPath (${(fileSize / 1024 / 1024).toStringAsFixed(2)} MB)',
@@ -3629,11 +3643,13 @@ class AudioPlayerService {
                 localFile,
                 fileSize,
               );
+              if (!isLatestRequest()) return;
               _currentPlaybackData = localPlaybackData;
 
               await _player.setAudioSource(
                 AudioSource.uri(fileUri, tag: _currentTrack),
               );
+              if (!isLatestRequest()) return;
               _activeSourceQueueIndices = <int>[_currentIndex];
               if (localPlaybackData != null) {
                 _activeSourcePlaybackDataByQueueIndex = <int, PlaybackData>{
@@ -3763,21 +3779,15 @@ class AudioPlayerService {
             ytResult = await ytFuture;
           }
         } else {
+          // YouTube is ready: start it immediately. JioSaavn remains in flight
+          // and can upgrade quality in the background without delaying playback.
           ytResult = first.$2 as PlaybackResult;
-          // If YouTube finished first, give JioSaavn a short 400ms bounded race window
-          try {
-            final quickSaavn =
-                await saavnFuture.timeout(const Duration(milliseconds: 400));
-            if (quickSaavn != null && quickSaavn.bitrateKbps >= 320) {
-              directSaavnStream = quickSaavn;
-            }
-          } catch (_) {
-            // Still pending or timed out, will be handed to background upgrade
-          }
         }
       } else {
         ytResult = await ytFuture;
       }
+
+      if (!isLatestRequest()) return;
 
       // If JioSaavn won the race, play directly with 320kbps!
       if (directSaavnStream != null && directSaavnStream.bitrateKbps >= 320) {
@@ -3791,6 +3801,7 @@ class AudioPlayerService {
 
       // Otherwise proceed with YouTube stream
       ytResult ??= await ytFuture;
+      if (!isLatestRequest()) return;
 
       final urlResolveTime = stopwatch.elapsedMilliseconds;
       if (kDebugMode) {
@@ -3914,6 +3925,7 @@ class AudioPlayerService {
         _currentTrack!,
         playbackData,
       );
+      if (!isLatestRequest()) return;
       final source = sourcePlan.source;
       _activeSourceQueueIndices = sourcePlan.queueIndices;
       _activeSourcePlaybackDataByQueueIndex =
@@ -3927,12 +3939,14 @@ class AudioPlayerService {
             preload: true,
             initialIndex: 0,
           );
+          if (!isLatestRequest()) return;
         } else {
           await _player.setAudioSource(
             source,
             // Pre-buffer ahead for smoother playback
             preload: true,
           );
+          if (!isLatestRequest()) return;
         }
       } catch (e) {
         // ignore: experimental_member_use
@@ -3954,6 +3968,7 @@ class AudioPlayerService {
             ),
             preload: true,
           );
+          if (!isLatestRequest()) return;
         } else {
           rethrow;
         }
@@ -4002,6 +4017,7 @@ class AudioPlayerService {
         unawaited(_upgradeToLosslessIfPossible(_currentTrack!));
       }
     } catch (e) {
+      if (!isLatestRequest()) return;
       unawaited(_player.setVolume(1.0));
       if (kDebugMode) {
         print('AudioPlayerService: Error: $e');
