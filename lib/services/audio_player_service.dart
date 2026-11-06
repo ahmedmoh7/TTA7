@@ -1979,7 +1979,8 @@ class AudioPlayerService {
     PlaybackData playbackData, {
     bool allowDnsRetry = true,
   }) async {
-    if (kIsWeb) return;
+    if (kIsWeb || !_onUnmeteredNetwork) return;
+    // Optional full-file caching is Wi-Fi only; direct playback remains available.
     // Never try to download a live/manifest stream to a file — it's endless.
     if (playbackData.isLive || playbackData.isManifestStream) return;
     if (_precacheInProgress.contains(track.id)) return;
@@ -3289,13 +3290,14 @@ class AudioPlayerService {
   /// Prefetch all tracks in queue (OuterTune approach)
   /// This resolves stream URLs in background
   void _prefetchAllTracks() {
-    if (_queue.isEmpty) return;
+    if (_queue.isEmpty || !_onUnmeteredNetwork) return;
 
-    // Prefetch all tracks, but prioritize current and next, filtering out local tracks
-    final allIds = _queue
-        .where((t) => !_isLocalTrack(t))
-        .map((t) => t.id)
-        .toList();
+    // Resolve only the immediate next track. Resolving an entire long queue
+    // creates unnecessary network work and stale URL requests.
+    final nextIndex = _currentIndex + 1;
+    if (nextIndex < 0 || nextIndex >= _queue.length) return;
+    final nextTrack = _queue[nextIndex];
+    final allIds = _isLocalTrack(nextTrack) ? <String>[] : <String>[nextTrack.id];
         
     if (allIds.isEmpty) return;
     
@@ -3346,17 +3348,11 @@ class AudioPlayerService {
 
     // Prefetch newly added tracks
     if (tracks.isNotEmpty) {
-      _ytPlayerUtils.prefetch(
-        tracks.map((t) => t.id).toList(),
-        quality: _audioQuality,
-      );
-      if (_jioSaavnEnabled &&
-          (_audioQuality == AudioQuality.high ||
-              _audioQuality == AudioQuality.max ||
-              _audioQuality == AudioQuality.auto)) {
-        for (final track in tracks.take(3)) {
-          unawaited(JioSaavnService.instance.getBestStreamForTrack(track));
-        }
+      if (_onUnmeteredNetwork) {
+        _ytPlayerUtils.prefetch(
+          tracks.take(1).map((t) => t.id).toList(),
+          quality: _audioQuality,
+        );
       }
       _schedulePrecacheAhead();
       _scheduleLyricsPrefetchAroundCurrent();
@@ -3507,7 +3503,7 @@ class AudioPlayerService {
   Future<void> _loadAndPlayCurrent({int? generation}) async {
     if (_currentIndex < 0 || _currentIndex >= _queue.length) return;
     final requestGeneration = generation ?? ++_playbackGeneration;
-    final requestedTrackId = _queue[_currentIndex].id;
+    var requestedTrackId = _queue[_currentIndex].id;
     if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
     _flushWatchtimeForCurrentTrackBeforeSwitch();
 
@@ -3534,6 +3530,7 @@ class AudioPlayerService {
                 if (diff <= 30) {
                   if (kDebugMode) print('AudioPlayerService: Swapped ${t.id} for ${best.id}');
                   _currentTrack = best.copyWith(setVideoId: t.setVideoId);
+                  requestedTrackId = _currentTrack!.id;
                   _queue[_currentIndex] = _currentTrack!;
                   
                   // Update the original queue too if it's there
@@ -3748,23 +3745,16 @@ class AudioPlayerService {
         }
       }
 
-      // 2. Concurrently resolve JioSaavn and YouTube streams
-      Future<JioSaavnStream?>? saavnFuture;
-      if (wantsJioSaavn) {
-        saavnFuture =
-            JioSaavnService.instance.getBestStreamForTrack(_currentTrack!);
-      }
-
+      // YouTube is the primary source. JioSaavn is requested only if
+      // YouTube cannot resolve or load the audio source.
       final ytFuture = _ytPlayerUtils.playerResponseForPlayback(
         trackId,
         quality: _audioQuality,
         isMetered: false,
       );
 
-      PlaybackResult? ytResult;
-      JioSaavnStream? directSaavnStream;
-
-      if (saavnFuture != null) {
+      final ytResult = await ytFuture;
+      if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
         // Race JioSaavn against YouTube
         final first = await Future.any<dynamic>([
           saavnFuture
@@ -3826,12 +3816,14 @@ class AudioPlayerService {
             'AudioPlayerService: Failed to get stream URL: ${ytResult.error}',
           );
         }
-        // Fallback: If YouTube failed, wait up to 4s for JioSaavn
-        if (saavnFuture != null) {
+        // Try JioSaavn only after YouTube URL resolution fails.
+        if (wantsJioSaavn && _isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) {
           try {
-            final fallbackSaavn =
-                await saavnFuture.timeout(const Duration(seconds: 4));
-            if (fallbackSaavn != null && fallbackSaavn.bitrateKbps >= 320) {
+            final fallbackSaavn = await JioSaavnService.instance
+                .getBestStreamForTrack(_currentTrack!)
+                .timeout(const Duration(seconds: 8));
+            if (fallbackSaavn != null && fallbackSaavn.bitrateKbps >= 320 &&
+                _isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) {
               await _playJioSaavnStream(
                 fallbackSaavn,
                 _currentTrack!,
@@ -4012,16 +4004,6 @@ class AudioPlayerService {
       _prefetchNextTrack();
       unawaited(_enforceAudioCacheLimit());
 
-      // Attempt seamless upgrade to JioSaavn 320kbps in background.
-      // Never for live streams — JioSaavn would overwrite the live HLS.
-      if (_currentTrack != null && wantsJioSaavn && !playbackData.isLive) {
-        unawaited(
-          _upgradeTrackQualityIfPossible(
-            _currentTrack!,
-            inFlightStream: saavnFuture,
-          ),
-        );
-      }
       if (_currentTrack != null && !playbackData.isLive) {
         unawaited(_upgradeToLosslessIfPossible(_currentTrack!));
       }
@@ -4311,6 +4293,8 @@ class AudioPlayerService {
   /// to analyse, whatever source is audible for it (lossless, JioSaavn) —
   /// the canonical copy BitChord analyses too.
   Future<void> fetchAnalysisAudio(String videoId) async {
+    // Automix analysis downloads are optional and must not consume mobile data.
+    if (!_onUnmeteredNetwork) return;
     final track = _currentTrack?.id == videoId
         ? _currentTrack
         : _queue.where((t) => t.id == videoId).firstOrNull;
@@ -4753,9 +4737,11 @@ class AudioPlayerService {
     // Automix reads both sides of the coming transition: the playing
     // track's ending and the next one's opening.
     final playing = _currentTrack;
-    if (playing != null) _requestAutomixAnalysis(playing);
-    if (_currentIndex < _queue.length - 1) {
-      _requestAutomixAnalysis(_queue[_currentIndex + 1]);
+    if (_onUnmeteredNetwork) {
+      if (playing != null) _requestAutomixAnalysis(playing);
+      if (_currentIndex < _queue.length - 1) {
+        _requestAutomixAnalysis(_queue[_currentIndex + 1]);
+      }
     }
     if (_currentIndex < _queue.length - 1) {
       final nextTrack = _queue[_currentIndex + 1];
@@ -4778,22 +4764,11 @@ class AudioPlayerService {
         ),
       );
 
-      // Resolve the next track's lossless copy now, so it can start on it.
-      if (_qualityAllowsLossless && AddonService.instance.isEnabled) {
+      // Resolve optional lossless upgrades only on an unmetered network.
+      if (_onUnmeteredNetwork && _qualityAllowsLossless && AddonService.instance.isEnabled) {
         unawaited(AddonService.instance.matchFor(nextTrack));
       }
 
-      // Prefetch JioSaavn 320kbps stream in background if enabled
-      if (_jioSaavnEnabled &&
-          (_audioQuality == AudioQuality.high ||
-              _audioQuality == AudioQuality.max ||
-              _audioQuality == AudioQuality.auto)) {
-        unawaited(JioSaavnService.instance.getBestStreamForTrack(nextTrack));
-        if (_currentIndex < _queue.length - 2) {
-          final subsequentTrack = _queue[_currentIndex + 2];
-          unawaited(JioSaavnService.instance.getBestStreamForTrack(subsequentTrack));
-        }
-      }
 
       // Pre-extract colors for upcoming tracks so song change is instant 0ms
       for (int i = 1; i <= 3 && (_currentIndex + i) < _queue.length; i++) {
