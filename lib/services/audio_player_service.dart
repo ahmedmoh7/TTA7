@@ -3601,6 +3601,7 @@ class AudioPlayerService {
     try {
       final trackId = _currentTrack!.id;
       final stopwatch = Stopwatch()..start();
+      var saavnFallbackAttempted = false;
       await _inactivePlayer.stop();
       if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
       await _player.setVolume(1.0);
@@ -3701,6 +3702,7 @@ class AudioPlayerService {
               _prefetchNextTrack();
               return;
             } catch (e) {
+              if (!_isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) return;
               if (kDebugMode) {
                 print('AudioPlayerService: Failed to play local file: $e');
               }
@@ -3746,20 +3748,6 @@ class AudioPlayerService {
               _audioQuality == AudioQuality.max ||
               _audioQuality == AudioQuality.auto);
 
-      // Check if JioSaavn stream is already cached (e.g. from prefetch)
-      if (qualityAllowsSaavn) {
-        final cachedSaavnStream =
-            JioSaavnService.instance.getCachedStream(trackId);
-        if (cachedSaavnStream != null && cachedSaavnStream.bitrateKbps >= 320) {
-          await _playJioSaavnStream(
-            cachedSaavnStream,
-            _currentTrack!,
-            resolveTimeMs: stopwatch.elapsedMilliseconds,
-          );
-          return;
-        }
-      }
-
       final wantsJioSaavn = qualityAllowsSaavn;
 
       // Check if URL is already cached (should be instant if prefetched)
@@ -3802,6 +3790,7 @@ class AudioPlayerService {
                 .timeout(const Duration(seconds: 8));
             if (fallbackSaavn != null && fallbackSaavn.bitrateKbps >= 320 &&
                 _isPlaybackRequestCurrent(requestGeneration, requestedTrackId)) {
+              saavnFallbackAttempted = true;
               await _playJioSaavnStream(
                 fallbackSaavn,
                 _currentTrack!,
@@ -3999,12 +3988,14 @@ class AudioPlayerService {
 
       // A valid YouTube URL can still fail when ExoPlayer prepares the source.
       // Make one bounded JioSaavn fallback attempt before surfacing the error.
-      if (_jioSaavnEnabled &&
+      if (!saavnFallbackAttempted &&
+          _jioSaavnEnabled &&
           !_isLocalTrack(_currentTrack!) &&
           (_audioQuality == AudioQuality.high ||
               _audioQuality == AudioQuality.max ||
               _audioQuality == AudioQuality.auto)) {
         try {
+          saavnFallbackAttempted = true;
           final fallback = await JioSaavnService.instance
               .getBestStreamForTrack(_currentTrack!)
               .timeout(const Duration(seconds: 8));
