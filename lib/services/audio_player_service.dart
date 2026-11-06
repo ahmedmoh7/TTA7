@@ -33,6 +33,9 @@ const String kStreamCacheMaxConcurrentKey = 'stream_cache_max_concurrent';
 const String kCrossfadeDurationMsKey = 'crossfade_duration_ms';
 const String kShowNerdStatsKey = 'show_nerd_stats';
 const String kJioSaavnEnabledKey = 'jiosaavn_enabled';
+const String kAudioSourceModeKey = 'audio_source_mode';
+
+enum AudioSourceMode { automatic, youtubeOnly, jioSaavnOnly }
 const int kDefaultStreamCacheSizeLimitMb = 1024;
 const int kMinStreamCacheSizeLimitMb = 128;
 const int kMaxStreamCacheSizeLimitMb = 4096;
@@ -79,7 +82,7 @@ class PlaybackState {
   final int streamCacheMaxConcurrent;
   final int crossfadeDurationMs;
   final bool showNerdStats;
-  final bool jioSaavnEnabled;
+  final AudioSourceMode audioSourceMode;
 
   const PlaybackState({
     this.currentTrack,
@@ -107,7 +110,7 @@ class PlaybackState {
     this.streamCacheMaxConcurrent = kDefaultStreamCacheMaxConcurrent,
     this.crossfadeDurationMs = kDefaultCrossfadeDurationMs,
     this.showNerdStats = false,
-    this.jioSaavnEnabled = true,
+    this.audioSourceMode = AudioSourceMode.automatic,
   });
 
   PlaybackState copyWith({
@@ -140,7 +143,7 @@ class PlaybackState {
     int? streamCacheMaxConcurrent,
     int? crossfadeDurationMs,
     bool? showNerdStats,
-    bool? jioSaavnEnabled,
+    AudioSourceMode? audioSourceMode,
   }) {
     return PlaybackState(
       currentTrack: resetCurrentTrack ? null : (currentTrack ?? this.currentTrack),
@@ -172,7 +175,7 @@ class PlaybackState {
           streamCacheMaxConcurrent ?? this.streamCacheMaxConcurrent,
       crossfadeDurationMs: crossfadeDurationMs ?? this.crossfadeDurationMs,
       showNerdStats: showNerdStats ?? this.showNerdStats,
-      jioSaavnEnabled: jioSaavnEnabled ?? this.jioSaavnEnabled,
+      audioSourceMode: audioSourceMode ?? this.audioSourceMode,
     );
   }
 
@@ -227,7 +230,7 @@ class PlaybackState {
         other.streamCacheMaxConcurrent == streamCacheMaxConcurrent &&
         other.crossfadeDurationMs == crossfadeDurationMs &&
         other.showNerdStats == showNerdStats &&
-        other.jioSaavnEnabled == jioSaavnEnabled &&
+        other.audioSourceMode == audioSourceMode &&
         other.currentPlaybackData == currentPlaybackData;
     // NOTE: position and bufferedPosition intentionally excluded
     // to prevent rebuilds on every position update
@@ -256,7 +259,7 @@ class PlaybackState {
     streamCacheMaxConcurrent,
     crossfadeDurationMs,
     showNerdStats,
-    jioSaavnEnabled,
+    audioSourceMode,
     currentPlaybackData,
   ]);
 }
@@ -289,7 +292,7 @@ class AudioPlayerService {
     _loadStreamCacheSettings();
     _loadNerdStatsSetting();
     _loadPreferAudioVersionsSetting();
-    _loadJioSaavnSetting();
+    _loadAudioSourceMode();
     unawaited(AddonService.instance.load());
     AddonService.instance.matches.listen(_onLosslessFound);
     unawaited(AutomixService.instance.load());
@@ -394,8 +397,17 @@ class AudioPlayerService {
   bool _showNerdStats = false;
   bool get showNerdStats => _showNerdStats;
   bool _preferAudioVersions = false;
-  bool _jioSaavnEnabled = true;
-  bool get jioSaavnEnabled => _jioSaavnEnabled;
+  AudioSourceMode _audioSourceMode = AudioSourceMode.automatic;
+  AudioSourceMode get audioSourceMode => _audioSourceMode;
+  bool get jioSaavnEnabled => _audioSourceMode != AudioSourceMode.youtubeOnly;
+  bool get _isHighQualityStreaming =>
+      _audioQuality == AudioQuality.high ||
+      _audioQuality == AudioQuality.max ||
+      _audioQuality == AudioQuality.auto;
+  bool get _shouldUseYoutube =>
+      !_isHighQualityStreaming || _audioSourceMode != AudioSourceMode.jioSaavnOnly;
+  bool get _shouldUseJioSaavn =>
+      _isHighQualityStreaming && _audioSourceMode != AudioSourceMode.youtubeOnly;
   int _upgradeSessionId = 0;
   int _losslessUpgradeId = 0;
   String?
@@ -654,29 +666,43 @@ class AudioPlayerService {
     }
   }
 
-  /// Load JioSaavn source preference
-  Future<void> _loadJioSaavnSetting() async {
+  /// Load the unified online audio-source mode.
+  /// Migrate the former JioSaavn switch once, preserving its previous behavior.
+  Future<void> _loadAudioSourceMode() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      _jioSaavnEnabled = prefs.getBool(kJioSaavnEnabledKey) ?? true;
-      _updateState(jioSaavnEnabled: _jioSaavnEnabled);
+      final savedMode = prefs.getString(kAudioSourceModeKey);
+      if (savedMode != null) {
+        _audioSourceMode = AudioSourceMode.values.firstWhere(
+          (mode) => mode.name == savedMode,
+          orElse: () => AudioSourceMode.automatic,
+        );
+      } else {
+        final wasJioSaavnEnabled = prefs.getBool(kJioSaavnEnabledKey) ?? true;
+        _audioSourceMode = wasJioSaavnEnabled
+            ? AudioSourceMode.automatic
+            : AudioSourceMode.youtubeOnly;
+        await prefs.setString(kAudioSourceModeKey, _audioSourceMode.name);
+        await prefs.remove(kJioSaavnEnabledKey);
+      }
+      _updateState(audioSourceMode: _audioSourceMode);
     } catch (e) {
       if (kDebugMode) {
-        print('AudioPlayerService: Failed to load JioSaavn setting: $e');
+        print('AudioPlayerService: Failed to load audio source mode: $e');
       }
     }
   }
 
-  /// Toggle JioSaavn source preference
-  Future<void> setJioSaavnEnabled(bool enabled) async {
-    _jioSaavnEnabled = enabled;
-    _updateState(jioSaavnEnabled: enabled);
+  /// Persist the single source choice used for High, Max and Auto quality.
+  Future<void> setAudioSourceMode(AudioSourceMode mode) async {
+    _audioSourceMode = mode;
+    _updateState(audioSourceMode: mode);
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(kJioSaavnEnabledKey, enabled);
+      await prefs.setString(kAudioSourceModeKey, mode.name);
     } catch (e) {
       if (kDebugMode) {
-        print('AudioPlayerService: Failed to persist JioSaavn setting: $e');
+        print('AudioPlayerService: Failed to save audio source mode: $e');
       }
     }
   }
@@ -949,6 +975,29 @@ class AudioPlayerService {
           playbackData: _addonPlaybackData(lossless, forCurrentTrack: false),
         );
       }
+    }
+
+    if (_isHighQualityStreaming &&
+        _audioSourceMode == AudioSourceMode.jioSaavnOnly) {
+      final saavn = await JioSaavnService.instance.getBestStreamForTrack(track);
+      if (saavn == null) {
+        throw Exception('No matching JioSaavn stream for ${track.title}');
+      }
+      final saavnData = PlaybackData(
+        streamUrl: saavn.streamUrl,
+        format: AudioFormat(
+          mimeType: 'audio/mp4',
+          bitrate: saavn.bitrateKbps * 1000,
+          codecs: 'mp4a.40.2',
+        ),
+        streamExpiresInSeconds: 86400,
+        fetchedAt: DateTime.now(),
+        audioSource: 'JioSaavn',
+      );
+      return (
+        source: AudioSource.uri(Uri.parse(saavn.streamUrl), tag: track),
+        playbackData: saavnData,
+      );
     }
 
     final result = await _ytPlayerUtils.playerResponseForPlayback(
@@ -3027,7 +3076,7 @@ class AudioPlayerService {
     int? streamCacheMaxConcurrent,
     int? crossfadeDurationMs,
     bool? showNerdStats,
-    bool? jioSaavnEnabled,
+    AudioSourceMode? audioSourceMode,
   }) {
     final shouldResetCurrentTrack =
         resetCurrentTrack || (currentTrack == null && _currentTrack == null);
@@ -3069,7 +3118,7 @@ class AudioPlayerService {
           streamCacheMaxConcurrent ?? _streamCacheMaxConcurrent,
       crossfadeDurationMs: crossfadeDurationMs ?? _crossfadeDurationMs,
       showNerdStats: showNerdStats ?? _showNerdStats,
-      jioSaavnEnabled: jioSaavnEnabled ?? _jioSaavnEnabled,
+      audioSourceMode: audioSourceMode ?? _audioSourceMode,
     );
 
     // Only emit if state actually changed (using == that excludes position)
@@ -3257,7 +3306,9 @@ class AudioPlayerService {
         'AudioPlayerService: Prefetching ${videoIds.length} visible tracks',
       );
     }
-    await _ytPlayerUtils.prefetch(videoIds, quality: _audioQuality);
+    if (_shouldUseYoutube) {
+      await _ytPlayerUtils.prefetch(videoIds, quality: _audioQuality);
+    }
   }
 
   bool _isLocalTrack(Track track) {
@@ -3293,7 +3344,9 @@ class AudioPlayerService {
     }
 
     // Fire and forget - prefetch happens in background
-    _ytPlayerUtils.prefetch(allIds, quality: _audioQuality);
+    if (_shouldUseYoutube) {
+      _ytPlayerUtils.prefetch(allIds, quality: _audioQuality);
+    }
   }
 
   void _scheduleLyricsPrefetchAroundCurrent() {
@@ -3335,14 +3388,13 @@ class AudioPlayerService {
 
     // Prefetch newly added tracks
     if (tracks.isNotEmpty) {
-      _ytPlayerUtils.prefetch(
-        tracks.map((t) => t.id).toList(),
-        quality: _audioQuality,
-      );
-      if (_jioSaavnEnabled &&
-          (_audioQuality == AudioQuality.high ||
-              _audioQuality == AudioQuality.max ||
-              _audioQuality == AudioQuality.auto)) {
+      if (_shouldUseYoutube) {
+        _ytPlayerUtils.prefetch(
+          tracks.map((t) => t.id).toList(),
+          quality: _audioQuality,
+        );
+      }
+      if (_shouldUseJioSaavn) {
         for (final track in tracks.take(3)) {
           unawaited(JioSaavnService.instance.getBestStreamForTrack(track));
         }
@@ -3371,11 +3423,10 @@ class AudioPlayerService {
     _saveQueueDebounced();
 
     // Prefetch the track that will play next
-    _ytPlayerUtils.prefetchNext(track.id, quality: _audioQuality);
-    if (_jioSaavnEnabled &&
-        (_audioQuality == AudioQuality.high ||
-            _audioQuality == AudioQuality.max ||
-            _audioQuality == AudioQuality.auto)) {
+    if (_shouldUseYoutube) {
+      _ytPlayerUtils.prefetchNext(track.id, quality: _audioQuality);
+    }
+    if (_shouldUseJioSaavn) {
       unawaited(JioSaavnService.instance.getBestStreamForTrack(track));
     }
     _schedulePrecacheAhead();
@@ -3693,10 +3744,30 @@ class AudioPlayerService {
       }
 
       // 1. Check if JioSaavn stream is requested.
-      final qualityAllowsSaavn = _jioSaavnEnabled &&
-          (_audioQuality == AudioQuality.high ||
-              _audioQuality == AudioQuality.max ||
-              _audioQuality == AudioQuality.auto);
+      final qualityAllowsSaavn = _shouldUseJioSaavn &&
+          _audioSourceMode == AudioSourceMode.automatic;
+
+      // Strict JioSaavn mode never starts or falls back to a YouTube stream.
+      // The service already filters out unusably low-bitrate results.
+      if (_isHighQualityStreaming &&
+          _audioSourceMode == AudioSourceMode.jioSaavnOnly) {
+        final saavnStream =
+            JioSaavnService.instance.getCachedStream(trackId) ??
+            await JioSaavnService.instance.getBestStreamForTrack(_currentTrack!);
+        if (saavnStream == null) {
+          _updateState(
+            error: 'No matching JioSaavn stream found for "${_currentTrack!.title}"',
+            isLoading: false,
+          );
+          return;
+        }
+        await _playJioSaavnStream(
+          saavnStream,
+          _currentTrack!,
+          resolveTimeMs: stopwatch.elapsedMilliseconds,
+        );
+        return;
+      }
 
       // Check if JioSaavn stream is already cached (e.g. from prefetch)
       if (qualityAllowsSaavn) {
@@ -4728,7 +4799,7 @@ class AudioPlayerService {
     }
     if (_currentIndex < _queue.length - 1) {
       final nextTrack = _queue[_currentIndex + 1];
-      if (!_isLocalTrack(nextTrack)) {
+      if (!_isLocalTrack(nextTrack) && _shouldUseYoutube) {
         if (kDebugMode) {
           print('AudioPlayerService: Prefetching next track: ${nextTrack.title}');
         }
@@ -4753,10 +4824,7 @@ class AudioPlayerService {
       }
 
       // Prefetch JioSaavn 320kbps stream in background if enabled
-      if (_jioSaavnEnabled &&
-          (_audioQuality == AudioQuality.high ||
-              _audioQuality == AudioQuality.max ||
-              _audioQuality == AudioQuality.auto)) {
+      if (_shouldUseJioSaavn) {
         unawaited(JioSaavnService.instance.getBestStreamForTrack(nextTrack));
         if (_currentIndex < _queue.length - 2) {
           final subsequentTrack = _queue[_currentIndex + 2];
@@ -4781,7 +4849,7 @@ class AudioPlayerService {
   }) async {
     final sessionId = ++_upgradeSessionId;
 
-    if (!_jioSaavnEnabled) return;
+    if (_audioSourceMode != AudioSourceMode.automatic) return;
 
     // Respect data saver quality preferences
     if (_audioQuality == AudioQuality.low ||
