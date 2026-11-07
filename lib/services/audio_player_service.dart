@@ -1777,6 +1777,7 @@ class AudioPlayerService {
       cacheFile: cacheFile,
       headers: headers,
       expectedLength: playbackData.format.contentLength,
+      contentType: playbackData.format.mimeType,
       tag: track,
     );
   }
