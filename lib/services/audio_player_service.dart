@@ -3293,34 +3293,23 @@ class AudioPlayerService {
     return false;
   }
 
-  /// Prefetch all tracks in queue (OuterTune approach)
-  /// This resolves stream URLs in background
+  /// Prefetch stream URLs for the whole queue in the background.
+  /// This resolves playback data only; it does not download audio bytes.
+  /// Keep this enabled regardless of Crossfade / Automix settings so tracks
+  /// can still start quickly when the user selects them.
   void _prefetchAllTracks() {
     if (_queue.isEmpty) return;
 
-    // With both transition features off, the next track is resolved only
-    // when it becomes current. There is no reason to warm its stream URL.
-    if (_jamsModeEnabled ||
-        (!_automixOn && _crossfadeDurationMs <= 0)) {
-      return;
-    }
-
-    // Resolve only the active item and its immediate successor. Resolving
-    // the entire queue creates unnecessary network requests for tracks that
-    // may never be played; the transition engine resolves audio when it arms.
-    final start = _currentIndex < 0 ? 0 : _currentIndex;
-    final end = min(_queue.length, start + 2);
-    final ids = _queue
-        .sublist(start, end)
+    final allIds = _queue
         .where((t) => !_isLocalTrack(t))
         .map((t) => t.id)
         .toList();
 
-    if (ids.isEmpty) return;
+    if (allIds.isEmpty) return;
     if (kDebugMode) {
-      print('AudioPlayerService: Prefetching ${ids.length} active/next track metadata');
+      print('AudioPlayerService: Prefetching ${allIds.length} remote track stream URLs');
     }
-    _ytPlayerUtils.prefetch(ids, quality: _audioQuality);
+    _ytPlayerUtils.prefetch(allIds, quality: _audioQuality);
   }
 
   void _scheduleLyricsPrefetchAroundCurrent() {
@@ -4746,15 +4735,12 @@ class AudioPlayerService {
     if (playing != null) _requestAutomixAnalysis(playing);
     if (_currentIndex < _queue.length - 1) {
       final nextTrack = _queue[_currentIndex + 1];
-      final transitionPrefetchEnabled = !_jamsModeEnabled &&
-          (_automixOn || _crossfadeDurationMs > 0);
-      if (transitionPrefetchEnabled && !_isLocalTrack(nextTrack)) {
+      // Resolve the next track's playback URL in every mode. This is
+      // lightweight playback-data prefetch, not a download of audio bytes.
+      if (!_isLocalTrack(nextTrack)) {
         if (kDebugMode) {
-          print('AudioPlayerService: Prefetching next track for transition: ${nextTrack.title}');
+          print('AudioPlayerService: Prefetching next track stream URL: ${nextTrack.title}');
         }
-
-        // Resolve the successor early only when a transition feature needs it.
-        // With Automix and Crossfade both off, resolution waits until playback.
         _ytPlayerUtils.prefetchNext(nextTrack.id, quality: _audioQuality);
       }
       _schedulePrecacheAhead();
@@ -4768,22 +4754,16 @@ class AudioPlayerService {
         ),
       );
 
-      // Resolve the next track's lossless copy now, so it can start on it.
-      if (transitionPrefetchEnabled &&
-          _qualityAllowsLossless &&
-          AddonService.instance.isEnabled) {
+      // Resolve optional lossless/JioSaavn stream links early as well.
+      // These lookups prepare playback URLs; they do not fetch the audio file.
+      if (_qualityAllowsLossless && AddonService.instance.isEnabled) {
         unawaited(AddonService.instance.matchFor(nextTrack));
       }
 
-      // Prefetch JioSaavn only when a transition feature needs the next track
-      // ready early; otherwise its stream is resolved when it becomes current.
-      if (transitionPrefetchEnabled &&
-          _jioSaavnEnabled &&
+      if (_jioSaavnEnabled &&
           (_audioQuality == AudioQuality.high ||
               _audioQuality == AudioQuality.max ||
               _audioQuality == AudioQuality.auto)) {
-        // Keep only the immediate successor warm; farther tracks are
-        // resolved after the queue advances to them.
         unawaited(JioSaavnService.instance.getBestStreamForTrack(nextTrack));
       }
 
