@@ -1778,6 +1778,7 @@ class AudioPlayerService {
       headers: headers,
       expectedLength: playbackData.format.contentLength,
       contentType: playbackData.format.mimeType,
+      onCacheUpdated: _enforceAudioCacheLimit,
       tag: track,
     );
   }

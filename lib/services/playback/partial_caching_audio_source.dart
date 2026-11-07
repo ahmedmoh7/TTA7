@@ -14,6 +14,7 @@ class PartialCachingAudioSource extends StreamAudioSource {
     this.headers,
     this.expectedLength,
     this.contentType = 'audio/mpeg',
+    this.onCacheUpdated,
     dynamic tag,
   })  : store = PartialAudioCacheStore(cacheFile),
         super(tag: tag);
@@ -23,15 +24,18 @@ class PartialCachingAudioSource extends StreamAudioSource {
   final Map<String, String>? headers;
   final int? expectedLength;
   final String contentType;
+  final Future<void> Function()? onCacheUpdated;
   final PartialAudioCacheStore store;
+  int? _resolvedLength;
 
   @override
   Future<StreamAudioResponse> request([int? start, int? end]) async {
     final rangeStart = start ?? 0;
+    final knownLength = expectedLength ?? _resolvedLength;
     final requestedEnd = end ?? (rangeStart + 256 * 1024);
-    final rangeEnd = expectedLength == null
+    final rangeEnd = knownLength == null
         ? requestedEnd
-        : (requestedEnd < expectedLength! ? requestedEnd : expectedLength!);
+        : (requestedEnd < knownLength ? requestedEnd : knownLength);
     if (rangeStart < 0 || rangeEnd <= rangeStart) {
       throw RangeError('Invalid audio byte range: $rangeStart-$rangeEnd');
     }
@@ -65,6 +69,7 @@ class PartialCachingAudioSource extends StreamAudioSource {
       final actualStart = isPartial ? rangeStart : 0;
       final sourceLength = _totalLength(response.headers.value(HttpHeaders.contentRangeHeader)) ??
           expectedLength ?? (response.contentLength >= 0 ? response.contentLength : null);
+      if (expectedLength == null && sourceLength != null) _resolvedLength = sourceLength;
       final mime = response.headers.contentType?.mimeType ?? contentType;
       final skipBytes = rangeStart - actualStart;
       final requestedLength = rangeEnd - rangeStart;
@@ -104,6 +109,8 @@ class PartialCachingAudioSource extends StreamAudioSource {
           // A cache write failure must not interrupt otherwise successful audio playback.
           try {
             await store.writeRange(rangeStart, Stream<List<int>>.fromIterable(chunks));
+            final callback = onCacheUpdated;
+            if (callback != null) unawaited(callback().catchError((Object _) {}));
           } catch (_) {}
           await controller.close();
         } catch (error, stack) {
