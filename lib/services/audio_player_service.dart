@@ -951,7 +951,7 @@ class AudioPlayerService {
     final result = await _ytPlayerUtils.playerResponseForPlayback(
       track.id,
       quality: _audioQuality,
-      isMetered: false,
+      isMetered: !_onUnmeteredNetwork,
     );
     if (!result.isSuccess || result.data == null) {
       throw Exception(
@@ -2939,6 +2939,7 @@ class AudioPlayerService {
       final playerResult = await _ytPlayerUtils.playerResponseForPlayback(
         _currentTrack!.id,
         quality: _audioQuality,
+        isMetered: !_onUnmeteredNetwork,
       );
       if (!playerResult.isSuccess || playerResult.data == null) return;
 
@@ -3615,7 +3616,7 @@ class AudioPlayerService {
       final ytFuture = _ytPlayerUtils.playerResponseForPlayback(
         trackId,
         quality: _audioQuality,
-        isMetered: false,
+        isMetered: !_onUnmeteredNetwork,
       );
 
       PlaybackResult? ytResult;
