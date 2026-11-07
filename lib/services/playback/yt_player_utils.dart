@@ -1035,9 +1035,10 @@ class YTPlayerUtils {
       print('YTPlayerUtils: Found ${audioFormats.length} audio formats');
     }
 
-    // Resolve auto quality based on connection
-    final effectiveQuality = (quality == AudioQuality.auto)
-        ? (isMetered ? AudioQuality.medium : AudioQuality.high)
+    // Data saver: Auto must select the same moderate bitrate on Wi-Fi
+    // and mobile data. Network type must never silently raise audio quality.
+    final effectiveQuality = quality == AudioQuality.auto
+        ? AudioQuality.medium
         : quality;
 
     // Sort by quality preference
