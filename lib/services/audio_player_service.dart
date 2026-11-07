@@ -966,7 +966,6 @@ class AudioPlayerService {
     final source = await _streamingAudioSourceForTrack(
       track,
       playbackData,
-      preferDirectStreamWithBackgroundPrecache: true,
     );
     return (source: source, playbackData: playbackData);
   }
@@ -1796,7 +1795,6 @@ class AudioPlayerService {
     final currentSource = await _streamingAudioSourceForTrack(
       track,
       playbackData,
-      preferDirectStreamWithBackgroundPrecache: true,
     );
     return _singleTrackSourcePlan(currentSource, playbackData);
   }
