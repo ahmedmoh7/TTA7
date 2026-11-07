@@ -3298,6 +3298,13 @@ class AudioPlayerService {
   void _prefetchAllTracks() {
     if (_queue.isEmpty) return;
 
+    // With both transition features off, the next track is resolved only
+    // when it becomes current. There is no reason to warm its stream URL.
+    if (_jamsModeEnabled ||
+        (!_automixOn && _crossfadeDurationMs <= 0)) {
+      return;
+    }
+
     // Resolve only the active item and its immediate successor. Resolving
     // the entire queue creates unnecessary network requests for tracks that
     // may never be played; the transition engine resolves audio when it arms.
@@ -4739,12 +4746,15 @@ class AudioPlayerService {
     if (playing != null) _requestAutomixAnalysis(playing);
     if (_currentIndex < _queue.length - 1) {
       final nextTrack = _queue[_currentIndex + 1];
-      if (!_isLocalTrack(nextTrack)) {
+      final transitionPrefetchEnabled = !_jamsModeEnabled &&
+          (_automixOn || _crossfadeDurationMs > 0);
+      if (transitionPrefetchEnabled && !_isLocalTrack(nextTrack)) {
         if (kDebugMode) {
-          print('AudioPlayerService: Prefetching next track: ${nextTrack.title}');
+          print('AudioPlayerService: Prefetching next track for transition: ${nextTrack.title}');
         }
 
-        // Fire and forget - don't await
+        // Resolve the successor early only when a transition feature needs it.
+        // With Automix and Crossfade both off, resolution waits until playback.
         _ytPlayerUtils.prefetchNext(nextTrack.id, quality: _audioQuality);
       }
       _schedulePrecacheAhead();
@@ -4759,12 +4769,16 @@ class AudioPlayerService {
       );
 
       // Resolve the next track's lossless copy now, so it can start on it.
-      if (_qualityAllowsLossless && AddonService.instance.isEnabled) {
+      if (transitionPrefetchEnabled &&
+          _qualityAllowsLossless &&
+          AddonService.instance.isEnabled) {
         unawaited(AddonService.instance.matchFor(nextTrack));
       }
 
-      // Prefetch JioSaavn 320kbps stream in background if enabled
-      if (_jioSaavnEnabled &&
+      // Prefetch JioSaavn only when a transition feature needs the next track
+      // ready early; otherwise its stream is resolved when it becomes current.
+      if (transitionPrefetchEnabled &&
+          _jioSaavnEnabled &&
           (_audioQuality == AudioQuality.high ||
               _audioQuality == AudioQuality.max ||
               _audioQuality == AudioQuality.auto)) {
