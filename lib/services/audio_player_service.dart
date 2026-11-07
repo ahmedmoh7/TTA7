@@ -3963,7 +3963,8 @@ class AudioPlayerService {
         }
       } catch (e) {
         // ignore: experimental_member_use
-        if (source is LockCachingAudioSource && _isLoopbackCleartextError(e)) {
+        if ((source is PartialCachingAudioSource || source is LockCachingAudioSource) &&
+            _isLoopbackCleartextError(e)) {
           if (kDebugMode) {
             print(
               'AudioPlayerService: Local proxy blocked by cleartext policy, falling back to direct stream',
@@ -4310,7 +4311,7 @@ class AudioPlayerService {
   }
 
   /// Automix may request analysis audio, but we do not start a separate
-  /// download for it. The current track's LockCachingAudioSource already
+  /// download for it. The current track's streaming cache source already
   /// writes the bytes being played into the stream cache. Upcoming tracks
   /// are not downloaded just for analysis.
   Future<void> fetchAnalysisAudio(String videoId) async {
