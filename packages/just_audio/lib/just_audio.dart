@@ -3160,6 +3160,30 @@ class LockCachingAudioSource extends StreamAudioSource {
         });
       }
     }, onDone: () async {
+      if (sourceLength != null && _progress != sourceLength) {
+        // A clean EOF can still be truncated. Never promote a short .part
+        // file to the completed cache entry.
+        final partial = await _partialCacheFile;
+        if (partial.existsSync()) partial.deleteSync();
+        final error = FormatException(
+          'Incomplete audio cache: received $_progress of $sourceLength bytes',
+        );
+        for (final req in _requests) {
+          req.fail(error, StackTrace.current);
+        }
+        _requests.clear();
+        for (final cacheResponse in inProgressResponses) {
+          if (!cacheResponse.controller.isClosed) {
+            cacheResponse.controller.addError(error);
+            cacheResponse.controller.close();
+          }
+        }
+        await subscription.cancel();
+        httpClient.close();
+        _downloading = false;
+        _response = null;
+        return;
+      }
       if (sourceLength == null) {
         updateProgress(100);
       }
