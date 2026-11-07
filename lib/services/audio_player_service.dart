@@ -1588,32 +1588,23 @@ class AudioPlayerService {
   }
 
   Future<void> _deleteAudioCacheArtifact(File file) async {
-    _stopLiveCacheProgressLogger(file.path);
-    final mimeFile = File('${file.path}.mime');
-    final partialFile = File('${file.path}.part');
-    final precachePartFile = File('${file.path}.precache.part');
-    if (await file.exists()) {
-      await file.delete();
-    }
-    if (await mimeFile.exists()) {
-      await mimeFile.delete();
-    }
-    if (await partialFile.exists()) {
-      await partialFile.delete();
-    }
-    final rangesIndex = File('${file.path}.ranges.json');
-    if (await rangesIndex.exists()) await rangesIndex.delete();
-    final rangePrefix = '${file.path}.range.';
+    final marker = file.path.indexOf('.audio.range.');
+    final basePath = marker >= 0
+        ? file.path.substring(0, marker + '.audio'.length)
+        : file.path;
+    _stopLiveCacheProgressLogger(basePath);
     final cacheDir = file.parent;
-    if (await cacheDir.exists()) {
-      await for (final entity in cacheDir.list(followLinks: false)) {
-        if (entity is File && entity.path.startsWith(rangePrefix)) {
-          await entity.delete();
-        }
+    if (!await cacheDir.exists()) return;
+    await for (final entity in cacheDir.list(followLinks: false)) {
+      if (entity is File &&
+          (entity.path == basePath ||
+           entity.path == '$basePath.ranges.json' ||
+           entity.path.startsWith('$basePath.range.') ||
+           entity.path == '$basePath.mime' ||
+           entity.path == '$basePath.part' ||
+           entity.path == '$basePath.precache.part')) {
+        await entity.delete();
       }
-    }
-    if (await precachePartFile.exists()) {
-      await precachePartFile.delete();
     }
   }
 

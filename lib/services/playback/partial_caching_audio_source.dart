@@ -17,7 +17,10 @@ class PartialCachingAudioSource extends StreamAudioSource {
   @override
   Future<StreamAudioResponse> request([int? start, int? end]) async {
     final rangeStart = start ?? 0;
-    final rangeEnd = end ?? expectedLength;
+    final requestedEnd = end ?? (rangeStart + 256 * 1024);
+    final rangeEnd = expectedLength == null
+        ? requestedEnd
+        : (requestedEnd < expectedLength! ? requestedEnd : expectedLength!);
     if (rangeStart < 0 || (rangeEnd != null && rangeEnd <= rangeStart)) throw RangeError('Invalid audio byte range');
     await store.load();
     if (rangeEnd != null && await cacheFile.exists() && store.contains(rangeStart, rangeEnd)) {

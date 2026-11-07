@@ -3,7 +3,7 @@ name: Build TTA7 APK
 on:
   workflow_dispatch:
   push:
-    branches: [main, master, stream-cache-no-next-download]
+    branches: [main, master, stream-cache-no-next-download, partial-audio-cache]
 
 jobs:
   build:
