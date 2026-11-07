@@ -219,6 +219,15 @@ class YTPlayerUtils {
   bool _hasPlaybackTracking(PlaybackData data) =>
       data.playbackTracking?.hasStatsUrls == true;
 
+  bool _isCachedFormatCompatible(PlaybackData data, AudioQuality quality) {
+    // Auto and Medium are capped to the moderate tier. Older cache entries
+    // may have been resolved as High while on Wi-Fi, so don't reuse them.
+    if (quality == AudioQuality.auto || quality == AudioQuality.medium) {
+      return data.format.bitrate <= 128000;
+    }
+    return true;
+  }
+
   void _discardUntrackedCache(String videoId) {
     _cache.remove(videoId);
     unawaited(HiveService.streamCacheBox.delete(videoId));
@@ -280,6 +289,13 @@ class YTPlayerUtils {
           );
         }
         _discardUntrackedCache(videoId);
+      } else if (!_isCachedFormatCompatible(normalized, quality)) {
+        if (kDebugMode) {
+          print(
+            'YTPlayerUtils: Discarding cached high-bitrate stream for ${quality.name}',
+          );
+        }
+        _discardUntrackedCache(videoId);
       } else if (!_hasPlaybackTracking(normalized)) {
         if (kDebugMode) {
           print(
@@ -308,6 +324,13 @@ class YTPlayerUtils {
         if (kDebugMode) {
           print(
             'YTPlayerUtils: Discarding stale progressive disk cache for live $videoId',
+          );
+        }
+        _discardUntrackedCache(videoId);
+      } else if (!_isCachedFormatCompatible(normalized, quality)) {
+        if (kDebugMode) {
+          print(
+            'YTPlayerUtils: Discarding high-bitrate disk cache for ${quality.name}',
           );
         }
         _discardUntrackedCache(videoId);
