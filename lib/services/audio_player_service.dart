@@ -3298,20 +3298,22 @@ class AudioPlayerService {
   void _prefetchAllTracks() {
     if (_queue.isEmpty) return;
 
-    // Prefetch all tracks, but prioritize current and next, filtering out local tracks
-    final allIds = _queue
+    // Resolve only the active item and its immediate successor. Resolving
+    // the entire queue creates unnecessary network requests for tracks that
+    // may never be played; the transition engine resolves audio when it arms.
+    final start = _currentIndex < 0 ? 0 : _currentIndex;
+    final end = min(_queue.length, start + 2);
+    final ids = _queue
+        .sublist(start, end)
         .where((t) => !_isLocalTrack(t))
         .map((t) => t.id)
         .toList();
-        
-    if (allIds.isEmpty) return;
-    
-    if (kDebugMode) {
-      print('AudioPlayerService: Prefetching ${allIds.length} remote tracks');
-    }
 
-    // Fire and forget - prefetch happens in background
-    _ytPlayerUtils.prefetch(allIds, quality: _audioQuality);
+    if (ids.isEmpty) return;
+    if (kDebugMode) {
+      print('AudioPlayerService: Prefetching ${ids.length} active/next track metadata');
+    }
+    _ytPlayerUtils.prefetch(ids, quality: _audioQuality);
   }
 
   void _scheduleLyricsPrefetchAroundCurrent() {
@@ -3351,19 +3353,22 @@ class AudioPlayerService {
     _updateState(queue: _queue, queueRevision: _queueRevision);
     _saveQueueDebounced();
 
-    // Prefetch newly added tracks
+    // Resolve only the immediate next track. Later queue entries are
+    // resolved when they move into the next position.
     if (tracks.isNotEmpty) {
-      _ytPlayerUtils.prefetch(
-        tracks.map((t) => t.id).toList(),
-        quality: _audioQuality,
-      );
+      final nextIndex = _currentIndex < 0
+          ? 0
+          : min(_currentIndex + 1, _queue.length - 1);
+      final nextTrack = _queue[nextIndex];
+      if (!_isLocalTrack(nextTrack)) {
+        _ytPlayerUtils.prefetchNext(nextTrack.id, quality: _audioQuality);
+      }
       if (_jioSaavnEnabled &&
           (_audioQuality == AudioQuality.high ||
               _audioQuality == AudioQuality.max ||
-              _audioQuality == AudioQuality.auto)) {
-        for (final track in tracks.take(3)) {
-          unawaited(JioSaavnService.instance.getBestStreamForTrack(track));
-        }
+              _audioQuality == AudioQuality.auto) &&
+          !_isLocalTrack(nextTrack)) {
+        unawaited(JioSaavnService.instance.getBestStreamForTrack(nextTrack));
       }
       _schedulePrecacheAhead();
       _scheduleLyricsPrefetchAroundCurrent();
@@ -4763,11 +4768,9 @@ class AudioPlayerService {
           (_audioQuality == AudioQuality.high ||
               _audioQuality == AudioQuality.max ||
               _audioQuality == AudioQuality.auto)) {
+        // Keep only the immediate successor warm; farther tracks are
+        // resolved after the queue advances to them.
         unawaited(JioSaavnService.instance.getBestStreamForTrack(nextTrack));
-        if (_currentIndex < _queue.length - 2) {
-          final subsequentTrack = _queue[_currentIndex + 2];
-          unawaited(JioSaavnService.instance.getBestStreamForTrack(subsequentTrack));
-        }
       }
 
       // Pre-extract colors for upcoming tracks so song change is instant 0ms
