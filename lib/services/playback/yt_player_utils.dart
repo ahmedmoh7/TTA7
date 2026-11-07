@@ -72,6 +72,9 @@ class YTPlayerUtils {
   /// Cache of playback data keyed by videoId
   final Map<String, PlaybackData> _cache = {};
 
+  /// Coalesce concurrent resolves for the same track and playback settings.
+  final Map<String, Future<PlaybackResult>> _inFlightPlaybackResolutions = {};
+
   /// Track consecutive failures per client for backoff
   final Map<String, int> _clientFailures = {};
 
@@ -231,6 +234,30 @@ class YTPlayerUtils {
   /// 5. Validates stream URL with HEAD request
   /// 6. Returns complete PlaybackData or error
   Future<PlaybackResult> playerResponseForPlayback(
+    String videoId, {
+    String? playlistId,
+    AudioQuality quality = AudioQuality.auto,
+    bool isMetered = false,
+  }) {
+    final key = '$videoId|${quality.name}|$isMetered|${playlistId ?? ''}';
+    final pending = _inFlightPlaybackResolutions[key];
+    if (pending != null) return pending;
+
+    final future = _resolvePlaybackResponse(
+      videoId,
+      playlistId: playlistId,
+      quality: quality,
+      isMetered: isMetered,
+    );
+    _inFlightPlaybackResolutions[key] = future;
+    return future.whenComplete(() {
+      if (identical(_inFlightPlaybackResolutions[key], future)) {
+        _inFlightPlaybackResolutions.remove(key);
+      }
+    });
+  }
+
+  Future<PlaybackResult> _resolvePlaybackResponse(
     String videoId, {
     String? playlistId,
     AudioQuality quality = AudioQuality.auto,

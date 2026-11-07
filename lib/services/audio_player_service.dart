@@ -36,7 +36,7 @@ const String kJioSaavnEnabledKey = 'jiosaavn_enabled';
 const int kDefaultStreamCacheSizeLimitMb = 1024;
 const int kMinStreamCacheSizeLimitMb = 128;
 const int kMaxStreamCacheSizeLimitMb = 4096;
-const int kDefaultStreamCacheMaxConcurrent = 2;
+const int kDefaultStreamCacheMaxConcurrent = 1;
 const int kMinStreamCacheMaxConcurrent = 1;
 const int kMaxStreamCacheMaxConcurrent = 4;
 const int kDefaultCrossfadeDurationMs = 8000;
@@ -102,7 +102,7 @@ class PlaybackState {
     this.queueTitle,
     this.isRadioMode = false,
     this.isFetchingRadio = false,
-    this.streamCacheWifiOnly = false,
+    this.streamCacheWifiOnly = true,
     this.streamCacheSizeLimitMb = kDefaultStreamCacheSizeLimitMb,
     this.streamCacheMaxConcurrent = kDefaultStreamCacheMaxConcurrent,
     this.crossfadeDurationMs = kDefaultCrossfadeDurationMs,
@@ -386,8 +386,8 @@ class AudioPlayerService {
 
   /// Wi-Fi or ethernet right now, kept current by a connectivity listener
   /// so quality checks don't have to wait on the platform.
-  bool _onUnmeteredNetwork = true;
-  bool _streamCacheWifiOnly = false;
+  bool _onUnmeteredNetwork = false;
+  bool _streamCacheWifiOnly = true;
   int _streamCacheSizeLimitMb = kDefaultStreamCacheSizeLimitMb;
   int _streamCacheMaxConcurrent = kDefaultStreamCacheMaxConcurrent;
   int _crossfadeDurationMs = kDefaultCrossfadeDurationMs;
@@ -479,7 +479,7 @@ class AudioPlayerService {
   Future<void> _loadStreamCacheSettings() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      _streamCacheWifiOnly = prefs.getBool(kStreamCacheWifiOnlyKey) ?? false;
+      _streamCacheWifiOnly = prefs.getBool(kStreamCacheWifiOnlyKey) ?? true;
       _streamCacheSizeLimitMb =
           prefs.getInt(kStreamCacheSizeLimitMbKey) ??
           kDefaultStreamCacheSizeLimitMb;
@@ -2451,7 +2451,7 @@ class AudioPlayerService {
       _saveQueueDebounced();
       _prefetchNextTrack();
       if (_currentTrack != null) {
-        unawaited(_upgradeTrackQualityIfPossible(_currentTrack!));
+        // JioSaavn is only resolved as a fallback after YouTube fails.
         // Gapless auto-advance starts the next track on whatever the
         // playlist was built with; it gets its second look too.
         if (playbackData?.format.isLossless != true &&
@@ -3595,7 +3595,10 @@ class AudioPlayerService {
         }
       }
 
-      final wantsJioSaavn = qualityAllowsSaavn;
+      // Automatic 320 kbps hand-over downloads part of YouTube and then
+      // starts the same song again from another provider. Keep cached JioSaavn
+      // streams eligible, but do not resolve/upgrade in the background.
+      const wantsJioSaavn = false;
 
       // Check if URL is already cached (should be instant if prefetched)
       final hasCached = _ytPlayerUtils.hasCachedData(trackId);
@@ -3605,12 +3608,9 @@ class AudioPlayerService {
         }
       }
 
-      // 2. Concurrently resolve JioSaavn and YouTube streams
+      // Data saver: do not resolve a second provider while a valid YouTube
+      // stream is being started. JioSaavn remains available as a failure fallback.
       Future<JioSaavnStream?>? saavnFuture;
-      if (wantsJioSaavn) {
-        saavnFuture =
-            JioSaavnService.instance.getBestStreamForTrack(_currentTrack!);
-      }
 
       final ytFuture = _ytPlayerUtils.playerResponseForPlayback(
         trackId,
@@ -3682,11 +3682,12 @@ class AudioPlayerService {
             'AudioPlayerService: Failed to get stream URL: ${ytResult.error}',
           );
         }
-        // Fallback: If YouTube failed, wait up to 4s for JioSaavn
-        if (saavnFuture != null) {
+        // Fallback only: resolve JioSaavn after YouTube has failed.
+        if (qualityAllowsSaavn && _jioSaavnEnabled) {
           try {
-            final fallbackSaavn =
-                await saavnFuture.timeout(const Duration(seconds: 4));
+            final fallbackSaavn = await JioSaavnService.instance
+                .getBestStreamForTrack(_currentTrack!)
+                .timeout(const Duration(seconds: 4));
             if (fallbackSaavn != null && fallbackSaavn.bitrateKbps >= 320) {
               await _playJioSaavnStream(
                 fallbackSaavn,
@@ -4162,6 +4163,9 @@ class AudioPlayerService {
   /// to analyse, whatever source is audible for it (lossless, JioSaavn) —
   /// the canonical copy BitChord analyses too.
   Future<void> fetchAnalysisAudio(String videoId) async {
+    // Automix needs a complete audio file. Never fetch that extra copy on
+    // metered networks; normal playback remains unaffected.
+    if (!AutomixService.instance.enabled || !_onUnmeteredNetwork) return;
     final track = _currentTrack?.id == videoId
         ? _currentTrack
         : _queue.where((t) => t.id == videoId).firstOrNull;
@@ -4278,6 +4282,10 @@ class AudioPlayerService {
       _logLossless('Off: lossless needs Max quality, or Auto on Wi-Fi');
       return;
     }
+    if (!_onUnmeteredNetwork) {
+      _logLossless('Skipping background lossless lookup on mobile data');
+      return;
+    }
     if (!addons.isEnabled) return;
     if (track.localFilePath != null || track.id.startsWith('local_')) return;
     if (_currentPlaybackData?.format.isLossless == true) return;
@@ -4328,7 +4336,7 @@ class AudioPlayerService {
   void _onLosslessFound(({String trackId, AddonMatch match}) found) {
     final track = _currentTrack;
     if (track == null || track.id != found.trackId) return;
-    if (!_qualityAllowsLossless) return;
+    if (!_onUnmeteredNetwork || !_qualityAllowsLossless) return;
     unawaited(_beginLosslessHandOver(track, found.match));
   }
 
@@ -4340,6 +4348,7 @@ class AudioPlayerService {
       _logLossless('Not upgrading "${track.title}": the song changed');
       return;
     }
+    if (!_onUnmeteredNetwork) return;
     if (_currentPlaybackData?.format.isLossless == true) return;
     if (_currentPlaybackData?.isLive == true) return;
 
