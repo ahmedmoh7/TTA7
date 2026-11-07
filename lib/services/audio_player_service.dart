@@ -956,7 +956,7 @@ class AudioPlayerService {
       if (lossless != null) {
         _logLossless('Crossfading straight into ${lossless.stream.formatLabel}');
         return (
-          source: _addonAudioSource(lossless, track),
+          source: await _addonAudioSource(lossless, track),
           // This track isn't current yet; its history tracking is resolved
           // once it is, so don't carry the outgoing track's over.
           playbackData: _addonPlaybackData(lossless, forCurrentTrack: false),
@@ -4066,10 +4066,7 @@ class AudioPlayerService {
     _activeSourcePlaybackDataByQueueIndex = <int, PlaybackData>{
       _currentIndex: saavnPlaybackData,
     };
-    final saavnSource = AudioSource.uri(
-      Uri.parse(saavnStream.streamUrl),
-      tag: track,
-    );
+    final saavnSource = await _streamingAudioSourceForTrack(track, saavnPlaybackData);
     await _player.setAudioSource(saavnSource, preload: true);
     if (_pendingSeekPosition != null && _pendingSeekTrackId == track.id) {
       await _player.seek(_pendingSeekPosition);
@@ -4365,11 +4362,10 @@ class AudioPlayerService {
     );
   }
 
-  AudioSource _addonAudioSource(AddonMatch match, Track track) {
+  Future<AudioSource> _addonAudioSource(AddonMatch match, Track track) async {
     final uri = Uri.parse(match.stream.url);
-    return match.stream.isDash
-        ? DashAudioSource(uri, tag: track)
-        : AudioSource.uri(uri, tag: track);
+    if (match.stream.isDash) return DashAudioSource(uri, tag: track);
+    return _streamingAudioSourceForTrack(track, _addonPlaybackData(match));
   }
 
   /// Starts [track] directly on its lossless copy.
@@ -4384,7 +4380,7 @@ class AudioPlayerService {
       );
     }
     final playbackData = _addonPlaybackData(match);
-    await _player.setAudioSource(_addonAudioSource(match, track), preload: true);
+    await _player.setAudioSource(await _addonAudioSource(match, track), preload: true);
     _currentPlaybackData = playbackData;
     _activeSourceQueueIndices = <int>[_currentIndex];
     _activeSourcePlaybackDataByQueueIndex = <int, PlaybackData>{
@@ -4536,7 +4532,7 @@ class AudioPlayerService {
 
       final swapped = await _seamlessSwap(
         track: track,
-        source: _addonAudioSource(match, track),
+        source: await _addonAudioSource(match, track),
         playbackData: _addonPlaybackData(match),
         stillWanted: stillWanted,
         // The second try parks further ahead: the first usually lost to a
@@ -4886,10 +4882,7 @@ class AudioPlayerService {
         audioSource: 'JioSaavn',
       );
 
-      final newSource = AudioSource.uri(
-        Uri.parse(saavnStream.streamUrl),
-        tag: track,
-      );
+      final newSource = await _streamingAudioSourceForTrack(track, upgradedPlaybackData);
 
       // A lossless swap may have landed while JioSaavn was resolving.
       if (_currentPlaybackData?.format.isLossless == true) return;
