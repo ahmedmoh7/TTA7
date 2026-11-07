@@ -42,7 +42,16 @@ const int kMaxStreamCacheMaxConcurrent = 4;
 const int kDefaultCrossfadeDurationMs = 8000;
 const int kMinCrossfadeDurationMs = 0;
 const int kMaxCrossfadeDurationMs = 12000;
-const int kPrecacheAheadTrackCount = 3;
+// Data usage: only the single next track is pre-downloaded (was 3, further
+// limited to 2 by the default max-concurrent setting). The track that will
+// actually play next is still ready; tracks further ahead are resolved when
+// they become "next".
+const int kPrecacheAheadTrackCount = 1;
+// The next track's pre-download starts only once the current one has played
+// this long (shorter tracks: half their length). Starting it at the very
+// beginning of every track made it compete with the new track's own stream
+// for bandwidth and pulled a full extra song in at the same moment.
+const Duration kPrecacheAheadStartAfter = Duration(seconds: 20);
 const int kLyricsPrefetchAheadTrackCount = 4;
 const int kMinValidStreamCacheFileBytes = 50 * 1024;
 const int kParallelPrecacheMinBytes = 1024 * 1024;
@@ -414,6 +423,7 @@ class AudioPlayerService {
   final Queue<Completer<void>> _precacheSlotWaiters = Queue<Completer<void>>();
   int _activePrecacheDownloads = 0;
   bool _isPrecachingAhead = false;
+  Timer? _precacheAheadDelayTimer;
   bool _allowProxyCachingSource = true;
   Timer? _cacheMaintenanceTimer;
   final Map<String, Timer> _liveCacheLogTimers = {};
@@ -1714,7 +1724,8 @@ class AudioPlayerService {
 
     if (!_allowProxyCachingSource) {
       _stopLiveCacheProgressLogger(cacheFile.path);
-      if (preferDirectStreamWithBackgroundPrecache) {
+      if (preferDirectStreamWithBackgroundPrecache &&
+          _backgroundPrecacheOfPlayingTrackWanted) {
         if (await _canPrecacheOnCurrentNetwork()) {
           unawaited(_precacheTrackAudioBytes(track, playbackData));
         } else if (kDebugMode) {
@@ -1738,7 +1749,15 @@ class AudioPlayerService {
           'AudioPlayerService: Using direct stream + aggressive background cache for ${track.id}',
         );
       }
-      if (await _canPrecacheOnCurrentNetwork()) {
+      if (!_backgroundPrecacheOfPlayingTrackWanted) {
+        // Streaming it already downloads this file once; a second
+        // background download of the same bytes is skipped.
+        if (kDebugMode) {
+          print(
+            'AudioPlayerService: Skipping duplicate background cache for ${track.id}',
+          );
+        }
+      } else if (await _canPrecacheOnCurrentNetwork()) {
         unawaited(_precacheTrackAudioBytes(track, playbackData));
       } else if (kDebugMode) {
         print(
@@ -1814,8 +1833,43 @@ class AudioPlayerService {
         message.contains('no address associated with hostname');
   }
 
+  /// Data usage: the track that is already playing streams directly, so
+  /// downloading the very same file again in the background doubles its
+  /// cost. It is only kept for Automix, which analyses whole cached files.
+  bool get _backgroundPrecacheOfPlayingTrackWanted =>
+      AutomixService.instance.enabled;
+
   void _schedulePrecacheAhead() {
     if (_isPrecachingAhead) return;
+
+    // Hold the next-track download back until the current one has been
+    // playing for a bit (see kPrecacheAheadStartAfter). Every new call
+    // restarts the wait, so a track change re-arms it for the new track.
+    final trackDuration = _currentTrack?.duration ?? Duration.zero;
+    final startAfter =
+        trackDuration > Duration.zero &&
+            trackDuration < kPrecacheAheadStartAfter * 2
+        ? trackDuration ~/ 2
+        : kPrecacheAheadStartAfter;
+    final position = _player.position;
+    if (_currentTrack != null && position < startAfter) {
+      final wait = startAfter - position;
+      _precacheAheadDelayTimer?.cancel();
+      _precacheAheadDelayTimer = Timer(wait, () {
+        _precacheAheadDelayTimer = null;
+        if (_isPrecachingAhead) return;
+        unawaited(_precacheAheadTracks());
+      });
+      if (kDebugMode) {
+        print(
+          'AudioPlayerService: Pre-cache ahead delayed ${wait.inSeconds}s (index=$_currentIndex)',
+        );
+      }
+      return;
+    }
+
+    _precacheAheadDelayTimer?.cancel();
+    _precacheAheadDelayTimer = null;
     if (kDebugMode) {
       print(
         'AudioPlayerService: Scheduling pre-cache ahead (index=$_currentIndex, queue=${_queue.length})',
@@ -2023,16 +2077,27 @@ class AudioPlayerService {
     int downloadedBytes = 0;
     try {
       client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-      final request = await client.getUrl(Uri.parse(playbackData.streamUrl));
-      _applyPrecacheRequestHeaders(request);
-      HttpClientResponse response = await request.close();
-      if (response.statusCode != 200 && response.statusCode != 206) {
-        throw HttpException('HTTP ${response.statusCode}');
+      HttpClientResponse? response;
+      int? expectedBytes;
+      final knownContentLength = playbackData.format.contentLength;
+      if (knownContentLength != null &&
+          knownContentLength >= kParallelPrecacheMinBytes) {
+        // The size is already known from the player response. The old
+        // probe GET below was opened and force-closed right away before the
+        // parallel ranges started, wasting the first chunk of every file.
+        expectedBytes = knownContentLength;
+      } else {
+        final request = await client.getUrl(Uri.parse(playbackData.streamUrl));
+        _applyPrecacheRequestHeaders(request);
+        response = await request.close();
+        if (response.statusCode != 200 && response.statusCode != 206) {
+          throw HttpException('HTTP ${response.statusCode}');
+        }
+        final responseContentLength = response.contentLength;
+        expectedBytes = responseContentLength > 0
+            ? responseContentLength
+            : playbackData.format.contentLength;
       }
-      final responseContentLength = response.contentLength;
-      int? expectedBytes = responseContentLength > 0
-          ? responseContentLength
-          : playbackData.format.contentLength;
 
       if (await tempFile.exists()) {
         await tempFile.delete();
@@ -2097,7 +2162,7 @@ class AudioPlayerService {
           }
         }
 
-        await for (final chunk in response) {
+        await for (final chunk in response!) {
           sink.add(chunk);
           downloadedBytes += chunk.length;
           if (kDebugMode) {
@@ -5535,6 +5600,7 @@ class AudioPlayerService {
   void dispose() {
     _persistenceDebounceTimer?.cancel();
     _cacheMaintenanceTimer?.cancel();
+    _precacheAheadDelayTimer?.cancel();
     unawaited(_sendYoutubeWatchtime(state: 'paused', force: true));
     _stopYoutubeWatchtimeTimer();
     _stopAllLiveCacheProgressLoggers();
