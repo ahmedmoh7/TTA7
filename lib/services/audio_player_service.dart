@@ -1636,38 +1636,38 @@ class AudioPlayerService {
       final cacheDir = await _getStreamAudioCacheDir(create: false);
       if (!await cacheDir.exists()) return;
 
-      final files = <File>[];
+      // Group sparse ranges by their owning track and evict each track once.
+      final groups = <String, ({int size, DateTime modified, File baseFile})>{};
       await for (final entity in cacheDir.list(followLinks: false)) {
-        if (entity is File &&
-            (entity.path.endsWith('.audio') || entity.path.contains('.audio.range.'))) {
-          files.add(entity);
-        }
+        if (entity is! File) continue;
+        final path = entity.path;
+        final marker = path.indexOf('.audio.range.');
+        final isFullFile = path.endsWith('.audio');
+        if (!isFullFile && marker < 0) continue;
+        final basePath = isFullFile ? path : path.substring(0, marker + '.audio'.length);
+        final stat = await entity.stat();
+        final previous = groups[basePath];
+        groups[basePath] = (
+          size: (previous?.size ?? 0) + stat.size,
+          modified: previous == null || stat.modified.isAfter(previous.modified)
+              ? stat.modified
+              : previous.modified,
+          baseFile: File(basePath),
+        );
       }
-      if (files.isEmpty) return;
 
-      int totalSizeBytes = 0;
-      final fileStats = <({File file, int size, DateTime modified})>[];
-      for (final file in files) {
-        if (!await file.exists()) continue;
-        final stat = await file.stat();
-        final size = stat.size;
-        totalSizeBytes += size;
-        fileStats.add((file: file, size: size, modified: stat.modified));
-      }
-
+      var totalSizeBytes = groups.values.fold<int>(0, (sum, group) => sum + group.size);
       final maxSizeBytes = _streamCacheSizeLimitMb * 1024 * 1024;
       if (totalSizeBytes <= maxSizeBytes) return;
-
-      fileStats.sort((a, b) => a.modified.compareTo(b.modified));
-      for (final entry in fileStats) {
+      final ordered = groups.entries.toList()
+        ..sort((a, b) => a.value.modified.compareTo(b.value.modified));
+      for (final entry in ordered) {
         if (totalSizeBytes <= maxSizeBytes) break;
-        await _deleteAudioCacheArtifact(entry.file);
-        totalSizeBytes -= entry.size;
+        await _deleteAudioCacheArtifact(entry.value.baseFile);
+        totalSizeBytes -= entry.value.size;
       }
     } catch (e) {
-      if (kDebugMode) {
-        print('AudioPlayerService: Failed to enforce cache limit: $e');
-      }
+      if (kDebugMode) print('AudioPlayerService: Failed to enforce cache limit: $e');
     }
   }
 
@@ -1770,11 +1770,6 @@ class AudioPlayerService {
         'AudioPlayerService: Streaming + caching audio bytes for ${track.id}',
       );
     }
-    _startLiveCacheProgressLogger(
-      track: track,
-      cacheFile: cacheFile,
-      expectedBytes: playbackData.format.contentLength,
-    );
     // Request-driven sparse caching: only decoder-requested ranges are fetched.
     // ignore: experimental_member_use
     return PartialCachingAudioSource(
