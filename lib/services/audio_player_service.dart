@@ -963,7 +963,6 @@ class AudioPlayerService {
     final source = await _streamingAudioSourceForTrack(
       track,
       playbackData,
-      preferDirectStreamWithBackgroundPrecache: true,
     );
     return (source: source, playbackData: playbackData);
   }
@@ -1647,9 +1646,8 @@ class AudioPlayerService {
 
   Future<AudioSource> _streamingAudioSourceForTrack(
     Track track,
-    PlaybackData playbackData, {
-    bool preferDirectStreamWithBackgroundPrecache = false,
-  }) async {
+    PlaybackData playbackData,
+  ) async {
     final streamUri = Uri.parse(playbackData.streamUrl);
     // The user agent (and origin) of the client that produced this URL.
     final streamHeaders = InnerTubeClient.streamHeadersFor(streamUri);
@@ -1710,35 +1708,9 @@ class AudioPlayerService {
 
     if (!_allowProxyCachingSource) {
       _stopLiveCacheProgressLogger(cacheFile.path);
-      if (preferDirectStreamWithBackgroundPrecache) {
-        if (await _canPrecacheOnCurrentNetwork()) {
-          unawaited(_precacheTrackAudioBytes(track, playbackData));
-        } else if (kDebugMode) {
-          print(
-            'AudioPlayerService: Skipping aggressive background cache for ${track.id} (Wi-Fi only)',
-          );
-        }
-      }
       if (kDebugMode) {
         print(
           'AudioPlayerService: Proxy caching disabled, using direct stream for ${track.id}',
-        );
-      }
-      return AudioSource.uri(streamUri, headers: headers, tag: track);
-    }
-
-    if (preferDirectStreamWithBackgroundPrecache) {
-      _stopLiveCacheProgressLogger(cacheFile.path);
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Using direct stream + aggressive background cache for ${track.id}',
-        );
-      }
-      if (await _canPrecacheOnCurrentNetwork()) {
-        unawaited(_precacheTrackAudioBytes(track, playbackData));
-      } else if (kDebugMode) {
-        print(
-          'AudioPlayerService: Skipping aggressive background cache for ${track.id} (Wi-Fi only)',
         );
       }
       return AudioSource.uri(streamUri, headers: headers, tag: track);
@@ -1792,7 +1764,6 @@ class AudioPlayerService {
     final currentSource = await _streamingAudioSourceForTrack(
       track,
       playbackData,
-      preferDirectStreamWithBackgroundPrecache: true,
     );
     return _singleTrackSourcePlan(currentSource, playbackData);
   }
@@ -3948,11 +3919,10 @@ class AudioPlayerService {
     unawaited(_enforceAudioCacheLimit());
   }
 
-  /// Lossless (a FLAC is ~10x a lossy stream) on Max always, and on Auto
-  /// while on Wi-Fi. High stays on the best lossy copy.
-  bool get _qualityAllowsLossless =>
-      _audioQuality == AudioQuality.max ||
-      (_audioQuality == AudioQuality.auto && _onUnmeteredNetwork);
+  /// Data saver: never replace a normal playback stream with a second,
+  /// much larger lossless stream automatically. The selected YouTube quality
+  /// remains in effect on both Wi-Fi and mobile data.
+  bool get _qualityAllowsLossless => false;
 
   /// Waits before looking again when the addon couldn't be reached.
   static const _losslessLookRetries = [
@@ -4164,25 +4134,9 @@ class AudioPlayerService {
   /// to analyse, whatever source is audible for it (lossless, JioSaavn) —
   /// the canonical copy BitChord analyses too.
   Future<void> fetchAnalysisAudio(String videoId) async {
-    // Automix needs a complete audio file. Never fetch that extra copy on
-    // metered networks; normal playback remains unaffected.
-    if (!AutomixService.instance.enabled || !_onUnmeteredNetwork) return;
-    final track = _currentTrack?.id == videoId
-        ? _currentTrack
-        : _queue.where((t) => t.id == videoId).firstOrNull;
-    if (track == null || _isLocalTrack(track)) return;
-    try {
-      final result = await _ytPlayerUtils.playerResponseForPlayback(
-        videoId,
-        quality: _audioQuality,
-        isMetered: false,
-      );
-      final data = result.data;
-      if (!result.isSuccess || data == null) return;
-      await _precacheTrackAudioBytes(track, data);
-    } catch (e) {
-      if (kDebugMode) print('AudioPlayerService: Automix audio fetch failed: $e');
-    }
+    // Data saver: never download a second, complete audio copy just for
+    // Automix analysis. Automix can use audio already present in the cache.
+    return;
   }
 
   /// Starts the current player without waiting on it.
