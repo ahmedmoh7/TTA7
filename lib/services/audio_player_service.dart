@@ -1687,7 +1687,16 @@ class AudioPlayerService {
     final cacheFile = await _cacheFileForTrack(track, playbackData);
     if (await cacheFile.exists()) {
       final size = await cacheFile.length();
-      if (size < kMinValidStreamCacheFileBytes) {
+      final expectedBytes = playbackData.format.contentLength;
+      final incompleteByLength =
+          expectedBytes != null && expectedBytes > 0 && size < expectedBytes;
+      if (size < kMinValidStreamCacheFileBytes || incompleteByLength) {
+        if (kDebugMode && incompleteByLength) {
+          print(
+            'AudioPlayerService: Rejecting incomplete cache for ${track.id} '
+            '(${_formatBytes(size)} / ${_formatBytes(expectedBytes!)}).',
+          );
+        }
         await _deleteAudioCacheArtifact(cacheFile);
       } else {
         _stopLiveCacheProgressLogger(cacheFile.path);
@@ -4285,25 +4294,16 @@ class AudioPlayerService {
     }
   }
 
-  /// Downloads [videoId]'s YouTube audio into the stream cache for Automix
-  /// to analyse, whatever source is audible for it (lossless, JioSaavn) —
-  /// the canonical copy BitChord analyses too.
+  /// Automix may request analysis audio, but we do not start a separate
+  /// download for it. The current track's LockCachingAudioSource already
+  /// writes the bytes being played into the stream cache. Upcoming tracks
+  /// are not downloaded just for analysis.
   Future<void> fetchAnalysisAudio(String videoId) async {
-    final track = _currentTrack?.id == videoId
-        ? _currentTrack
-        : _queue.where((t) => t.id == videoId).firstOrNull;
-    if (track == null || _isLocalTrack(track)) return;
-    try {
-      final result = await _ytPlayerUtils.playerResponseForPlayback(
-        videoId,
-        quality: _audioQuality,
-        isMetered: false,
+    if (kDebugMode) {
+      print(
+        'AudioPlayerService: Skipping separate Automix audio fetch for $videoId; '
+        'playback stream owns caching',
       );
-      final data = result.data;
-      if (!result.isSuccess || data == null) return;
-      await _precacheTrackAudioBytes(track, data);
-    } catch (e) {
-      if (kDebugMode) print('AudioPlayerService: Automix audio fetch failed: $e');
     }
   }
 
