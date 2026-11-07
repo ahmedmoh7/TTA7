@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart' show debugPrint, kDebugMode, kIsWeb;
 import 'dart:async';
+import 'dart:convert';
 import 'dart:collection';
 import 'dart:io';
 import 'dart:math';
@@ -8,6 +9,8 @@ import 'package:just_audio/just_audio.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:rxdart/rxdart.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:crypto/crypto.dart' as crypto;
+import 'playback/partial_caching_audio_source.dart';
 import '../models/models.dart';
 import 'playback/playback.dart';
 import 'jiosaavn/jiosaavn_service.dart';
@@ -1547,8 +1550,13 @@ class AudioPlayerService {
   ) async {
     final cacheDir = await _getStreamAudioCacheDir();
     final safeTrackId = _sanitizeCacheKey(track.id);
+    final uri = Uri.tryParse(playbackData.streamUrl);
+    final stableStreamIdentity = uri == null
+        ? playbackData.streamUrl
+        : '${uri.scheme}://${uri.host}${uri.path}';
+    final fingerprint = crypto.sha256.convert(utf8.encode(stableStreamIdentity)).toString().substring(0, 16);
     final cacheKey =
-        '${safeTrackId}_${_audioQuality.name}_${playbackData.format.bitrate}';
+        '${safeTrackId}_${_audioQuality.name}_${playbackData.format.bitrate}_$fingerprint';
     return File('${cacheDir.path}/$cacheKey.audio');
   }
 
@@ -1593,6 +1601,17 @@ class AudioPlayerService {
     if (await partialFile.exists()) {
       await partialFile.delete();
     }
+    final rangesIndex = File('${file.path}.ranges.json');
+    if (await rangesIndex.exists()) await rangesIndex.delete();
+    final rangePrefix = '${file.path}.range.';
+    final cacheDir = file.parent;
+    if (await cacheDir.exists()) {
+      await for (final entity in cacheDir.list(followLinks: false)) {
+        if (entity is File && entity.path.startsWith(rangePrefix)) {
+          await entity.delete();
+        }
+      }
+    }
     if (await precachePartFile.exists()) {
       await precachePartFile.delete();
     }
@@ -1605,7 +1624,8 @@ class AudioPlayerService {
       if (!await cacheDir.exists()) return 0;
       int totalBytes = 0;
       await for (final entity in cacheDir.list(followLinks: false)) {
-        if (entity is! File || !entity.path.endsWith('.audio')) continue;
+        if (entity is! File ||
+            !(entity.path.endsWith('.audio') || entity.path.contains('.audio.range.'))) continue;
         totalBytes += await entity.length();
       }
       return totalBytes;
@@ -1627,7 +1647,8 @@ class AudioPlayerService {
 
       final files = <File>[];
       await for (final entity in cacheDir.list(followLinks: false)) {
-        if (entity is File && entity.path.endsWith('.audio')) {
+        if (entity is File &&
+            (entity.path.endsWith('.audio') || entity.path.contains('.audio.range.'))) {
           files.add(entity);
         }
       }
@@ -1763,11 +1784,13 @@ class AudioPlayerService {
       cacheFile: cacheFile,
       expectedBytes: playbackData.format.contentLength,
     );
+    // Request-driven sparse caching: only decoder-requested ranges are fetched.
     // ignore: experimental_member_use
-    return LockCachingAudioSource(
-      streamUri,
+    return PartialCachingAudioSource(
+      uri: streamUri,
       cacheFile: cacheFile,
       headers: headers,
+      expectedLength: playbackData.format.contentLength,
       tag: track,
     );
   }
