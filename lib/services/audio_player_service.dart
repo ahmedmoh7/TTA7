@@ -1742,31 +1742,8 @@ class AudioPlayerService {
       return AudioSource.uri(streamUri, headers: headers, tag: track);
     }
 
-    if (preferDirectStreamWithBackgroundPrecache) {
-      _stopLiveCacheProgressLogger(cacheFile.path);
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Using direct stream + aggressive background cache for ${track.id}',
-        );
-      }
-      if (!_backgroundPrecacheOfPlayingTrackWanted) {
-        // Streaming it already downloads this file once; a second
-        // background download of the same bytes is skipped.
-        if (kDebugMode) {
-          print(
-            'AudioPlayerService: Skipping duplicate background cache for ${track.id}',
-          );
-        }
-      } else if (await _canPrecacheOnCurrentNetwork()) {
-        unawaited(_precacheTrackAudioBytes(track, playbackData));
-      } else if (kDebugMode) {
-        print(
-          'AudioPlayerService: Skipping aggressive background cache for ${track.id} (Wi-Fi only)',
-        );
-      }
-      return AudioSource.uri(streamUri, headers: headers, tag: track);
-    }
-
+    // Cache the exact response used for playback. This avoids a second
+    // background GET for the current track and makes completed replays local.
     if (kDebugMode) {
       print(
         'AudioPlayerService: Streaming + caching audio bytes for ${track.id}',
@@ -1836,46 +1813,13 @@ class AudioPlayerService {
   /// Data usage: the track that is already playing streams directly, so
   /// downloading the very same file again in the background doubles its
   /// cost. It is only kept for Automix, which analyses whole cached files.
-  bool get _backgroundPrecacheOfPlayingTrackWanted =>
-      AutomixService.instance.enabled;
+  bool get _backgroundPrecacheOfPlayingTrackWanted => false;
 
+  // Next-track audio is intentionally never downloaded in the background.
+  // _prefetchNextTrack resolves metadata/stream URLs only for faster startup.
   void _schedulePrecacheAhead() {
-    if (_isPrecachingAhead) return;
-
-    // Hold the next-track download back until the current one has been
-    // playing for a bit (see kPrecacheAheadStartAfter). Every new call
-    // restarts the wait, so a track change re-arms it for the new track.
-    final trackDuration = _currentTrack?.duration ?? Duration.zero;
-    final startAfter =
-        trackDuration > Duration.zero &&
-            trackDuration < kPrecacheAheadStartAfter * 2
-        ? trackDuration ~/ 2
-        : kPrecacheAheadStartAfter;
-    final position = _player.position;
-    if (_currentTrack != null && position < startAfter) {
-      final wait = startAfter - position;
-      _precacheAheadDelayTimer?.cancel();
-      _precacheAheadDelayTimer = Timer(wait, () {
-        _precacheAheadDelayTimer = null;
-        if (_isPrecachingAhead) return;
-        unawaited(_precacheAheadTracks());
-      });
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Pre-cache ahead delayed ${wait.inSeconds}s (index=$_currentIndex)',
-        );
-      }
-      return;
-    }
-
     _precacheAheadDelayTimer?.cancel();
     _precacheAheadDelayTimer = null;
-    if (kDebugMode) {
-      print(
-        'AudioPlayerService: Scheduling pre-cache ahead (index=$_currentIndex, queue=${_queue.length})',
-      );
-    }
-    unawaited(_precacheAheadTracks());
   }
 
   Future<void> _precacheAheadTracks() async {
@@ -4788,9 +4732,6 @@ class AudioPlayerService {
     // track's ending and the next one's opening.
     final playing = _currentTrack;
     if (playing != null) _requestAutomixAnalysis(playing);
-    if (_currentIndex < _queue.length - 1) {
-      _requestAutomixAnalysis(_queue[_currentIndex + 1]);
-    }
     if (_currentIndex < _queue.length - 1) {
       final nextTrack = _queue[_currentIndex + 1];
       if (!_isLocalTrack(nextTrack)) {
