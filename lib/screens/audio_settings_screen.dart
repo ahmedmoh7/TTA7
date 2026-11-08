@@ -38,9 +38,6 @@ class AudioSettingsScreen extends ConsumerWidget {
     final streamInfo = ref.watch(streamQualityInfoProvider);
     final streamCacheWifiOnly = ref.watch(streamCacheWifiOnlyProvider);
     final streamCacheLimitMb = ref.watch(streamCacheSizeLimitMbProvider);
-    final streamCacheMaxConcurrent = ref.watch(
-      streamCacheMaxConcurrentProvider,
-    );
     final crossfadeDurationMs = ref.watch(crossfadeDurationMsProvider);
     final streamCacheUsageAsync = ref.watch(streamAudioCacheUsageBytesProvider);
     final jioSaavnEnabled = ref.watch(jioSaavnEnabledProvider);
@@ -348,7 +345,6 @@ class AudioSettingsScreen extends ConsumerWidget {
             accentColor: accentColor,
             wifiOnly: streamCacheWifiOnly,
             cacheLimitMb: streamCacheLimitMb,
-            maxConcurrent: streamCacheMaxConcurrent,
             usageAsync: streamCacheUsageAsync,
             onWifiOnlyChanged: (enabled) async {
               await playerService.setStreamCacheWifiOnly(enabled);
@@ -357,9 +353,6 @@ class AudioSettingsScreen extends ConsumerWidget {
             onCacheLimitChanged: (limitMb) async {
               await playerService.setStreamCacheSizeLimitMb(limitMb);
               ref.read(streamAudioCacheRefreshProvider.notifier).state++;
-            },
-            onMaxConcurrentChanged: (value) async {
-              await playerService.setStreamCacheMaxConcurrent(value);
             },
           ),
 
@@ -834,14 +827,11 @@ class AudioSettingsScreen extends ConsumerWidget {
     required Color accentColor,
     required bool wifiOnly,
     required int cacheLimitMb,
-    required int maxConcurrent,
     required AsyncValue<int> usageAsync,
     required Future<void> Function(bool enabled) onWifiOnlyChanged,
     required Future<void> Function(int limitMb) onCacheLimitChanged,
-    required Future<void> Function(int value) onMaxConcurrentChanged,
   }) {
     const cacheLimitOptions = [256, 512, 1024, 2048, 4096];
-    const concurrencyOptions = [1, 2, 3, 4];
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -959,46 +949,6 @@ class AudioSettingsScreen extends ConsumerWidget {
             wifiOnly
                 ? context.l10n.preCacheRunsWifiOnly
                 : context.l10n.preCacheRunsWifiAndMobile,
-            style: TextStyle(
-              fontSize: 12,
-              color: isDark ? Colors.white54 : InzxColors.textSecondary,
-            ),
-          ),
-          const SizedBox(height: 16),
-          Text(
-            context.l10n.concurrentPreCacheDownloads,
-            style: TextStyle(
-              fontSize: 14,
-              fontWeight: FontWeight.w600,
-              color: isDark ? Colors.white : InzxColors.textPrimary,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: concurrencyOptions.map((option) {
-              final selected = option == maxConcurrent;
-              return ChoiceChip(
-                selected: selected,
-                label: Text(option.toString()),
-                selectedColor: accentColor,
-                labelStyle: TextStyle(
-                  color: selected
-                      ? InzxColors.contrastTextOn(accentColor)
-                      : (isDark ? Colors.white : InzxColors.textPrimary),
-                ),
-                onSelected: (picked) {
-                  if (picked) {
-                    onMaxConcurrentChanged(option);
-                  }
-                },
-              );
-            }).toList(),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            context.l10n.higherValuesCacheFaster,
             style: TextStyle(
               fontSize: 12,
               color: isDark ? Colors.white54 : InzxColors.textSecondary,

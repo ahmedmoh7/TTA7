@@ -3369,17 +3369,26 @@ _ProxyHandler _proxyHandlerForSource(StreamAudioSource source) {
       request.response.add(event);
     }, onError: (Object e, StackTrace st) {
       source._player?._playbackEventSubject.addError(e, st);
+      if (!completer.isCompleted) completer.completeError(e, st);
     }, onDone: () {
-      completer.complete();
+      if (!completer.isCompleted) completer.complete();
     });
 
     request.response.done.then((dynamic value) {
       subscription.cancel();
     });
 
-    await completer.future;
-
-    await request.response.close();
+    try {
+      await completer.future;
+    } catch (_) {
+      // The native player may see a truncated response and retry; always close
+      // the local socket so a failed/cancelled source cannot hang playback.
+    } finally {
+      await subscription.cancel();
+      try {
+        await request.response.close();
+      } catch (_) {}
+    }
   }
 
   return handler;

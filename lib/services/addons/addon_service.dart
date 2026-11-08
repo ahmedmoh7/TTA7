@@ -135,13 +135,15 @@ class AddonService extends ChangeNotifier {
           final enabled = prefs.getBool(_enabledKey) ?? true;
           final quality = AddonQuality.fromWire(prefs.getString(_qualityKey));
           final name = prefs.getString(_nameKey) ?? 'Addon';
-          _addons.add(AddonEntry(
-            id: 'legacy',
-            name: name,
-            baseUrl: legacyUrl,
-            enabled: enabled,
-            quality: quality,
-          ));
+          _addons.add(
+            AddonEntry(
+              id: 'legacy',
+              name: name,
+              baseUrl: legacyUrl,
+              enabled: enabled,
+              quality: quality,
+            ),
+          );
           await _save();
         }
       }
@@ -208,8 +210,9 @@ class AddonService extends ChangeNotifier {
       throw const AddonException('This addon can\'t search and stream tracks');
     }
 
-    final existingIndex =
-        _addons.indexWhere((a) => a.baseUrl == client.baseUrl);
+    final existingIndex = _addons.indexWhere(
+      (a) => a.baseUrl == client.baseUrl,
+    );
     if (existingIndex != -1) {
       _addons[existingIndex].close();
       _addons[existingIndex] = AddonEntry(
@@ -221,14 +224,16 @@ class AddonService extends ChangeNotifier {
         client: client,
       );
     } else {
-      _addons.add(AddonEntry(
-        id: DateTime.now().millisecondsSinceEpoch.toString(),
-        name: manifest.displayName,
-        baseUrl: client.baseUrl,
-        enabled: true,
-        quality: AddonQuality.lossless,
-        client: client,
-      ));
+      _addons.add(
+        AddonEntry(
+          id: DateTime.now().millisecondsSinceEpoch.toString(),
+          name: manifest.displayName,
+          baseUrl: client.baseUrl,
+          enabled: true,
+          quality: AddonQuality.lossless,
+          client: client,
+        ),
+      );
     }
 
     _clearCache();
@@ -381,6 +386,17 @@ class AddonService extends ChangeNotifier {
     });
   }
 
+  /// Force-refreshes a previously matched stream URL without repeating the
+  /// catalogue search. Used when a signed URL is rejected before its TTL.
+  Future<AddonMatch?> refreshStreamFor(Track track) {
+    final knownMatch = _cache[track.id];
+    if (knownMatch == null) return matchFor(track);
+    return _inFlight[track.id] ??= _resolve(track, knownMatch: knownMatch)
+        .whenComplete(() {
+          _inFlight.remove(track.id);
+        });
+  }
+
   Future<AddonMatch?> _resolve(Track track, {AddonMatch? knownMatch}) async {
     final active = _addons.where((a) => a.enabled).toList();
     if (active.isEmpty) return null;
@@ -388,8 +404,11 @@ class AddonService extends ChangeNotifier {
     // Fast-path: if re-resolving an expired stream from a previously matched addon,
     // try that addon directly first without a full search.
     if (knownMatch != null) {
-      final knownEntry = active.where((a) =>
-          a.id == knownMatch.addonId || a.name == knownMatch.addonName).firstOrNull;
+      final knownEntry = active
+          .where(
+            (a) => a.id == knownMatch.addonId || a.name == knownMatch.addonName,
+          )
+          .firstOrNull;
       if (knownEntry != null) {
         try {
           final stream = await knownEntry.client.stream(
@@ -487,7 +506,9 @@ class AddonService extends ChangeNotifier {
     final title = CanvasRepository.cleanTitle(track.title);
     final artist = CanvasRepository.cleanArtist(track.artist);
     if (title.isEmpty) return null;
-    final primaryArtist = artist.split(RegExp(r'\s*(?:,|&| x |feat\.?)\s*')).first;
+    final primaryArtist = artist
+        .split(RegExp(r'\s*(?:,|&| x |feat\.?)\s*'))
+        .first;
     AddonTrack? pick(List<AddonTrack> results) => pickBest(
       results,
       title: title,
@@ -508,7 +529,10 @@ class AddonService extends ChangeNotifier {
       final hit = pick(tagged);
       if (hit != null) return hit;
     }
-    final results = await client.search('$primaryArtist $title', quality: quality);
+    final results = await client.search(
+      '$primaryArtist $title',
+      quality: quality,
+    );
     final hit = pick(results);
     if (hit == null && results.isNotEmpty) {
       debugPrint(
@@ -547,9 +571,13 @@ class AddonService extends ChangeNotifier {
     final wantTitle = CanvasArtwork.normalizeForMatch(title);
     // A title in a script normalisation drops would match every other one.
     if (wantTitle.isEmpty) return null;
-    final wantAlbum = album == null ? '' : CanvasArtwork.normalizeForMatch(album);
+    final wantAlbum = album == null
+        ? ''
+        : CanvasArtwork.normalizeForMatch(album);
     final wantTakes = takeMarkers(sourceTitle ?? title);
-    final wantLanguages = languageTags('${sourceTitle ?? title} ${album ?? ''}');
+    final wantLanguages = languageTags(
+      '${sourceTitle ?? title} ${album ?? ''}',
+    );
     AddonTrack? best;
     var bestScore = -1;
     for (final hit in results) {
@@ -602,7 +630,9 @@ class AddonService extends ChangeNotifier {
   /// Hindi Version"). Bengali and Bangla are one language.
   @visibleForTesting
   static Set<String> languageTags(String text) => {
-    for (final m in _languageWord.allMatches(CanvasArtwork.foldDiacritics(text).toLowerCase()))
+    for (final m in _languageWord.allMatches(
+      CanvasArtwork.foldDiacritics(text).toLowerCase(),
+    ))
       m[1] == 'bangla' ? 'bengali' : m[1]!,
   };
 
@@ -636,7 +666,8 @@ class AddonService extends ChangeNotifier {
   static Set<String> takeMarkers(String title) {
     final text = CanvasArtwork.foldDiacritics(title).toLowerCase();
     final asides = [
-      for (final m in RegExp(r'[\(\[\{]([^\)\]\}]*)[\)\]\}]').allMatches(text)) m[1]!,
+      for (final m in RegExp(r'[\(\[\{]([^\)\]\}]*)[\)\]\}]').allMatches(text))
+        m[1]!,
       ...text.split(RegExp(r'\s[-–—]\s')).skip(1),
     ].join(' ').replaceAll('lo-fi', 'lofi');
     return {for (final m in _takeWord.allMatches(asides)) m[1]!};
