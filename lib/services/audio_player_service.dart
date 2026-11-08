@@ -1,8 +1,10 @@
 import 'package:flutter/foundation.dart' show debugPrint, kDebugMode, kIsWeb;
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'package:crypto/crypto.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:path_provider/path_provider.dart';
@@ -10,6 +12,7 @@ import 'package:rxdart/rxdart.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/models.dart';
 import 'playback/playback.dart';
+import 'playback/partial_audio_cache.dart';
 import 'jiosaavn/jiosaavn_service.dart';
 import 'addons/addon_service.dart';
 import 'automix/automix_service.dart';
@@ -1594,8 +1597,10 @@ class AudioPlayerService {
   }
 
   Future<Directory> _getStreamAudioCacheDir({bool create = true}) async {
-    final tempDir = await getTemporaryDirectory();
-    final cacheDir = Directory('${tempDir.path}/$_streamAudioCacheDirName');
+    final appSupportDir = await getApplicationSupportDirectory();
+    final cacheDir = Directory(
+      '${appSupportDir.path}/$_streamAudioCacheDirName',
+    );
     if (create && !await cacheDir.exists()) {
       await cacheDir.create(recursive: true);
     }
@@ -1604,13 +1609,39 @@ class AudioPlayerService {
 
   Future<File> _cacheFileForTrack(
     Track track,
-    PlaybackData playbackData,
-  ) async {
+    PlaybackData playbackData, {
+    String? sourceIdentity,
+  }) async {
     final cacheDir = await _getStreamAudioCacheDir();
     final safeTrackId = _sanitizeCacheKey(track.id);
-    final cacheKey =
-        '${safeTrackId}_${_audioQuality.name}_${playbackData.format.bitrate}';
-    return File('${cacheDir.path}/$cacheKey.audio');
+    final cacheKey = _audioCacheRepresentationKey(
+      track,
+      playbackData,
+      sourceIdentity: sourceIdentity,
+    );
+    return File('${cacheDir.path}/${safeTrackId}_$cacheKey.audio');
+  }
+
+  String _audioCacheRepresentationKey(
+    Track track,
+    PlaybackData playbackData, {
+    String? sourceIdentity,
+  }) {
+    final format = playbackData.format;
+    final stableIdentity = sourceIdentity ?? playbackData.audioSource;
+    final fields = <String>[
+      track.id,
+      stableIdentity,
+      _audioQuality.name,
+      format.mimeType,
+      format.codecs ?? '',
+      format.bitrate.toString(),
+      format.sampleRate?.toString() ?? '',
+      format.channelCount?.toString() ?? '',
+      format.contentLength?.toString() ?? '',
+      format.bitsPerSample?.toString() ?? '',
+    ];
+    return sha256.convert(utf8.encode(fields.join('|'))).toString();
   }
 
   Future<bool> _isConnectedToWifi() async {
@@ -1627,11 +1658,6 @@ class AudioPlayerService {
     }
   }
 
-  Future<bool> _canPrecacheOnCurrentNetwork() async {
-    if (!_streamCacheWifiOnly) return true;
-    return await _isConnectedToWifi();
-  }
-
   Future<void> _touchCacheFile(File file) async {
     try {
       if (await file.exists()) {
@@ -1645,6 +1671,7 @@ class AudioPlayerService {
     final mimeFile = File('${file.path}.mime');
     final partialFile = File('${file.path}.part');
     final precachePartFile = File('${file.path}.precache.part');
+    final rangesFile = File('${file.path}.ranges.json');
     if (await file.exists()) {
       await file.delete();
     }
@@ -1657,6 +1684,9 @@ class AudioPlayerService {
     if (await precachePartFile.exists()) {
       await precachePartFile.delete();
     }
+    if (await rangesFile.exists()) {
+      await rangesFile.delete();
+    }
   }
 
   Future<int> getStreamAudioCacheSizeBytes() async {
@@ -1667,7 +1697,11 @@ class AudioPlayerService {
       int totalBytes = 0;
       await for (final entity in cacheDir.list(followLinks: false)) {
         if (entity is! File || !entity.path.endsWith('.audio')) continue;
-        totalBytes += await entity.length();
+        final cachedBytes = await PartialAudioCacheStore.cacheBytesFor(entity);
+        final hasRangeMetadata = await File(
+          '${entity.path}.ranges.json',
+        ).exists();
+        totalBytes += hasRangeMetadata ? cachedBytes : await entity.length();
       }
       return totalBytes;
     } catch (_) {
@@ -1699,9 +1733,17 @@ class AudioPlayerService {
       for (final file in files) {
         if (!await file.exists()) continue;
         final stat = await file.stat();
-        final size = stat.size;
+        final cachedBytes = await PartialAudioCacheStore.cacheBytesFor(file);
+        final hasRangeMetadata = await File(
+          '${file.path}.ranges.json',
+        ).exists();
+        final size = hasRangeMetadata ? cachedBytes : stat.size;
         totalSizeBytes += size;
-        fileStats.add((file: file, size: size, modified: stat.modified));
+        fileStats.add((
+          file: file,
+          size: size,
+          modified: await PartialAudioCacheStore.cacheLastAccessFor(file),
+        ));
       }
 
       final maxSizeBytes = _streamCacheSizeLimitMb * 1024 * 1024;
@@ -1744,98 +1786,194 @@ class AudioPlayerService {
       }
       return AudioSource.uri(streamUri, headers: headers, tag: track);
     }
-
-    final cacheFile = await _cacheFileForTrack(track, playbackData);
-    if (await cacheFile.exists()) {
-      final size = await cacheFile.length();
-      if (size < kMinValidStreamCacheFileBytes) {
-        await _deleteAudioCacheArtifact(cacheFile);
-      } else {
-        _stopLiveCacheProgressLogger(cacheFile.path);
-        unawaited(_touchCacheFile(cacheFile));
-        final expectedBytes = playbackData.format.contentLength;
-        if (kDebugMode) {
-          if (expectedBytes != null && expectedBytes > 0) {
-            final progress = ((size / expectedBytes) * 100).clamp(0.0, 100.0);
-            print(
-              'AudioPlayerService: Using cached audio bytes for ${track.id} '
-              '(${_formatBytes(size)} / ${_formatBytes(expectedBytes)}, ${progress.toStringAsFixed(1)}%)',
-            );
-          } else {
-            print(
-              'AudioPlayerService: Using cached audio bytes for ${track.id} '
-              '(${_formatBytes(size)})',
-            );
-          }
-        }
-        return AudioSource.uri(Uri.file(cacheFile.path), tag: track);
-      }
-    }
-
-    // Avoid competing writers for the same cache file.
-    if (_precacheInProgress.contains(track.id)) {
-      _stopLiveCacheProgressLogger(cacheFile.path);
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Pre-cache in progress for ${track.id}, using direct stream',
-        );
-      }
-      return AudioSource.uri(streamUri, headers: headers, tag: track);
-    }
-
     if (!_allowProxyCachingSource) {
-      _stopLiveCacheProgressLogger(cacheFile.path);
-      if (preferDirectStreamWithBackgroundPrecache) {
-        if (await _canPrecacheOnCurrentNetwork()) {
-          unawaited(_precacheTrackAudioBytes(track, playbackData));
-        } else if (kDebugMode) {
-          print(
-            'AudioPlayerService: Skipping aggressive background cache for ${track.id} (Wi-Fi only)',
-          );
-        }
-      }
       if (kDebugMode) {
         print(
-          'AudioPlayerService: Proxy caching disabled, using direct stream for ${track.id}',
+          'AudioPlayerService: Local source proxy unavailable; using direct stream for ${track.id}',
         );
       }
       return AudioSource.uri(streamUri, headers: headers, tag: track);
     }
-
-    if (preferDirectStreamWithBackgroundPrecache) {
-      _stopLiveCacheProgressLogger(cacheFile.path);
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Using direct stream + aggressive background cache for ${track.id}',
-        );
-      }
-      if (await _canPrecacheOnCurrentNetwork()) {
-        unawaited(_precacheTrackAudioBytes(track, playbackData));
-      } else if (kDebugMode) {
-        print(
-          'AudioPlayerService: Skipping aggressive background cache for ${track.id} (Wi-Fi only)',
-        );
-      }
-      return AudioSource.uri(streamUri, headers: headers, tag: track);
-    }
-
-    if (kDebugMode) {
-      print(
-        'AudioPlayerService: Streaming + caching audio bytes for ${track.id}',
-      );
-    }
-    _startLiveCacheProgressLogger(
-      track: track,
-      cacheFile: cacheFile,
-      expectedBytes: playbackData.format.contentLength,
+    final sourceIdentity = playbackData.audioSource;
+    final representationKey = _audioCacheRepresentationKey(
+      track,
+      playbackData,
+      sourceIdentity: sourceIdentity,
     );
-    // ignore: experimental_member_use
-    return LockCachingAudioSource(
-      streamUri,
-      cacheFile: cacheFile,
+    return _partialAudioSourceForTrack(
+      track,
+      playbackData,
+      sourceIdentity: sourceIdentity,
+      representationKey: representationKey,
       headers: headers,
+      refreshOrigin: () => _refreshYouTubeAudioOrigin(
+        track,
+        sourceIdentity: sourceIdentity,
+        representationKey: representationKey,
+      ),
+    );
+  }
+
+  Future<AudioSource> _partialAudioSourceForTrack(
+    Track track,
+    PlaybackData playbackData, {
+    required String sourceIdentity,
+    required String representationKey,
+    Map<String, String>? headers,
+    PartialAudioOriginRefresh? refreshOrigin,
+  }) async {
+    final cacheFile = await _cacheFileForTrack(
+      track,
+      playbackData,
+      sourceIdentity: sourceIdentity,
+    );
+    final store = PartialAudioCacheStore(cacheFile);
+    final knownLength =
+        playbackData.format.contentLength ?? await store.totalLength();
+    if (knownLength != null && await store.isComplete(knownLength)) {
+      await _touchCacheFile(cacheFile);
+      _offerToAutomix(track, cacheFile.path);
+      return AudioSource.uri(Uri.file(cacheFile.path), tag: track);
+    }
+
+    final streamUri = Uri.parse(playbackData.streamUrl);
+    if (!_allowProxyCachingSource) {
+      return AudioSource.uri(streamUri, headers: headers, tag: track);
+    }
+    return PartialCachingAudioSource(
+      origin: PartialAudioOrigin(
+        uri: streamUri,
+        representationKey: representationKey,
+        contentType: playbackData.format.mimeType.isEmpty
+            ? 'audio/mpeg'
+            : playbackData.format.mimeType,
+        headers: headers ?? const <String, String>{},
+        contentLength: playbackData.format.contentLength,
+      ),
+      audioFile: cacheFile,
+      expectedLength: playbackData.format.contentLength,
+      refreshOrigin: refreshOrigin,
+      onComplete: (file) {
+        _stopLiveCacheProgressLogger(file.path);
+        _offerToAutomix(track, file.path);
+        unawaited(_enforceAudioCacheLimit());
+      },
       tag: track,
     );
+  }
+
+  /// Finds the best persisted cache for a track without requiring a stream URL.
+  /// A complete cache is opened as a normal file; a sparse cache is exposed as
+  /// an offline-only source that can serve cached ranges but never fetch gaps.
+  Future<AudioSource?> _offlineCachedSourceForTrack(Track track) async {
+    if (kIsWeb) return null;
+    final cacheDir = await _getStreamAudioCacheDir(create: false);
+    if (!await cacheDir.exists()) return null;
+
+    final prefix = '${_sanitizeCacheKey(track.id)}_';
+    final candidates = <({
+      File file,
+      PartialAudioCacheStore store,
+      PartialAudioCacheSnapshot snapshot,
+    })>[];
+
+    await for (final entity in cacheDir.list(followLinks: false)) {
+      if (entity is! File || !entity.path.endsWith('.audio')) continue;
+      final name = entity.uri.pathSegments.isEmpty
+          ? entity.path
+          : entity.uri.pathSegments.last;
+      if (!name.startsWith(prefix)) continue;
+
+      final store = PartialAudioCacheStore(entity);
+      final snapshot = await store.snapshot();
+      if (snapshot == null) continue;
+      candidates.add((file: entity, store: store, snapshot: snapshot));
+    }
+
+    if (candidates.isEmpty) return null;
+    candidates.sort((a, b) {
+      final byBytes = b.snapshot.cachedBytes.compareTo(a.snapshot.cachedBytes);
+      if (byBytes != 0) return byBytes;
+      return b.snapshot.lastAccessMs.compareTo(a.snapshot.lastAccessMs);
+    });
+
+    final best = candidates.first;
+    final totalLength = best.snapshot.totalLength;
+    if (totalLength != null && await best.store.isComplete(totalLength)) {
+      await best.store.touch();
+      return AudioSource.uri(Uri.file(best.file.path), tag: track);
+    }
+
+    final contentType = best.snapshot.contentType.isEmpty
+        ? 'audio/mpeg'
+        : best.snapshot.contentType;
+    return PartialCachingAudioSource(
+      origin: PartialAudioOrigin(
+        // This URI is never contacted while offlineOnly is true.
+        uri: Uri.parse('http://127.0.0.1/offline-cache'),
+        representationKey: best.file.uri.path,
+        contentType: contentType,
+        contentLength: totalLength,
+      ),
+      audioFile: best.file,
+      expectedLength: totalLength,
+      offlineOnly: true,
+      tag: track,
+    );
+  }
+
+  AudioSource _directAudioSourceForTrack(
+    Track track,
+    PlaybackData playbackData,
+  ) {
+    final uri = Uri.parse(playbackData.streamUrl);
+    final headers = InnerTubeClient.streamHeadersFor(uri);
+    return AudioSource.uri(
+      uri,
+      headers: headers.isEmpty ? null : headers,
+      tag: track,
+    );
+  }
+
+  Future<PartialAudioOrigin?> _refreshYouTubeAudioOrigin(
+    Track track, {
+    required String sourceIdentity,
+    required String representationKey,
+  }) async {
+    try {
+      _ytPlayerUtils.clearCache(track.id);
+      final result = await _ytPlayerUtils.playerResponseForPlayback(
+        track.id,
+        quality: _audioQuality,
+        isMetered: false,
+      );
+      final data = result.data;
+      if (!result.isSuccess || data == null) return null;
+      final refreshedKey = _audioCacheRepresentationKey(
+        track,
+        data,
+        sourceIdentity: sourceIdentity,
+      );
+      if (refreshedKey != representationKey) return null;
+      final uri = Uri.parse(data.streamUrl);
+      final headers = InnerTubeClient.streamHeadersFor(uri);
+      return PartialAudioOrigin(
+        uri: uri,
+        representationKey: representationKey,
+        contentType: data.format.mimeType.isEmpty
+            ? 'audio/mpeg'
+            : data.format.mimeType,
+        headers: headers,
+        contentLength: data.format.contentLength,
+      );
+    } catch (e) {
+      if (kDebugMode) {
+        print(
+          'AudioPlayerService: Failed to refresh stream URL for ${track.id}: $e',
+        );
+      }
+      return null;
+    }
   }
 
   ({
@@ -3912,6 +4050,53 @@ class AudioPlayerService {
             'AudioPlayerService: Failed to get stream URL: ${ytResult.error}',
           );
         }
+        // A partial stream cache survives app restarts. Try it before any
+        // secondary online provider so already-heard bytes remain replayable
+        // when the device has no network connection.
+        final offlineSource = await _offlineCachedSourceForTrack(_currentTrack!);
+        if (offlineSource != null) {
+          try {
+            await _player.setAudioSource(offlineSource, preload: true);
+            _activeSourceQueueIndices = <int>[_currentIndex];
+            _activeSourcePlaybackDataByQueueIndex =
+                const <int, PlaybackData>{};
+
+            if (_pendingSeekPosition != null &&
+                _pendingSeekTrackId == _currentTrack!.id) {
+              try {
+                await _player.seek(_pendingSeekPosition);
+              } catch (_) {
+                // If the saved position is outside cached ranges, replay from
+                // the beginning of the locally available portion instead.
+                await _player.seek(Duration.zero);
+              }
+              _positionController.add(_player.position);
+              _updateState(position: _player.position);
+              _pendingSeekPosition = null;
+              _pendingSeekTrackId = null;
+            }
+
+            _startPlayback();
+            _updateState(
+              isLoading: false,
+              error: null,
+              resetCurrentPlaybackData: true,
+            );
+            if (kDebugMode) {
+              print(
+                'AudioPlayerService: Replaying cached audio offline for ${_currentTrack!.id}',
+              );
+            }
+            return;
+          } catch (e) {
+            if (kDebugMode) {
+              print(
+                'AudioPlayerService: Offline cache could not satisfy playback: $e',
+              );
+            }
+          }
+        }
+
         // Fallback: If YouTube failed, wait up to 4s for JioSaavn
         if (saavnFuture != null) {
           try {
