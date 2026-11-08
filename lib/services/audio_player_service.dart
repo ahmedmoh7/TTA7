@@ -1053,195 +1053,21 @@ class AudioPlayerService {
   }
 
   Future<void> _crossfadeToIndex(int targetIndex) async {
-    if (_isCrossfading) return;
-    if (_crossfadeDurationMs <= 0) {
-      _currentIndex = targetIndex;
-      _currentTrack = _queue[targetIndex];
-      await _loadAndPlayCurrent();
+    // Load the requested track only when the transition is actually due.
+    if (_isCrossfading ||
+        targetIndex < 0 ||
+        targetIndex >= _queue.length ||
+        targetIndex == _currentIndex) {
       return;
     }
-    if (targetIndex < 0 || targetIndex >= _queue.length) return;
-    if (_currentIndex == targetIndex) return;
-    if (_jamsModeEnabled) {
-      _currentIndex = targetIndex;
-      _currentTrack = _queue[targetIndex];
-      await _loadAndPlayCurrent();
-      return;
-    }
-
-    _isCrossfading = true;
-    var crossfadeSucceeded = false;
-    final outgoingPlayer = _player;
-    final incomingPlayer = _inactivePlayer;
-    final targetTrack = _queue[targetIndex];
-    final sourceTrackId = _currentTrack?.id ?? 'unknown';
-
-    try {
-      final built = await _buildSourceForTrack(targetTrack);
-      await incomingPlayer.stop();
-      await incomingPlayer.setLoopMode(_nativeLoopModeFor(_loopMode));
-      await incomingPlayer.setSpeed(outgoingPlayer.speed);
-      await incomingPlayer.setAudioSource(built.source, preload: true);
-      await _setVolumeSafely(
-        incomingPlayer,
-        0.12,
-        context: 'crossfade-bootstrap',
-      );
-
-      _player = incomingPlayer;
-      _currentIndex = targetIndex;
-      var enrichedTrack = targetTrack;
-      final crossfadeDetails = built.playbackData?.videoDetails;
-      if (crossfadeDetails != null) {
-        const badPlaceholders = {
-          'unknown artist',
-          'song',
-          'video',
-          'album',
-          'single',
-          'ep',
-          'playlist',
-          '',
-        };
-        final artistLower = enrichedTrack.artist.toLowerCase().trim();
-        if (badPlaceholders.contains(artistLower) &&
-            crossfadeDetails.author.isNotEmpty &&
-            !badPlaceholders.contains(crossfadeDetails.author.toLowerCase().trim())) {
-          enrichedTrack =
-              enrichedTrack.copyWith(artist: crossfadeDetails.author);
-        }
-        if (enrichedTrack.duration <= Duration.zero &&
-            crossfadeDetails.duration > Duration.zero) {
-          enrichedTrack =
-              enrichedTrack.copyWith(duration: crossfadeDetails.duration);
-        }
-        if (enrichedTrack != targetTrack) {
-          _queue[targetIndex] = enrichedTrack;
-          for (int i = 0; i < _originalQueue.length; i++) {
-            if (_originalQueue[i].id == enrichedTrack.id) {
-              _originalQueue[i] = enrichedTrack;
-              break;
-            }
-          }
-          _queueRevision++;
-        }
-      }
-      _currentTrack = enrichedTrack;
-      _currentPlaybackData = built.playbackData;
-      _activeSourceQueueIndices = <int>[targetIndex];
-      _activeSourcePlaybackDataByQueueIndex = built.playbackData == null
-          ? const <int, PlaybackData>{}
-          : <int, PlaybackData>{targetIndex: built.playbackData!};
-      _crossfadeTriggeredForTrack = false;
-
-      final newDuration = incomingPlayer.duration;
-      if (newDuration != null) {
-        _applyDurationToCurrentTrack(newDuration);
-      }
-
-      _updateState(
-        currentTrack: _currentTrack,
-        currentIndex: _currentIndex,
-        currentPlaybackData: _currentPlaybackData,
-        queue: _queue,
-        queueRevision: _queueRevision,
-        duration: newDuration,
-        resetDuration: newDuration == null,
-        isLoading: false,
-      );
-      _saveQueueDebounced();
-      _prefetchNextTrack();
-      _scheduleLyricsPrefetchAroundCurrent();
-
-      AudioRoutingService.reapplyAudioRoute();
-      unawaited(incomingPlayer.play());
-      for (int i = 1; i <= 6; i++) {
-        Future.delayed(Duration(milliseconds: i * 25), AudioRoutingService.reapplyAudioRoute);
-      }
-
-      await Future.delayed(const Duration(milliseconds: 90));
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Crossfade started $sourceTrackId -> ${targetTrack.id} (${_crossfadeDurationMs}ms)',
-        );
-      }
-      await _runOverlapFade(
-        outgoing: outgoingPlayer,
-        incoming: incomingPlayer,
-        duration: _crossfadeDuration,
-      );
-
-      await outgoingPlayer.stop();
-      await _setVolumeSafely(
-        outgoingPlayer,
-        1.0,
-        context: 'crossfade-reset-outgoing',
-      );
-      await _setVolumeSafely(
-        incomingPlayer,
-        1.0,
-        context: 'crossfade-settle-incoming',
-      );
-      if (!incomingPlayer.playing) {
-        unawaited(incomingPlayer.play());
-      }
-      await _stabilizeIncomingAfterCrossfade(incomingPlayer);
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Crossfade completed on ${targetTrack.id}, incomingVolume=${incomingPlayer.volume.toStringAsFixed(2)}',
-        );
-      }
-      crossfadeSucceeded = true;
-    } catch (e) {
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Crossfade failed, fallback to hard switch: $e',
-        );
-      }
-      _player = outgoingPlayer;
-      _currentIndex = targetIndex;
-      _currentTrack = _queue[targetIndex];
-      // (The hard switch goes through the normal load, which upgrades.)
-      await _loadAndPlayCurrent();
-    } finally {
-      _isCrossfading = false;
-    }
-    // Most tracks start here (crossfade is on by default), so this is where
-    // the second look for a lossless copy matters most.
-    final arrived = _currentTrack;
-    if (crossfadeSucceeded &&
-        arrived != null &&
-        arrived.id == targetTrack.id &&
-        _currentPlaybackData?.isLive != true) {
-      unawaited(_upgradeToLosslessIfPossible(arrived));
-    }
+    _currentIndex = targetIndex;
+    _currentTrack = _queue[targetIndex];
+    await _loadAndPlayCurrent();
   }
 
   void _maybeTriggerAutoCrossfade(Duration currentPosition) {
-    if (_jamsModeEnabled) return;
-    // With Automix on, the engine plans and runs every transition.
-    if (_automixOn) return;
-    if (_crossfadeDurationMs <= 0) return;
-    if (_isCrossfading) return;
-    if (_crossfadeTriggeredForTrack) return;
-    if (_loopMode == LoopMode.one) return;
-    if (!_player.playing) return;
-    // Live streams have no real end — never crossfade/advance off them.
-    if (_currentPlaybackData?.isLive == true) return;
-
-    final duration = _player.duration;
-    if (duration == null || duration <= Duration.zero) return;
-    final remaining = duration - currentPosition;
-    if (remaining <= Duration.zero) return;
-
-    final triggerLeadMs = max(300, _crossfadeDurationMs + 120);
-    if (remaining.inMilliseconds > triggerLeadMs) return;
-
-    final nextIndex = _nextQueueIndexForTransition();
-    if (nextIndex == null) return;
-
-    _crossfadeTriggeredForTrack = true;
-    unawaited(_crossfadeToIndex(nextIndex));
+    // Automatic crossfade requires preloading upcoming audio; disabled.
+    return;
   }
 
   int _effectivePrecacheConcurrency() {
@@ -2046,155 +1872,65 @@ class AudioPlayerService {
     unawaited(_precacheAheadTracks());
   }
 
+  /// Prepare only upcoming playback metadata/URLs. Audio bytes for next
+  /// tracks are never downloaded or buffered in advance.
   Future<void> _precacheAheadTracks() async {
-    if (_isPrecachingAhead) return;
-    if (_currentIndex < 0 || _queue.isEmpty) {
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Skipping pre-cache (index=$_currentIndex, queue=${_queue.length})',
-        );
-      }
+    if (_isPrecachingAhead ||
+        _currentIndex < 0 ||
+        _queue.isEmpty ||
+        _streamCachePrecacheTrackCount <= 0 ||
+        !_hasReachedPrecacheStartThreshold() ||
+        _precacheTriggeredForTrackId == _currentTrack?.id) {
       return;
     }
 
-    if (_streamCachePrecacheTrackCount <= 0 ||
-        !_hasReachedPrecacheStartThreshold() ||
-        _precacheTriggeredForTrackId == _currentTrack?.id) return;
+    final start = _currentIndex + 1;
+    if (start >= _queue.length) return;
+    final end = min(_queue.length, start + _streamCachePrecacheTrackCount);
+    final candidates = _queue
+        .sublist(start, end)
+        .where((track) => !_isLocalTrack(track))
+        .toList(growable: false);
+    if (candidates.isEmpty) return;
+
     _isPrecachingAhead = true;
+    _precacheTriggeredForTrackId = _currentTrack?.id;
     try {
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Pre-cache pass started from index $_currentIndex (queue=${_queue.length})',
-        );
-      }
-      final onWifi = await _isConnectedToWifi();
-      if (_streamCacheWifiOnly && !onWifi) {
-        // Avoid repeating a connectivity check on every position update.
-        // _watchNetworkType clears this marker when Wi-Fi becomes available.
-        _precacheTriggeredForTrackId = _currentTrack?.id;
-        if (kDebugMode) {
-          print('AudioPlayerService: Skipping pre-cache (not on Wi-Fi)');
-        }
-        return;
-      }
-      final start = _currentIndex + 1;
-      if (start >= _queue.length) {
-        if (kDebugMode) {
-          print('AudioPlayerService: No upcoming tracks to pre-cache');
-        }
-        return;
-      }
-      _precacheTriggeredForTrackId = _currentTrack?.id;
-      final maxConcurrent = _effectivePrecacheConcurrency();
-      final candidateLimit = _streamCachePrecacheTrackCount;
-      final end = min(_queue.length, start + candidateLimit);
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Pre-cache candidates ${end - start} tracks ($start..${end - 1}, limit=$candidateLimit)',
-        );
-      }
-
-      final candidates = <({Track track, PlaybackData playbackData})>[];
-      for (int i = start; i < end; i++) {
-        if (_streamCachePrecacheTrackCount <= 0 ||
-            i >= start + _streamCachePrecacheTrackCount) break;
-        final track = _queue[i];
-        if (_precacheInProgress.contains(track.id)) continue;
-
-        String? resolvedLocalPath = track.localFilePath;
-        if (resolvedLocalPath == null) {
-          try {
-            if (!Hive.isBoxOpen('music_downloads')) {
-              await Hive.openBox<DownloadEntity>('music_downloads');
-            }
-            final box = Hive.box<DownloadEntity>('music_downloads');
-            final entity = box.values.where((e) => e.trackId == track.id).firstOrNull;
-            if (entity != null) resolvedLocalPath = entity.localPath;
-          } catch (_) {}
-        }
-
-        if (resolvedLocalPath != null &&
-            await File(resolvedLocalPath).exists()) {
-          if (kDebugMode) {
-            print(
-              'AudioPlayerService: Skipping pre-cache for ${track.id} (local file)',
-            );
-          }
-          continue;
-        }
-
-        // A track that will play lossless never uses its YouTube file, so
-        // don't spend data downloading one. (The lossless copy itself isn't
-        // pre-downloaded: a FLAC is ~10x the size, so it streams instead.)
-        if (_qualityAllowsLossless && AddonService.instance.isEnabled) {
-          final lossless = await AddonService.instance.matchFor(track);
-          if (lossless != null) {
-            _logLossless(
-              'Skipping YouTube pre-cache for ${track.id}: will play '
-              '${lossless.stream.formatLabel}',
-            );
-            continue;
-          }
-        }
-
-        if (kDebugMode) {
-          print('AudioPlayerService: Pre-cache candidate ${track.id}');
-        }
-
-        final result = await _ytPlayerUtils.playerResponseForPlayback(
-          track.id,
-          quality: _audioQuality,
-          isMetered: false,
-        );
-        if (!result.isSuccess || result.data == null) continue;
-        candidates.add((track: track, playbackData: result.data!));
-      }
-
-      if (candidates.isEmpty) {
-        if (kDebugMode) {
-          print('AudioPlayerService: No valid tracks resolved for pre-cache');
-        }
-        return;
-      }
-
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Pre-cache download workers=$maxConcurrent (wifiOnly=$_streamCacheWifiOnly, onWifi=$onWifi, jobs=${candidates.length})',
-        );
-      }
-
-      if (maxConcurrent <= 1 || candidates.length == 1) {
-        for (final candidate in candidates) {
-          if (_streamCachePrecacheTrackCount <= 0) break;
-          await _precacheTrackAudioBytes(
-            candidate.track,
-            candidate.playbackData,
-          );
-          await _enforceAudioCacheLimit();
-        }
-        return;
-      }
-
-      int cursor = 0;
-      Future<void> worker(int workerId) async {
+      var cursor = 0;
+      Future<void> worker() async {
         while (true) {
-          if (_streamCachePrecacheTrackCount <= 0 ||
-              cursor >= candidates.length ||
-              cursor >= _streamCachePrecacheTrackCount) return;
-          final next = candidates[cursor++];
-          if (kDebugMode) {
-            print(
-              'AudioPlayerService: Pre-cache worker#$workerId downloading ${next.track.id}',
+          final index = cursor++;
+          if (index >= candidates.length) return;
+          final track = candidates[index];
+          try {
+            // Resolves and caches playback metadata/URL only. It does not
+            // create an AudioSource or request any audio bytes.
+            await _ytPlayerUtils.playerResponseForPlayback(
+              track.id,
+              quality: _audioQuality,
+              isMetered: false,
             );
+            if (kDebugMode) {
+              print(
+                'AudioPlayerService: Prepared next-track URL metadata for ${track.id}',
+              );
+            }
+          } catch (e) {
+            if (kDebugMode) {
+              print(
+                'AudioPlayerService: URL metadata prefetch failed for ${track.id}: $e',
+              );
+            }
           }
-          await _precacheTrackAudioBytes(next.track, next.playbackData);
-          await _enforceAudioCacheLimit();
         }
       }
 
-      final workerCount = min(maxConcurrent, candidates.length);
+      final workerCount = min(
+        _effectivePrecacheConcurrency(),
+        candidates.length,
+      );
       await Future.wait(
-        List.generate(workerCount, (index) => worker(index + 1)),
+        List.generate(workerCount, (_) => worker()),
       );
     } finally {
       _isPrecachingAhead = false;
@@ -3137,7 +2873,9 @@ class AudioPlayerService {
           }
 
           // Fire and forget - just warm up the cache
-          _ytPlayerUtils.prefetchNext(nextTrack.id, quality: _audioQuality);
+          if (_streamCachePrecacheTrackCount > 0) {
+            _ytPlayerUtils.prefetchNext(nextTrack.id, quality: _audioQuality);
+          }
         }
         _schedulePrecacheAhead();
       }
@@ -4411,7 +4149,7 @@ class AudioPlayerService {
   int _automixIncomingIndex = -1;
   bool _automixSyncScheduled = false;
 
-  bool get _automixOn => AutomixService.instance.enabled && !_jamsModeEnabled;
+  bool get _automixOn => false;
 
   AudioPlayer _playerById(String id) =>
       _primaryPlayer.playerId == id ? _primaryPlayer : _secondaryPlayer;
@@ -4481,30 +4219,8 @@ class AudioPlayerService {
   /// The arm: queue entry [index] onto the spare player at [cueMs], silent
   /// and paused; the engine starts it at the blend.
   Future<void> _automixLoad(String playerId, int index, int cueMs) async {
-    if (index < 0 || index >= _queue.length) return;
-    final player = _playerById(playerId);
-    if (identical(player, _player)) return; // never load over the song
-    _automixMixing = true;
-    final track = _queue[index];
-    try {
-      final built = await _buildSourceForTrack(track);
-      await player.setLoopMode(_nativeLoopModeFor(_loopMode));
-      await _setVolumeSafely(player, 0.0, context: 'automix-arm');
-      await player.setAudioSource(
-        built.source,
-        initialPosition: Duration(milliseconds: cueMs),
-        preload: true,
-      );
-      _automixIncomingData = built.playbackData;
-      _automixIncomingIndex = index;
-      await AutomixService.instance.loaded(playerId, index);
-      if (kDebugMode) {
-        print('AudioPlayerService: Automix armed ${track.id} at ${cueMs}ms');
-      }
-    } catch (e) {
-      // The engine's arm deadline lapses and it carries on with no blend.
-      if (kDebugMode) print('AudioPlayerService: Automix arm failed: $e');
-    }
+    // Do not prepare or buffer an upcoming track before Next is requested.
+    return;
   }
 
   /// The blend's midpoint: the incoming player is the song now.
@@ -4578,40 +4294,8 @@ class AudioPlayerService {
   /// to analyse, whatever source is audible for it (lossless, JioSaavn) —
   /// the canonical copy BitChord analyses too.
   Future<void> fetchAnalysisAudio(String videoId) async {
-    final isCurrentTrack = _currentTrack?.id == videoId;
-    final track = isCurrentTrack
-        ? _currentTrack
-        : _queue.where((t) => t.id == videoId).firstOrNull;
-    if (track == null || _isLocalTrack(track)) return;
-
-    // Automix may request analysis audio for an upcoming track. Keep that
-    // request inside the same user-configured pre-cache policy: only the
-    // configured number of tracks, only after the selected progress point,
-    // and only on an allowed network. The current track's analysis/cache
-    // behavior remains unchanged.
-    if (!isCurrentTrack) {
-      final upcomingIndex = _queue.indexWhere((t) => t.id == videoId);
-      final upcomingOffset = upcomingIndex - _currentIndex;
-      if (upcomingOffset < 1 ||
-          upcomingOffset > _streamCachePrecacheTrackCount ||
-          !_hasReachedPrecacheStartThreshold() ||
-          !await _canPrecacheOnCurrentNetwork()) {
-        return;
-      }
-    }
-
-    try {
-      final result = await _ytPlayerUtils.playerResponseForPlayback(
-        videoId,
-        quality: _audioQuality,
-        isMetered: false,
-      );
-      final data = result.data;
-      if (!result.isSuccess || data == null) return;
-      await _precacheTrackAudioBytes(track, data);
-    } catch (e) {
-      if (kDebugMode) print('AudioPlayerService: Automix audio fetch failed: $e');
-    }
+    // Automix must not fetch separate audio for current or upcoming tracks.
+    return;
   }
 
   /// Starts the current player without waiting on it.
