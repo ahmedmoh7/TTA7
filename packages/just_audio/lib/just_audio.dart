@@ -2920,6 +2920,12 @@ class LockCachingAudioSource extends StreamAudioSource {
   final _requests = <_StreamingByteRangeRequest>[];
   final _downloadProgressSubject = BehaviorSubject<double>();
   bool _downloading = false;
+  Completer<bool>? _downloadCompletion;
+
+  /// Completes with true only after the final cache file has been committed.
+  /// This is useful to coordinate background pre-cache with later playback.
+  Future<bool> get downloadCompletion =>
+      _downloadCompletion?.future ?? Future<bool>.value(false);
 
   /// Creates a [LockCachingAudioSource] to that provides [uri] to the player
   /// while simultaneously caching it to [cacheFile]. If no cache file is
@@ -3012,6 +3018,8 @@ class LockCachingAudioSource extends StreamAudioSource {
   /// entire file continues in parallel.
   Future<HttpClientResponse> _fetch() async {
     _downloading = true;
+    final completion = Completer<bool>();
+    _downloadCompletion = completion;
     final cacheFile = await this.cacheFile;
     final partialCacheFile = await _partialCacheFile;
 
@@ -3172,6 +3180,7 @@ class LockCachingAudioSource extends StreamAudioSource {
       await subscription.cancel();
       httpClient.close();
       _downloading = false;
+      if (!completion.isCompleted) completion.complete(true);
     }, onError: (Object e, StackTrace stackTrace) async {
       (await _partialCacheFile).deleteSync();
       httpClient.close();
@@ -3186,6 +3195,7 @@ class LockCachingAudioSource extends StreamAudioSource {
         res.controller.close();
       }
       _downloading = false;
+      if (!completion.isCompleted) completion.complete(false);
     }, cancelOnError: true);
     return response;
   }
@@ -3213,6 +3223,10 @@ class LockCachingAudioSource extends StreamAudioSource {
       // Cancel any pending request
       for (final req in _requests) {
         req.fail(error, stackTrace);
+      }
+      final completion = _downloadCompletion;
+      if (completion != null && !completion.isCompleted) {
+        completion.complete(false);
       }
       return Future<HttpClientResponse>.error(error as Object, stackTrace);
     });
