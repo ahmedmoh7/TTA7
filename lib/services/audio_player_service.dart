@@ -4380,10 +4380,28 @@ class AudioPlayerService {
   /// to analyse, whatever source is audible for it (lossless, JioSaavn) —
   /// the canonical copy BitChord analyses too.
   Future<void> fetchAnalysisAudio(String videoId) async {
-    final track = _currentTrack?.id == videoId
+    final isCurrentTrack = _currentTrack?.id == videoId;
+    final track = isCurrentTrack
         ? _currentTrack
         : _queue.where((t) => t.id == videoId).firstOrNull;
     if (track == null || _isLocalTrack(track)) return;
+
+    // Automix may request analysis audio for an upcoming track. Keep that
+    // request inside the same user-configured pre-cache policy: only the
+    // configured number of tracks, only after the selected progress point,
+    // and only on an allowed network. The current track's analysis/cache
+    // behavior remains unchanged.
+    if (!isCurrentTrack) {
+      final upcomingIndex = _queue.indexWhere((t) => t.id == videoId);
+      final upcomingOffset = upcomingIndex - _currentIndex;
+      if (upcomingOffset < 1 ||
+          upcomingOffset > _streamCachePrecacheTrackCount ||
+          !_hasReachedPrecacheStartThreshold() ||
+          !await _canPrecacheOnCurrentNetwork()) {
+        return;
+      }
+    }
+
     try {
       final result = await _ytPlayerUtils.playerResponseForPlayback(
         videoId,
