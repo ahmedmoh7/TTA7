@@ -241,7 +241,7 @@ void main() {
         ),
         bytes.sublist(0, 4096),
       );
-      expect(await PartialAudioCacheStore(cacheFile).cacheBytesFor(cacheFile), 4096);
+      expect(await PartialAudioCacheStore.cacheBytesFor(cacheFile), 4096);
 
       await server.close();
       final offlineSource = PartialCachingAudioSource(
