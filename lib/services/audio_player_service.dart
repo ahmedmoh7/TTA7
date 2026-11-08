@@ -4074,9 +4074,16 @@ class AudioPlayerService {
     _activeSourcePlaybackDataByQueueIndex = <int, PlaybackData>{
       _currentIndex: saavnPlaybackData,
     };
-    final saavnSource = AudioSource.uri(
-      Uri.parse(saavnStream.streamUrl),
-      tag: track,
+    final saavnIdentity = saavnPlaybackData.audioSource;
+    final saavnSource = await _partialAudioSourceForTrack(
+      track,
+      saavnPlaybackData,
+      sourceIdentity: saavnIdentity,
+      representationKey: _audioCacheRepresentationKey(
+        track,
+        saavnPlaybackData,
+        sourceIdentity: saavnIdentity,
+      ),
     );
     await _player.setAudioSource(saavnSource, preload: true);
     if (_pendingSeekPosition != null && _pendingSeekTrackId == track.id) {
@@ -4353,6 +4360,25 @@ class AudioPlayerService {
         : AudioSource.uri(uri, tag: track);
   }
 
+  Future<AudioSource> _cachedAddonAudioSource(
+    AddonMatch match,
+    Track track,
+    PlaybackData playbackData,
+  ) async {
+    if (match.stream.isDash) return _addonAudioSource(match, track);
+    final sourceIdentity = playbackData.audioSource;
+    return _partialAudioSourceForTrack(
+      track,
+      playbackData,
+      sourceIdentity: sourceIdentity,
+      representationKey: _audioCacheRepresentationKey(
+        track,
+        playbackData,
+        sourceIdentity: sourceIdentity,
+      ),
+    );
+  }
+
   /// Starts [track] directly on its lossless copy.
   Future<void> _playAddonStream(
     AddonMatch match,
@@ -4365,7 +4391,8 @@ class AudioPlayerService {
       );
     }
     final playbackData = _addonPlaybackData(match);
-    await _player.setAudioSource(_addonAudioSource(match, track), preload: true);
+    final source = await _cachedAddonAudioSource(match, track, playbackData);
+    await _player.setAudioSource(source, preload: true);
     _currentPlaybackData = playbackData;
     _activeSourceQueueIndices = <int>[_currentIndex];
     _activeSourcePlaybackDataByQueueIndex = <int, PlaybackData>{
@@ -4515,10 +4542,16 @@ class AudioPlayerService {
         return;
       }
 
+      final addonPlaybackData = _addonPlaybackData(match);
+      final addonSource = await _cachedAddonAudioSource(
+        match,
+        track,
+        addonPlaybackData,
+      );
       final swapped = await _seamlessSwap(
         track: track,
-        source: _addonAudioSource(match, track),
-        playbackData: _addonPlaybackData(match),
+        source: addonSource,
+        playbackData: addonPlaybackData,
         stillWanted: stillWanted,
         // The second try parks further ahead: the first usually lost to a
         // slow network buffering the FLAC.
