@@ -219,6 +219,61 @@ void main() {
   );
 
   test(
+    'replays persisted partial ranges offline after creating a new source',
+    () async {
+      final bytes = List<int>.generate(16 * 1024, (i) => (i * 23) & 0xff);
+      final server = _RangeTestOrigin(bytes, supportsRange: true);
+      origins.add(server);
+      final key = 'track-offline-restart-v1';
+      final cacheFile = File('${tempDir.path}/track-offline_$key.audio');
+
+      final onlineSource = PartialCachingAudioSource(
+        origin: makeOrigin(await server.uri, key, bytes.length),
+        audioFile: cacheFile,
+        expectedLength: bytes.length,
+        rangeChunkBytes: 4096,
+      );
+      final onlineResponse = await onlineSource.request(0, 4096);
+      expect(
+        await onlineResponse.stream.fold<List<int>>(
+          <int>[],
+          (all, part) => all..addAll(part),
+        ),
+        bytes.sublist(0, 4096),
+      );
+      expect(await PartialAudioCacheStore(cacheFile).cacheBytesFor(cacheFile), 4096);
+
+      await server.close();
+      final offlineSource = PartialCachingAudioSource(
+        origin: PartialAudioOrigin(
+          uri: Uri.parse('http://127.0.0.1:1/never-contact'),
+          representationKey: key,
+          contentType: 'audio/mpeg',
+          contentLength: bytes.length,
+        ),
+        audioFile: cacheFile,
+        expectedLength: bytes.length,
+        rangeChunkBytes: 4096,
+        offlineOnly: true,
+      );
+
+      final offlineResponse = await offlineSource.request(0, 4096);
+      expect(
+        await offlineResponse.stream.fold<List<int>>(
+          <int>[],
+          (all, part) => all..addAll(part),
+        ),
+        bytes.sublist(0, 4096),
+      );
+      await expectLater(
+        offlineSource.request(4096, 8192),
+        throwsA(isA<HttpException>()),
+      );
+      expect(server.requests, <String?>['bytes=0-4095']);
+    },
+  );
+
+  test(
     'a 200/no-Range origin is streamed and cached progressively, not eagerly',
     () async {
       final bytes = List<int>.generate(5 * 1024 * 1024, (i) => i & 0xff);
