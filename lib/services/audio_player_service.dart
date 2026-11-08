@@ -1923,7 +1923,6 @@ class AudioPlayerService {
     if (_streamCachePrecacheTrackCount <= 0 ||
         !_hasReachedPrecacheStartThreshold() ||
         _precacheTriggeredForTrackId == _currentTrack?.id) return;
-    _precacheTriggeredForTrackId = _currentTrack?.id;
     _isPrecachingAhead = true;
     try {
       if (kDebugMode) {
@@ -1938,6 +1937,7 @@ class AudioPlayerService {
         }
         return;
       }
+      _precacheTriggeredForTrackId = _currentTrack?.id;
 
       final start = _currentIndex + 1;
       if (start >= _queue.length) {
