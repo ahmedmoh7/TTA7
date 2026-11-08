@@ -2038,7 +2038,8 @@ class AudioPlayerService {
 
     _precacheInProgress.add(track.id);
     _precacheCancellationRequested.remove(track.id);
-    _precacheCompletionByTrack[track.id] = Completer<void>();
+    final completionSignal = Completer<void>();
+    _precacheCompletionByTrack[track.id] = completionSignal;
     final tempFile = File('${cacheFile.path}.precache.part');
     HttpClient? client;
     IOSink? sink;
@@ -2230,8 +2231,10 @@ class AudioPlayerService {
       if (client != null) _precacheClientsByTrack[track.id]?.remove(client);
       _precacheClientsByTrack.remove(track.id);
       _precacheInProgress.remove(track.id);
-      final completion = _precacheCompletionByTrack.remove(track.id);
-      if (completion != null && !completion.isCompleted) completion.complete();
+      if (identical(_precacheCompletionByTrack[track.id], completionSignal)) {
+        _precacheCompletionByTrack.remove(track.id);
+      }
+      if (!completionSignal.isCompleted) completionSignal.complete();
       if (slotAcquired) {
         _releasePrecacheSlot();
       }
