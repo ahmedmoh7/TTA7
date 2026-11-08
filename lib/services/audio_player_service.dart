@@ -2132,8 +2132,12 @@ class AudioPlayerService {
             ? null
             : RegExp(r'^bytes\s+\*/(\d+)$').firstMatch(contentRange);
         final completeLength = int.tryParse(completeMatch?.group(1) ?? '');
+        final matchesKnownLength = expectedFromFormat == null ||
+            expectedFromFormat <= 0 ||
+            expectedFromFormat == completeLength;
         if (completeLength != null &&
             completeLength == savedBytes &&
+            matchesKnownLength &&
             savedBytes >= kMinValidStreamCacheFileBytes) {
           client.close(force: true);
           client = null;
@@ -2146,7 +2150,9 @@ class AudioPlayerService {
           }
           return;
         }
-        throw HttpException('HTTP 416; saved partial is not complete');
+        // A stale or oversized prefix cannot be resumed safely.
+        if (await tempFile.exists()) await tempFile.delete();
+        throw HttpException('HTTP 416; discarded invalid saved partial');
       }
 
       if (response.statusCode == 206) {
@@ -2311,6 +2317,12 @@ class AudioPlayerService {
         }
       }
 
+      final errorText = e.toString();
+      final invalidRangeResponse =
+          errorText.contains('Content-Range') || errorText.contains('HTTP 416');
+      if (invalidRangeResponse && await tempFile.exists()) {
+        await tempFile.delete();
+      }
       if (kDebugMode) {
         final partialSize = await tempFile.exists() ? await tempFile.length() : 0;
         print(
