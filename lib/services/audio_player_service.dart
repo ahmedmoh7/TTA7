@@ -1218,6 +1218,13 @@ class AudioPlayerService {
     return '$bytes B';
   }
 
+  String _formatTransferRate(double bytesPerSecond) {
+    if (bytesPerSecond >= 1024 * 1024) {
+      return '${(bytesPerSecond / 1024 / 1024).toStringAsFixed(2)} MB/s';
+    }
+    return '${(bytesPerSecond / 1024).toStringAsFixed(1)} KB/s';
+  }
+
   void _stopLiveCacheProgressLogger(String cachePath) {
     _liveCacheLogTimers.remove(cachePath)?.cancel();
     _liveCacheLastLoggedBytes.remove(cachePath);
