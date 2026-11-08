@@ -2201,6 +2201,12 @@ class AudioPlayerService {
 
         if (refreshed.isSuccess && refreshed.data != null) {
           _precacheInProgress.remove(track.id);
+          // Release the current slot before retrying recursively. Otherwise
+          // a concurrency limit of one can wait forever on its own slot.
+          if (slotAcquired) {
+            _releasePrecacheSlot();
+            slotAcquired = false;
+          }
           await _precacheTrackAudioBytes(
             track,
             refreshed.data!,
