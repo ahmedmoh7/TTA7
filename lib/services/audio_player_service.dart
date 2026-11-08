@@ -3119,6 +3119,8 @@ class AudioPlayerService {
     bool? streamCacheWifiOnly,
     int? streamCacheSizeLimitMb,
     int? streamCacheMaxConcurrent,
+    int? streamCachePrecacheTrackCount,
+    int? streamCachePrecacheStartPercent,
     int? crossfadeDurationMs,
     bool? showNerdStats,
     bool? jioSaavnEnabled,
@@ -3161,6 +3163,10 @@ class AudioPlayerService {
       streamCacheSizeLimitMb: streamCacheSizeLimitMb ?? _streamCacheSizeLimitMb,
       streamCacheMaxConcurrent:
           streamCacheMaxConcurrent ?? _streamCacheMaxConcurrent,
+      streamCachePrecacheTrackCount:
+          streamCachePrecacheTrackCount ?? _streamCachePrecacheTrackCount,
+      streamCachePrecacheStartPercent:
+          streamCachePrecacheStartPercent ?? _streamCachePrecacheStartPercent,
       crossfadeDurationMs: crossfadeDurationMs ?? _crossfadeDurationMs,
       showNerdStats: showNerdStats ?? _showNerdStats,
       jioSaavnEnabled: jioSaavnEnabled ?? _jioSaavnEnabled,
