@@ -45,8 +45,6 @@ const int kMaxCrossfadeDurationMs = 12000;
 const int kPrecacheAheadTrackCount = 3;
 const int kLyricsPrefetchAheadTrackCount = 4;
 const int kMinValidStreamCacheFileBytes = 50 * 1024;
-const int kParallelPrecacheMinBytes = 1024 * 1024;
-const int kParallelPrecachePartCount = 4;
 
 /// ConcatenatingAudioSource for gapless playback with pre-buffering
 /// This is the key to OuterTune's instant playback
@@ -411,6 +409,8 @@ class AudioPlayerService {
       'persisted_queue_duration_migrated_v1';
   final Connectivity _connectivity = Connectivity();
   final Set<String> _precacheInProgress = <String>{};
+  // Reuse the same source instance from background pre-cache during playback.
+  final Map<String, LockCachingAudioSource> _precacheSourcesByTrack = {};
   final Queue<Completer<void>> _precacheSlotWaiters = Queue<Completer<void>>();
   int _activePrecacheDownloads = 0;
   bool _isPrecachingAhead = false;
@@ -1218,207 +1218,6 @@ class AudioPlayerService {
     return '$bytes B';
   }
 
-  String _formatTransferRate(double bytesPerSecond) {
-    if (bytesPerSecond >= 1024 * 1024) {
-      return '${(bytesPerSecond / 1024 / 1024).toStringAsFixed(2)} MB/s';
-    }
-    return '${(bytesPerSecond / 1024).toStringAsFixed(1)} KB/s';
-  }
-
-  void _applyPrecacheRequestHeaders(HttpClientRequest request) {
-    request.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
-    // Same identity as the client that issued the URL (see streamHeadersFor).
-    final clientHeaders = InnerTubeClient.streamHeadersFor(request.uri);
-    request.headers.set(
-      HttpHeaders.userAgentHeader,
-      clientHeaders['User-Agent'] ??
-          InnerTubeClient.androidVr165.userAgent,
-    );
-    clientHeaders.forEach((key, value) {
-      if (key != 'User-Agent') request.headers.set(key, value);
-    });
-    request.headers.set(HttpHeaders.acceptHeader, '*/*');
-  }
-
-  Future<int?> _downloadWithParallelRanges({
-    required Track track,
-    required Uri streamUri,
-    required File tempFile,
-    required int expectedBytes,
-  }) async {
-    if (expectedBytes < kParallelPrecacheMinBytes) {
-      return null;
-    }
-
-    final partCount = min(
-      kParallelPrecachePartCount,
-      max(2, expectedBytes ~/ (512 * 1024)),
-    );
-
-    final parts = <({int start, int end, File file})>[];
-    int cursor = 0;
-    final basePartSize = expectedBytes ~/ partCount;
-    final remainder = expectedBytes % partCount;
-    for (int i = 0; i < partCount; i++) {
-      final partSize = basePartSize + (i < remainder ? 1 : 0);
-      final start = cursor;
-      final end = start + partSize - 1;
-      cursor = end + 1;
-      parts.add((
-        start: start,
-        end: end,
-        file: File('${tempFile.path}.seg$i.part'),
-      ));
-    }
-
-    if (kDebugMode) {
-      print(
-        'AudioPlayerService: Trying parallel part pre-cache for ${track.id} '
-        '(${_formatBytes(expectedBytes)}, parts=$partCount)',
-      );
-    }
-
-    int downloadedBytes = 0;
-    int nextProgressLogPercent = 10;
-    final downloadTimer = Stopwatch()..start();
-    int speedSampleBytes = 0;
-    int speedSampleMs = 0;
-
-    String sampleSpeed() {
-      final nowMs = downloadTimer.elapsedMilliseconds;
-      final elapsedMs = max(1, nowMs - speedSampleMs);
-      final deltaBytes = max(0, downloadedBytes - speedSampleBytes);
-      speedSampleBytes = downloadedBytes;
-      speedSampleMs = nowMs;
-      return _formatTransferRate(deltaBytes * 1000 / elapsedMs);
-    }
-
-    void maybeLogProgress() {
-      if (!kDebugMode) return;
-      final progress = ((downloadedBytes / expectedBytes) * 100).clamp(
-        0.0,
-        100.0,
-      );
-      if (progress < nextProgressLogPercent) return;
-      final speed = sampleSpeed();
-      debugPrint(
-        'AudioPlayerService: Parallel pre-cache progress ${track.id} '
-        '${progress.toStringAsFixed(1)}% '
-        '(${_formatBytes(downloadedBytes)} / ${_formatBytes(expectedBytes)} @ $speed)',
-      );
-      while (progress >= nextProgressLogPercent) {
-        nextProgressLogPercent += 10;
-      }
-    }
-
-    Future<void> cleanupParts() async {
-      for (final part in parts) {
-        if (await part.file.exists()) {
-          await part.file.delete();
-        }
-      }
-    }
-
-    try {
-      for (final part in parts) {
-        if (await part.file.exists()) {
-          await part.file.delete();
-        }
-      }
-
-      Future<void> downloadPart(({int start, int end, File file}) part) async {
-        HttpClient? partClient;
-        IOSink? partSink;
-        try {
-          partClient = HttpClient()
-            ..connectionTimeout = const Duration(seconds: 20);
-          final request = await partClient.getUrl(streamUri);
-          _applyPrecacheRequestHeaders(request);
-          request.headers.set(
-            HttpHeaders.rangeHeader,
-            'bytes=${part.start}-${part.end}',
-          );
-
-          final response = await request.close();
-          if (response.statusCode != 206) {
-            throw HttpException(
-              'Range request returned HTTP ${response.statusCode}',
-            );
-          }
-
-          partSink = part.file.openWrite(mode: FileMode.writeOnly);
-          int partBytes = 0;
-          await for (final chunk in response) {
-            partSink.add(chunk);
-            partBytes += chunk.length;
-            downloadedBytes += chunk.length;
-            maybeLogProgress();
-          }
-          await partSink.flush();
-          await partSink.close();
-          partSink = null;
-
-          final expectedPartBytes = part.end - part.start + 1;
-          if (partBytes != expectedPartBytes) {
-            throw FormatException(
-              'Range part size mismatch ($partBytes vs $expectedPartBytes)',
-            );
-          }
-        } finally {
-          if (partSink != null) {
-            await partSink.close();
-          }
-          partClient?.close(force: true);
-        }
-      }
-
-      await Future.wait(parts.map(downloadPart));
-
-      if (await tempFile.exists()) {
-        await tempFile.delete();
-      }
-      final mergeSink = tempFile.openWrite(mode: FileMode.writeOnly);
-      try {
-        for (final part in parts) {
-          await mergeSink.addStream(part.file.openRead());
-        }
-        await mergeSink.flush();
-      } finally {
-        await mergeSink.close();
-      }
-
-      final mergedBytes = await tempFile.length();
-      if (mergedBytes != expectedBytes) {
-        throw FormatException(
-          'Merged range file size mismatch ($mergedBytes vs $expectedBytes)',
-        );
-      }
-
-      final elapsedMs = max(1, downloadTimer.elapsedMilliseconds);
-      final avgSpeed = _formatTransferRate(mergedBytes * 1000 / elapsedMs);
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Parallel pre-cache complete ${track.id} '
-          '(${_formatBytes(mergedBytes)}, avg $avgSpeed, parts=$partCount)',
-        );
-      }
-
-      await cleanupParts();
-      return mergedBytes;
-    } catch (e) {
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Parallel pre-cache fallback for ${track.id}: $e',
-        );
-      }
-      await cleanupParts();
-      if (await tempFile.exists()) {
-        await tempFile.delete();
-      }
-      return null;
-    }
-  }
-
   void _stopLiveCacheProgressLogger(String cachePath) {
     _liveCacheLogTimers.remove(cachePath)?.cancel();
     _liveCacheLastLoggedBytes.remove(cachePath);
@@ -1711,6 +1510,17 @@ class AudioPlayerService {
       return AudioSource.uri(streamUri, headers: headers, tag: track);
     }
 
+    // Reuse the exact source instance already downloading this track.
+    final precachingSource = _precacheSourcesByTrack[track.id];
+    if (precachingSource != null) {
+      if (kDebugMode) {
+        print(
+          'AudioPlayerService: Reusing in-flight pre-cache source for ${track.id}',
+        );
+      }
+      return precachingSource;
+    }
+
     if (!_allowProxyCachingSource) {
       _stopLiveCacheProgressLogger(cacheFile.path);
       if (preferDirectStreamWithBackgroundPrecache) {
@@ -1972,7 +1782,6 @@ class AudioPlayerService {
     bool allowDnsRetry = true,
   }) async {
     if (kIsWeb) return;
-    // Never try to download a live/manifest stream to a file — it's endless.
     if (playbackData.isLive || playbackData.isManifestStream) return;
     if (_precacheInProgress.contains(track.id)) return;
 
@@ -1981,33 +1790,18 @@ class AudioPlayerService {
       final existingSize = await cacheFile.length();
       if (existingSize >= kMinValidStreamCacheFileBytes) {
         _stopLiveCacheProgressLogger(cacheFile.path);
-        final expectedBytes = playbackData.format.contentLength;
-        if (kDebugMode) {
-          if (expectedBytes != null && expectedBytes > 0) {
-            final progress = ((existingSize / expectedBytes) * 100).clamp(
-              0.0,
-              100.0,
-            );
-            print(
-              'AudioPlayerService: Pre-cache skipped, already cached ${track.id} '
-              '(${_formatBytes(existingSize)} / ${_formatBytes(expectedBytes)}, ${progress.toStringAsFixed(1)}%)',
-            );
-          } else {
-            print(
-              'AudioPlayerService: Pre-cache skipped, already cached ${track.id} '
-              '(${_formatBytes(existingSize)})',
-            );
-          }
-        }
         await _touchCacheFile(cacheFile);
         _offerToAutomix(track, cacheFile.path);
+        if (kDebugMode) {
+          print('AudioPlayerService: Pre-cache skipped, already cached ' + track.id + ' (' + _formatBytes(existingSize) + ')');
+        }
         return;
       }
       await _deleteAudioCacheArtifact(cacheFile);
     }
 
     await _acquirePrecacheSlot();
-    bool slotAcquired = true;
+    var slotAcquired = true;
     if (_precacheInProgress.contains(track.id)) {
       _releasePrecacheSlot();
       slotAcquired = false;
@@ -2015,191 +1809,79 @@ class AudioPlayerService {
     }
 
     _precacheInProgress.add(track.id);
-    final tempFile = File('${cacheFile.path}.precache.part');
-    HttpClient? client;
-    IOSink? sink;
-    int downloadedBytes = 0;
+    final streamUri = Uri.parse(playbackData.streamUrl);
+    final streamHeaders = InnerTubeClient.streamHeadersFor(streamUri);
+    final headers = streamHeaders.isEmpty ? null : streamHeaders;
+    // The exact same source object is attached to the player if selected.
+    // ignore: experimental_member_use
+    final source = LockCachingAudioSource(
+      streamUri,
+      cacheFile: cacheFile,
+      headers: headers,
+      tag: track,
+    );
+    _precacheSourcesByTrack[track.id] = source;
+
     try {
-      client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-      final request = await client.getUrl(Uri.parse(playbackData.streamUrl));
-      _applyPrecacheRequestHeaders(request);
-      HttpClientResponse response = await request.close();
-      if (response.statusCode != 200 && response.statusCode != 206) {
-        throw HttpException('HTTP ${response.statusCode}');
+      if (kDebugMode) {
+        final expectedBytes = playbackData.format.contentLength;
+        final target = expectedBytes != null && expectedBytes > 0
+            ? ' (' + _formatBytes(expectedBytes) + ')'
+            : '';
+        print('AudioPlayerService: Shared pre-cache started for ' + track.id + target);
       }
-      final responseContentLength = response.contentLength;
-      int? expectedBytes = responseContentLength > 0
-          ? responseContentLength
-          : playbackData.format.contentLength;
-
-      if (await tempFile.exists()) {
-        await tempFile.delete();
+      final response = await source.request();
+      await for (final chunk in response.stream) {
+        if (chunk.isEmpty) continue;
       }
-
-      bool usedParallelDownload = false;
-      if (expectedBytes != null && expectedBytes >= kParallelPrecacheMinBytes) {
-        client.close(force: true);
-        client = null;
-        final parallelBytes = await _downloadWithParallelRanges(
-          track: track,
-          streamUri: Uri.parse(playbackData.streamUrl),
-          tempFile: tempFile,
-          expectedBytes: expectedBytes,
-        );
-        if (parallelBytes != null) {
-          downloadedBytes = parallelBytes;
-          usedParallelDownload = true;
-        } else {
-          client = HttpClient()
-            ..connectionTimeout = const Duration(seconds: 20);
-          final fallbackRequest = await client.getUrl(
-            Uri.parse(playbackData.streamUrl),
-          );
-          _applyPrecacheRequestHeaders(fallbackRequest);
-          response = await fallbackRequest.close();
-          if (response.statusCode != 200 && response.statusCode != 206) {
-            throw HttpException('HTTP ${response.statusCode}');
-          }
-          if (response.contentLength > 0) {
-            expectedBytes = response.contentLength;
-          }
-        }
+      final completed = await source.downloadCompletion;
+      if (!completed) {
+        throw const HttpException('Shared pre-cache download did not complete');
       }
 
-      if (!usedParallelDownload) {
-        sink = tempFile.openWrite(mode: FileMode.writeOnly);
-
-        int nextProgressLogPercent = 10;
-        int nextProgressLogBytes = 2 * 1024 * 1024;
-        final downloadTimer = Stopwatch()..start();
-        int speedSampleBytes = 0;
-        int speedSampleMs = 0;
-
-        String sampleSpeed() {
-          final nowMs = downloadTimer.elapsedMilliseconds;
-          final elapsedMs = max(1, nowMs - speedSampleMs);
-          final deltaBytes = max(0, downloadedBytes - speedSampleBytes);
-          speedSampleBytes = downloadedBytes;
-          speedSampleMs = nowMs;
-          return _formatTransferRate(deltaBytes * 1000 / elapsedMs);
-        }
-
-        if (kDebugMode) {
-          if (expectedBytes != null && expectedBytes > 0) {
-            print(
-              'AudioPlayerService: Pre-cache started for ${track.id} '
-              '(target ${_formatBytes(expectedBytes)})',
-            );
-          } else {
-            print('AudioPlayerService: Pre-cache started for ${track.id}');
-          }
-        }
-
-        await for (final chunk in response) {
-          sink.add(chunk);
-          downloadedBytes += chunk.length;
-          if (kDebugMode) {
-            if (expectedBytes != null && expectedBytes > 0) {
-              final progress = ((downloadedBytes / expectedBytes) * 100).clamp(
-                0.0,
-                100.0,
-              );
-              if (progress >= nextProgressLogPercent) {
-                final speed = sampleSpeed();
-                print(
-                  'AudioPlayerService: Pre-cache progress ${track.id} '
-                  '${progress.toStringAsFixed(1)}% '
-                  '(${_formatBytes(downloadedBytes)} / ${_formatBytes(expectedBytes)} @ $speed)',
-                );
-                while (progress >= nextProgressLogPercent) {
-                  nextProgressLogPercent += 10;
-                }
-              }
-            } else if (downloadedBytes >= nextProgressLogBytes) {
-              final speed = sampleSpeed();
-              print(
-                'AudioPlayerService: Pre-cache progress ${track.id} '
-                '${_formatBytes(downloadedBytes)} (total size unknown @ $speed)',
-              );
-              nextProgressLogBytes += 2 * 1024 * 1024;
-            }
-          }
-        }
-        await sink.flush();
-        await sink.close();
-        sink = null;
+      final cached = await cacheFile.exists();
+      final cachedBytes = cached ? await cacheFile.length() : 0;
+      if (!cached || cachedBytes < kMinValidStreamCacheFileBytes) {
+        throw const FormatException('Shared pre-cache file too small or missing');
       }
-
-      if (downloadedBytes < kMinValidStreamCacheFileBytes) {
-        throw const FormatException('Pre-cache file too small');
-      }
-
-      if (await cacheFile.exists()) {
-        await cacheFile.delete();
-      }
-      await tempFile.rename(cacheFile.path);
       await _touchCacheFile(cacheFile);
-      // A whole YouTube file is what Automix analyses this track from.
       _offerToAutomix(track, cacheFile.path);
       _stopLiveCacheProgressLogger(cacheFile.path);
       if (kDebugMode) {
-        if (expectedBytes != null && expectedBytes > 0) {
-          final progress = ((downloadedBytes / expectedBytes) * 100).clamp(
-            0.0,
-            100.0,
-          );
-          print(
-            'AudioPlayerService: Pre-cached ${track.id} '
-            '(${_formatBytes(downloadedBytes)} / ${_formatBytes(expectedBytes)}, ${progress.toStringAsFixed(1)}%)',
-          );
-        } else {
-          print(
-            'AudioPlayerService: Pre-cached ${track.id} (${_formatBytes(downloadedBytes)})',
-          );
-        }
+        print('AudioPlayerService: Shared pre-cache complete ' + track.id + ' (' + _formatBytes(cachedBytes) + ')');
       }
     } catch (e) {
       if (allowDnsRetry && _isHostLookupError(e)) {
         if (kDebugMode) {
-          print(
-            'AudioPlayerService: DNS lookup failed for ${track.id}, refreshing URL and retrying pre-cache once',
-          );
+          print('AudioPlayerService: DNS lookup failed for ' + track.id + ', refreshing URL and retrying shared pre-cache once');
         }
-
-        // Cached stream URL can become unreachable after network/DNS changes.
         _ytPlayerUtils.clearCache(track.id);
         final refreshed = await _ytPlayerUtils.playerResponseForPlayback(
           track.id,
           quality: _audioQuality,
-          isMetered: !_onUnmeteredNetwork,
+          isMetered: false,
         );
-
         if (refreshed.isSuccess && refreshed.data != null) {
+          _precacheSourcesByTrack.remove(track.id);
+          await _deleteAudioCacheArtifact(cacheFile);
           _precacheInProgress.remove(track.id);
-          await _precacheTrackAudioBytes(
-            track,
-            refreshed.data!,
-            allowDnsRetry: false,
-          );
+          if (slotAcquired) {
+            _releasePrecacheSlot();
+            slotAcquired = false;
+          }
+          await _precacheTrackAudioBytes(track, refreshed.data!, allowDnsRetry: false);
           return;
         }
       }
-
       if (kDebugMode) {
-        print('AudioPlayerService: Failed to pre-cache ${track.id}: $e');
+        print('AudioPlayerService: Failed shared pre-cache for ' + track.id + ': ' + e.toString());
       }
-      if (sink != null) {
-        await sink.close();
-      }
-      if (await tempFile.exists()) {
-        await tempFile.delete();
-      }
+      _precacheSourcesByTrack.remove(track.id);
+      await _deleteAudioCacheArtifact(cacheFile);
     } finally {
-      client?.close(force: true);
+      _precacheSourcesByTrack.remove(track.id);
       _precacheInProgress.remove(track.id);
-      if (slotAcquired) {
-        _releasePrecacheSlot();
-      }
+      if (slotAcquired) _releasePrecacheSlot();
     }
   }
 
