@@ -49,7 +49,6 @@ const List<int> kStreamCachePrecacheStartPercentOptions = [10, 20, 30, 40];
 const int kDefaultCrossfadeDurationMs = 8000;
 const int kMinCrossfadeDurationMs = 0;
 const int kMaxCrossfadeDurationMs = 12000;
-const int kPrecacheAheadTrackCount = 3;
 const int kLyricsPrefetchAheadTrackCount = 4;
 const int kMinValidStreamCacheFileBytes = 50 * 1024;
 const int kParallelPrecacheMinBytes = 1024 * 1024;
@@ -1937,8 +1936,6 @@ class AudioPlayerService {
         }
         return;
       }
-      _precacheTriggeredForTrackId = _currentTrack?.id;
-
       final start = _currentIndex + 1;
       if (start >= _queue.length) {
         if (kDebugMode) {
@@ -1946,6 +1943,7 @@ class AudioPlayerService {
         }
         return;
       }
+      _precacheTriggeredForTrackId = _currentTrack?.id;
       final maxConcurrent = _effectivePrecacheConcurrency();
       final candidateLimit = _streamCachePrecacheTrackCount;
       final end = min(_queue.length, start + candidateLimit);
