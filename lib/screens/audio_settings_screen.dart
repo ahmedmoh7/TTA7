@@ -41,6 +41,12 @@ class AudioSettingsScreen extends ConsumerWidget {
     final streamCacheMaxConcurrent = ref.watch(
       streamCacheMaxConcurrentProvider,
     );
+    final streamCachePrecacheTrackCount = ref.watch(
+      streamCachePrecacheTrackCountProvider,
+    );
+    final streamCachePrecacheStartPercent = ref.watch(
+      streamCachePrecacheStartPercentProvider,
+    );
     final crossfadeDurationMs = ref.watch(crossfadeDurationMsProvider);
     final streamCacheUsageAsync = ref.watch(streamAudioCacheUsageBytesProvider);
     final jioSaavnEnabled = ref.watch(jioSaavnEnabledProvider);
@@ -349,6 +355,8 @@ class AudioSettingsScreen extends ConsumerWidget {
             wifiOnly: streamCacheWifiOnly,
             cacheLimitMb: streamCacheLimitMb,
             maxConcurrent: streamCacheMaxConcurrent,
+            precacheTrackCount: streamCachePrecacheTrackCount,
+            precacheStartPercent: streamCachePrecacheStartPercent,
             usageAsync: streamCacheUsageAsync,
             onWifiOnlyChanged: (enabled) async {
               await playerService.setStreamCacheWifiOnly(enabled);
@@ -360,6 +368,12 @@ class AudioSettingsScreen extends ConsumerWidget {
             },
             onMaxConcurrentChanged: (value) async {
               await playerService.setStreamCacheMaxConcurrent(value);
+            },
+            onPrecacheTrackCountChanged: (value) async {
+              await playerService.setStreamCachePrecacheTrackCount(value);
+            },
+            onPrecacheStartPercentChanged: (value) async {
+              await playerService.setStreamCachePrecacheStartPercent(value);
             },
           ),
 
@@ -835,13 +849,19 @@ class AudioSettingsScreen extends ConsumerWidget {
     required bool wifiOnly,
     required int cacheLimitMb,
     required int maxConcurrent,
+    required int precacheTrackCount,
+    required int precacheStartPercent,
     required AsyncValue<int> usageAsync,
     required Future<void> Function(bool enabled) onWifiOnlyChanged,
     required Future<void> Function(int limitMb) onCacheLimitChanged,
     required Future<void> Function(int value) onMaxConcurrentChanged,
+    required Future<void> Function(int value) onPrecacheTrackCountChanged,
+    required Future<void> Function(int value) onPrecacheStartPercentChanged,
   }) {
     const cacheLimitOptions = [256, 512, 1024, 2048, 4096];
     const concurrencyOptions = [1, 2, 3, 4];
+    const precacheTrackCountOptions = [0, 1, 2, 3, 4];
+    const precachePercentOptions = [10, 20, 30, 40];
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -966,7 +986,7 @@ class AudioSettingsScreen extends ConsumerWidget {
           ),
           const SizedBox(height: 16),
           Text(
-            context.l10n.concurrentPreCacheDownloads,
+            context.l10n.preCacheUpcomingTrackCount,
             style: TextStyle(
               fontSize: 14,
               fontWeight: FontWeight.w600,
@@ -977,7 +997,91 @@ class AudioSettingsScreen extends ConsumerWidget {
           Wrap(
             spacing: 8,
             runSpacing: 8,
-            children: concurrencyOptions.map((option) {
+            children: precacheTrackCountOptions.map((option) {
+              final selected = option == precacheTrackCount;
+              return ChoiceChip(
+                selected: selected,
+                label: Text(option.toString()),
+                selectedColor: accentColor,
+                labelStyle: TextStyle(
+                  color: selected
+                      ? InzxColors.contrastTextOn(accentColor)
+                      : (isDark ? Colors.white : InzxColors.textPrimary),
+                ),
+                onSelected: (picked) {
+                  if (picked) onPrecacheTrackCountChanged(option);
+                },
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            context.l10n.preCacheUpcomingTrackCountHint,
+            style: TextStyle(
+              fontSize: 12,
+              color: isDark ? Colors.white54 : InzxColors.textSecondary,
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            context.l10n.preCacheStartAtPercent,
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: isDark ? Colors.white : InzxColors.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: precachePercentOptions.map((option) {
+              final selected = option == precacheStartPercent;
+              return ChoiceChip(
+                selected: selected,
+                label: Text('$option%'),
+                selectedColor: accentColor,
+                labelStyle: TextStyle(
+                  color: selected
+                      ? InzxColors.contrastTextOn(accentColor)
+                      : (isDark ? Colors.white : InzxColors.textPrimary),
+                ),
+                onSelected: precacheTrackCount == 0
+                    ? null
+                    : (picked) {
+                        if (picked) onPrecacheStartPercentChanged(option);
+                      },
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            precacheTrackCount == 0
+                ? context.l10n.preCacheStartDisabledHint
+                : context.l10n.preCacheStartAtPercentHint,
+            style: TextStyle(
+              fontSize: 12,
+              color: isDark ? Colors.white54 : InzxColors.textSecondary,
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            context.l10n.concurrentPreCacheDownloads,
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: isDark ? Colors.white : InzxColors.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Opacity(
+            opacity: precacheTrackCount == 0 ? 0.45 : 1,
+            child: IgnorePointer(
+              ignoring: precacheTrackCount == 0,
+              child: Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: concurrencyOptions.map((option) {
               final selected = option == maxConcurrent;
               return ChoiceChip(
                 selected: selected,
@@ -994,11 +1098,15 @@ class AudioSettingsScreen extends ConsumerWidget {
                   }
                 },
               );
-            }).toList(),
+                }).toList(),
+              ),
+            ),
           ),
           const SizedBox(height: 8),
           Text(
-            context.l10n.higherValuesCacheFaster,
+            precacheTrackCount == 0
+                ? context.l10n.concurrentPreCacheDisabledHint
+                : context.l10n.higherValuesCacheFaster,
             style: TextStyle(
               fontSize: 12,
               color: isDark ? Colors.white54 : InzxColors.textSecondary,
