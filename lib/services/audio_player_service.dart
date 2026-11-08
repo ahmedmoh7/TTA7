@@ -413,6 +413,7 @@ class AudioPlayerService {
   final Set<String> _precacheInProgress = <String>{};
   final Map<String, Set<HttpClient>> _precacheClientsByTrack = {};
   final Map<String, Completer<void>> _precacheCompletionByTrack = {};
+  final Set<String> _precacheCancellationRequested = <String>{};
   final Queue<Completer<void>> _precacheSlotWaiters = Queue<Completer<void>>();
   int _activePrecacheDownloads = 0;
   bool _isPrecachingAhead = false;
@@ -1249,6 +1250,9 @@ class AudioPlayerService {
     required File tempFile,
     required int expectedBytes,
   }) async {
+    if (_precacheCancellationRequested.contains(track.id)) {
+      throw const HttpException('Pre-cache cancelled for playback');
+    }
     if (expectedBytes < kParallelPrecacheMinBytes) {
       return null;
     }
@@ -1422,6 +1426,9 @@ class AudioPlayerService {
       if (await tempFile.exists()) {
         await tempFile.delete();
       }
+      if (_precacheCancellationRequested.contains(track.id)) {
+        throw const HttpException('Pre-cache cancelled for playback');
+      }
       return null;
     }
   }
@@ -1568,6 +1575,7 @@ class AudioPlayerService {
   }
 
   Future<void> _cancelPrecacheForPlayback(String trackId) async {
+    _precacheCancellationRequested.add(trackId);
     final clients =
         _precacheClientsByTrack[trackId]?.toList() ?? const <HttpClient>[];
     for (final client in clients) {
@@ -1575,6 +1583,7 @@ class AudioPlayerService {
     }
     final completion = _precacheCompletionByTrack[trackId];
     if (completion != null) await completion.future;
+    _precacheCancellationRequested.remove(trackId);
   }
 
   Future<void> _touchCacheFile(File file) async {
@@ -2028,6 +2037,7 @@ class AudioPlayerService {
     }
 
     _precacheInProgress.add(track.id);
+    _precacheCancellationRequested.remove(track.id);
     _precacheCompletionByTrack[track.id] = Completer<void>();
     final tempFile = File('${cacheFile.path}.precache.part');
     HttpClient? client;
@@ -2065,6 +2075,9 @@ class AudioPlayerService {
           downloadedBytes = parallelBytes;
           usedParallelDownload = true;
         } else {
+          if (_precacheCancellationRequested.contains(track.id)) {
+            throw const HttpException('Pre-cache cancelled for playback');
+          }
           client = HttpClient()
             ..connectionTimeout = const Duration(seconds: 20);
           (_precacheClientsByTrack[track.id] ??= <HttpClient>{}).add(client);
@@ -2175,7 +2188,9 @@ class AudioPlayerService {
         }
       }
     } catch (e) {
-      if (allowDnsRetry && _isHostLookupError(e)) {
+      if (!_precacheCancellationRequested.contains(track.id) &&
+          allowDnsRetry &&
+          _isHostLookupError(e)) {
         if (kDebugMode) {
           print(
             'AudioPlayerService: DNS lookup failed for ${track.id}, refreshing URL and retrying pre-cache once',
@@ -2201,7 +2216,7 @@ class AudioPlayerService {
         }
       }
 
-      if (kDebugMode) {
+      if (!_precacheCancellationRequested.contains(track.id) && kDebugMode) {
         print('AudioPlayerService: Failed to pre-cache ${track.id}: $e');
       }
       if (sink != null) {
