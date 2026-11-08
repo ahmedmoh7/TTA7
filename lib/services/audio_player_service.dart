@@ -1827,6 +1827,66 @@ class AudioPlayerService {
     );
   }
 
+  /// Finds the best persisted cache for a track without requiring a stream URL.
+  /// A complete cache is opened as a normal file; a sparse cache is exposed as
+  /// an offline-only source that can serve cached ranges but never fetch gaps.
+  Future<AudioSource?> _offlineCachedSourceForTrack(Track track) async {
+    if (kIsWeb) return null;
+    final cacheDir = await _getStreamAudioCacheDir(create: false);
+    if (!await cacheDir.exists()) return null;
+
+    final prefix = '${_sanitizeCacheKey(track.id)}_';
+    final candidates = <({
+      File file,
+      PartialAudioCacheStore store,
+      PartialAudioCacheSnapshot snapshot,
+    })>[];
+
+    await for (final entity in cacheDir.list(followLinks: false)) {
+      if (entity is! File || !entity.path.endsWith('.audio')) continue;
+      final name = entity.uri.pathSegments.isEmpty
+          ? entity.path
+          : entity.uri.pathSegments.last;
+      if (!name.startsWith(prefix)) continue;
+
+      final store = PartialAudioCacheStore(entity);
+      final snapshot = await store.snapshot();
+      if (snapshot == null) continue;
+      candidates.add((file: entity, store: store, snapshot: snapshot));
+    }
+
+    if (candidates.isEmpty) return null;
+    candidates.sort((a, b) {
+      final byBytes = b.snapshot.cachedBytes.compareTo(a.snapshot.cachedBytes);
+      if (byBytes != 0) return byBytes;
+      return b.snapshot.lastAccessMs.compareTo(a.snapshot.lastAccessMs);
+    });
+
+    final best = candidates.first;
+    final totalLength = best.snapshot.totalLength;
+    if (totalLength != null && await best.store.isComplete(totalLength)) {
+      await best.store.touch();
+      return AudioSource.uri(Uri.file(best.file.path), tag: track);
+    }
+
+    final contentType = best.snapshot.contentType.isEmpty
+        ? 'audio/mpeg'
+        : best.snapshot.contentType;
+    return PartialCachingAudioSource(
+      origin: PartialAudioOrigin(
+        // This URI is never contacted while offlineOnly is true.
+        uri: Uri.parse('http://127.0.0.1/offline-cache'),
+        representationKey: best.file.uri.path,
+        contentType: contentType,
+        contentLength: totalLength,
+      ),
+      audioFile: best.file,
+      expectedLength: totalLength,
+      offlineOnly: true,
+      tag: track,
+    );
+  }
+
   AudioSource _directAudioSourceForTrack(
     Track track,
     PlaybackData playbackData,
@@ -2299,6 +2359,12 @@ class AudioPlayerService {
 
         if (refreshed.isSuccess && refreshed.data != null) {
           _precacheInProgress.remove(track.id);
+          // Release this slot before recursively retrying; otherwise a
+          // single-download configuration would wait on its own slot.
+          if (slotAcquired) {
+            _releasePrecacheSlot();
+            slotAcquired = false;
+          }
           await _precacheTrackAudioBytes(
             track,
             refreshed.data!,
@@ -3984,6 +4050,54 @@ class AudioPlayerService {
             'AudioPlayerService: Failed to get stream URL: ${ytResult.error}',
           );
         }
+
+        // A partial stream cache survives app restarts. Try it before any
+        // secondary online provider so already-heard bytes remain replayable
+        // when the device has no network connection.
+        final offlineSource = await _offlineCachedSourceForTrack(_currentTrack!);
+        if (offlineSource != null) {
+          try {
+            await _player.setAudioSource(offlineSource, preload: true);
+            _activeSourceQueueIndices = <int>[_currentIndex];
+            _activeSourcePlaybackDataByQueueIndex =
+                const <int, PlaybackData>{};
+
+            if (_pendingSeekPosition != null &&
+                _pendingSeekTrackId == _currentTrack!.id) {
+              try {
+                await _player.seek(_pendingSeekPosition);
+              } catch (_) {
+                // If the saved position is outside cached ranges, replay from
+                // the beginning of the locally available portion instead.
+                await _player.seek(Duration.zero);
+              }
+              _positionController.add(_player.position);
+              _updateState(position: _player.position);
+              _pendingSeekPosition = null;
+              _pendingSeekTrackId = null;
+            }
+
+            _startPlayback();
+            _updateState(
+              isLoading: false,
+              error: null,
+              resetCurrentPlaybackData: true,
+            );
+            if (kDebugMode) {
+              print(
+                'AudioPlayerService: Replaying cached audio offline for ${_currentTrack!.id}',
+              );
+            }
+            return;
+          } catch (e) {
+            if (kDebugMode) {
+              print(
+                'AudioPlayerService: Offline cache could not satisfy playback: $e',
+              );
+            }
+          }
+        }
+
         // Fallback: If YouTube failed, wait up to 4s for JioSaavn
         if (saavnFuture != null) {
           try {
