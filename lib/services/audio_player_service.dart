@@ -1931,6 +1931,9 @@ class AudioPlayerService {
       }
       final onWifi = await _isConnectedToWifi();
       if (_streamCacheWifiOnly && !onWifi) {
+        // Avoid repeating a connectivity check on every position update.
+        // _watchNetworkType clears this marker when Wi-Fi becomes available.
+        _precacheTriggeredForTrackId = _currentTrack?.id;
         if (kDebugMode) {
           print('AudioPlayerService: Skipping pre-cache (not on Wi-Fi)');
         }
@@ -2470,8 +2473,18 @@ class AudioPlayerService {
   Future<void> _watchNetworkType() async {
     _onUnmeteredNetwork = await _isConnectedToWifi();
     _connectivity.onConnectivityChanged.listen((connections) {
+      final wasOnUnmeteredNetwork = _onUnmeteredNetwork;
       _onUnmeteredNetwork = connections.contains(ConnectivityResult.wifi) ||
           connections.contains(ConnectivityResult.ethernet);
+      if (!wasOnUnmeteredNetwork &&
+          _onUnmeteredNetwork &&
+          _streamCacheWifiOnly) {
+        // A Wi-Fi-only pre-cache pass may have been deferred. Retry once
+        // when the network becomes eligible instead of checking every
+        // playback-position tick while on mobile data.
+        _precacheTriggeredForTrackId = null;
+        _schedulePrecacheAhead();
+      }
     });
   }
 
