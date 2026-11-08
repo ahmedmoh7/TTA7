@@ -45,8 +45,6 @@ const int kMaxCrossfadeDurationMs = 12000;
 const int kPrecacheAheadTrackCount = 3;
 const int kLyricsPrefetchAheadTrackCount = 4;
 const int kMinValidStreamCacheFileBytes = 50 * 1024;
-const int kParallelPrecacheMinBytes = 1024 * 1024;
-const int kParallelPrecachePartCount = 4;
 
 /// ConcatenatingAudioSource for gapless playback with pre-buffering
 /// This is the key to OuterTune's instant playback
@@ -1506,7 +1504,9 @@ class AudioPlayerService {
     final precachingSource = _precacheSourcesByTrack[track.id];
     if (precachingSource != null) {
       if (kDebugMode) {
-        print('AudioPlayerService: Reusing in-flight pre-cache source for ' + track.id);
+        print(
+          'AudioPlayerService: Reusing in-flight pre-cache source for ${track.id}',
+        );
       }
       return precachingSource;
     }
@@ -1784,7 +1784,10 @@ class AudioPlayerService {
         await _touchCacheFile(cacheFile);
         _offerToAutomix(track, cacheFile.path);
         if (kDebugMode) {
-          print('AudioPlayerService: Pre-cache skipped, already cached ' + track.id + ' (' + _formatBytes(existingSize) + ')');
+          print(
+            'AudioPlayerService: Pre-cache skipped, already cached ${track.id} '
+            '(${_formatBytes(existingSize)})',
+          );
         }
         return;
       }
@@ -1819,7 +1822,9 @@ class AudioPlayerService {
         final target = expectedBytes != null && expectedBytes > 0
             ? ' (' + _formatBytes(expectedBytes) + ')'
             : '';
-        print('AudioPlayerService: Shared pre-cache started for ' + track.id + target);
+        print(
+          'AudioPlayerService: Shared pre-cache started for ${track.id}$target',
+        );
       }
 
       // This starts the source's one full GET. Draining the returned stream
@@ -1845,12 +1850,18 @@ class AudioPlayerService {
       _offerToAutomix(track, cacheFile.path);
       _stopLiveCacheProgressLogger(cacheFile.path);
       if (kDebugMode) {
-        print('AudioPlayerService: Shared pre-cache complete ' + track.id + ' (' + _formatBytes(cachedBytes) + ')');
+        print(
+          'AudioPlayerService: Shared pre-cache complete ${track.id} '
+          '(${_formatBytes(cachedBytes)})',
+        );
       }
     } catch (e) {
       if (allowDnsRetry && _isHostLookupError(e)) {
         if (kDebugMode) {
-          print('AudioPlayerService: DNS lookup failed for ' + track.id + ', refreshing URL and retrying shared pre-cache once');
+          print(
+            'AudioPlayerService: DNS lookup failed for ${track.id}, '
+            'refreshing URL and retrying shared pre-cache once',
+          );
         }
         _ytPlayerUtils.clearCache(track.id);
         final refreshed = await _ytPlayerUtils.playerResponseForPlayback(
@@ -1867,7 +1878,9 @@ class AudioPlayerService {
         }
       }
       if (kDebugMode) {
-        print('AudioPlayerService: Failed shared pre-cache for ' + track.id + ': ' + e.toString());
+        print(
+          'AudioPlayerService: Failed shared pre-cache for ${track.id}: $e',
+        );
       }
       _precacheSourcesByTrack.remove(track.id);
       await _deleteAudioCacheArtifact(cacheFile);
