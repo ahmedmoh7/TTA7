@@ -3160,6 +3160,32 @@ class LockCachingAudioSource extends StreamAudioSource {
         });
       }
     }, onDone: () async {
+      if (sourceLength != null && _progress != sourceLength) {
+        // A clean EOF can still be truncated. Never promote a short .part
+        // file to the completed cache entry.
+        await sink.flush();
+        await sink.close();
+        final partial = await _partialCacheFile;
+        if (partial.existsSync()) partial.deleteSync();
+        final error = FormatException(
+          'Incomplete audio cache: received $_progress of $sourceLength bytes',
+        );
+        for (final req in _requests) {
+          req.fail(error, StackTrace.current);
+        }
+        _requests.clear();
+        for (final cacheResponse in inProgressResponses) {
+          if (!cacheResponse.controller.isClosed) {
+            cacheResponse.controller.addError(error);
+            cacheResponse.controller.close();
+          }
+        }
+        await subscription.cancel();
+        httpClient.close();
+        _downloading = false;
+        _response = null;
+        return;
+      }
       if (sourceLength == null) {
         updateProgress(100);
       }
@@ -3168,11 +3194,17 @@ class LockCachingAudioSource extends StreamAudioSource {
           cacheResponse.controller.close();
         }
       }
+      // Flush and close the writer before promoting the temporary file.
+      // Renaming an open IOSink can leave the final cache file incomplete on
+      // some platforms (notably Android).
+      await sink.flush();
+      await sink.close();
       (await _partialCacheFile).renameSync(cacheFile.path);
       await subscription.cancel();
       httpClient.close();
       _downloading = false;
     }, onError: (Object e, StackTrace stackTrace) async {
+      await sink.close();
       (await _partialCacheFile).deleteSync();
       httpClient.close();
       // Fail all pending requests
