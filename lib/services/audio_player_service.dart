@@ -1829,6 +1829,12 @@ class AudioPlayerService {
       await for (final chunk in response.stream) {
         if (chunk.isEmpty) continue;
       }
+      // The response stream can close just before the source renames .part
+      // to the final cache file. Wait for that commit before dropping the map.
+      final completed = await source.downloadCompletion;
+      if (!completed) {
+        throw const HttpException('Shared pre-cache download did not complete');
+      }
 
       final cached = await cacheFile.exists();
       final cachedBytes = cached ? await cacheFile.length() : 0;
