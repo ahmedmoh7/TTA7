@@ -697,6 +697,8 @@ class PartialAudioCacheStore {
 
   Future<bool> isComplete(int totalLength) async {
     if (totalLength <= 0 || !await audioFile.exists()) return false;
+    // Metadata alone is not proof that the physical file contains every byte.
+    if (await audioFile.length() < totalLength) return false;
     final meta = await _read(
       expectedLength: totalLength,
       fallbackContentType: '',
