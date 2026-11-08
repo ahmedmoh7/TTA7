@@ -30,6 +30,21 @@ class PartialAudioOrigin {
 typedef PartialAudioOriginRefresh = Future<PartialAudioOrigin?> Function();
 typedef PartialAudioCacheComplete = FutureOr<void> Function(File audioFile);
 
+/// A validated summary of byte ranges persisted for one audio representation.
+class PartialAudioCacheSnapshot {
+  const PartialAudioCacheSnapshot({
+    required this.totalLength,
+    required this.contentType,
+    required this.cachedBytes,
+    required this.lastAccessMs,
+  });
+
+  final int? totalLength;
+  final String contentType;
+  final int cachedBytes;
+  final int lastAccessMs;
+}
+
 /// Streams a progressive media file from validated cached byte ranges and asks
 /// the origin only for missing ranges. It never starts an independent,
 /// background full-file download. HLS/DASH manifests must stay on their native
@@ -42,6 +57,7 @@ class PartialCachingAudioSource extends StreamAudioSource {
     PartialAudioOriginRefresh? refreshOrigin,
     PartialAudioCacheComplete? onComplete,
     this.rangeChunkBytes = 512 * 1024,
+    this.offlineOnly = false,
     super.tag,
   }) : _origin = origin,
        _expectedLength = expectedLength,
@@ -58,6 +74,8 @@ class PartialCachingAudioSource extends StreamAudioSource {
 
   final File audioFile;
   final int rangeChunkBytes;
+  /// When true, missing byte ranges fail locally and never contact the origin.
+  final bool offlineOnly;
   final int? _expectedLength;
   final PartialAudioOriginRefresh? _refreshOrigin;
   final PartialAudioCacheComplete? _onComplete;
@@ -107,6 +125,32 @@ class PartialCachingAudioSource extends StreamAudioSource {
         offset: isRangeRequest ? outputStart : null,
         contentType: meta.contentType,
         stream: _store.readStream(outputStart, outputEnd ?? total),
+      );
+    }
+
+    // Offline replay may use only the exact ranges already persisted. Never
+    // attempt a network request or refresh a signed URL in this mode.
+    if (offlineOnly) {
+      final cachedEnd = await _store.cachedEndFrom(
+        outputStart,
+        limit: outputEnd,
+      );
+      if (cachedEnd == null || cachedEnd <= outputStart) {
+        throw HttpException(
+          'Requested audio bytes are not available in the offline cache.',
+          uri: _origin.uri,
+        );
+      }
+      await _store.touch();
+      return StreamAudioResponse(
+        rangeRequestsSupported: true,
+        sourceLength: total,
+        contentLength: cachedEnd - outputStart,
+        offset: isRangeRequest ? outputStart : null,
+        contentType: meta.contentType.isEmpty
+            ? _origin.contentType
+            : meta.contentType,
+        stream: _store.readStream(outputStart, cachedEnd),
       );
     }
 
@@ -658,6 +702,49 @@ class PartialAudioCacheStore {
       fallbackContentType: '',
     );
     return meta.totalLength == totalLength && meta.covers(0, totalLength);
+  }
+
+  /// Returns the end of the contiguous cached range containing [offset].
+  /// The result is capped by the physical file length and optional [limit].
+  Future<int?> cachedEndFrom(int offset, {int? limit}) async {
+    if (offset < 0 || !await audioFile.exists()) return null;
+    final fileLength = await audioFile.length();
+    if (offset >= fileLength || (limit != null && limit <= offset)) {
+      return null;
+    }
+    final meta = await _read(expectedLength: null, fallbackContentType: '');
+    for (final range in meta.ranges) {
+      if (range.start <= offset && range.end > offset) {
+        var end = math.min(range.end, fileLength);
+        if (limit != null) end = math.min(end, limit);
+        return end > offset ? end : null;
+      }
+      if (range.start > offset) break;
+    }
+    return null;
+  }
+
+  /// Returns persisted cache facts without exposing signed stream URLs.
+  Future<PartialAudioCacheSnapshot?> snapshot() async {
+    if (!await audioFile.exists() || !await _metadataFile.exists()) {
+      return null;
+    }
+    final fileLength = await audioFile.length();
+    if (fileLength <= 0) return null;
+    final meta = await _read(expectedLength: null, fallbackContentType: '');
+    var cachedBytes = 0;
+    for (final range in meta.ranges) {
+      if (range.start >= fileLength) continue;
+      final end = math.min(range.end, fileLength);
+      if (end > range.start) cachedBytes += end - range.start;
+    }
+    if (cachedBytes <= 0) return null;
+    return PartialAudioCacheSnapshot(
+      totalLength: meta.totalLength,
+      contentType: meta.contentType,
+      cachedBytes: cachedBytes,
+      lastAccessMs: meta.lastAccessMs,
+    );
   }
 
   Stream<List<int>> readStream(int start, int? end) =>
