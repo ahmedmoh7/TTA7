@@ -999,215 +999,20 @@ class AudioPlayerService {
   }
 
   Future<void> _crossfadeToIndex(int targetIndex) async {
+    // Never prepare the next track on the spare player. Switch only when the
+    // transition is requested, then let the normal current-track pipeline load it.
     if (_isCrossfading) return;
-    if (_crossfadeDurationMs <= 0) {
-      _currentIndex = targetIndex;
-      _currentTrack = _queue[targetIndex];
-      await _loadAndPlayCurrent();
-      return;
-    }
     if (targetIndex < 0 || targetIndex >= _queue.length) return;
     if (_currentIndex == targetIndex) return;
-    if (_jamsModeEnabled) {
-      _currentIndex = targetIndex;
-      _currentTrack = _queue[targetIndex];
-      await _loadAndPlayCurrent();
-      return;
-    }
-
-    _isCrossfading = true;
-    var crossfadeSucceeded = false;
-    final outgoingPlayer = _player;
-    final incomingPlayer = _inactivePlayer;
-    final targetTrack = _queue[targetIndex];
-    final sourceTrackId = _currentTrack?.id ?? 'unknown';
-
-    try {
-      final built = await _buildSourceForTrack(targetTrack);
-      await incomingPlayer.stop();
-      await incomingPlayer.setLoopMode(_nativeLoopModeFor(_loopMode));
-      await incomingPlayer.setSpeed(outgoingPlayer.speed);
-      try {
-        await incomingPlayer.setAudioSource(built.source, preload: true);
-      } catch (e) {
-        if (built.source is! PartialCachingAudioSource ||
-            !_isLoopbackCleartextError(e) ||
-            built.playbackData == null) {
-          rethrow;
-        }
-        _allowProxyCachingSource = false;
-        await incomingPlayer.setAudioSource(
-          _directAudioSourceForTrack(targetTrack, built.playbackData!),
-          preload: true,
-        );
-      }
-      await _setVolumeSafely(
-        incomingPlayer,
-        0.12,
-        context: 'crossfade-bootstrap',
-      );
-
-      _player = incomingPlayer;
-      _currentIndex = targetIndex;
-      var enrichedTrack = targetTrack;
-      final crossfadeDetails = built.playbackData?.videoDetails;
-      if (crossfadeDetails != null) {
-        const badPlaceholders = {
-          'unknown artist',
-          'song',
-          'video',
-          'album',
-          'single',
-          'ep',
-          'playlist',
-          '',
-        };
-        final artistLower = enrichedTrack.artist.toLowerCase().trim();
-        if (badPlaceholders.contains(artistLower) &&
-            crossfadeDetails.author.isNotEmpty &&
-            !badPlaceholders.contains(
-              crossfadeDetails.author.toLowerCase().trim(),
-            )) {
-          enrichedTrack = enrichedTrack.copyWith(
-            artist: crossfadeDetails.author,
-          );
-        }
-        if (enrichedTrack.duration <= Duration.zero &&
-            crossfadeDetails.duration > Duration.zero) {
-          enrichedTrack = enrichedTrack.copyWith(
-            duration: crossfadeDetails.duration,
-          );
-        }
-        if (enrichedTrack != targetTrack) {
-          _queue[targetIndex] = enrichedTrack;
-          for (int i = 0; i < _originalQueue.length; i++) {
-            if (_originalQueue[i].id == enrichedTrack.id) {
-              _originalQueue[i] = enrichedTrack;
-              break;
-            }
-          }
-          _queueRevision++;
-        }
-      }
-      _currentTrack = enrichedTrack;
-      _currentPlaybackData = built.playbackData;
-      _activeSourceQueueIndices = <int>[targetIndex];
-      _activeSourcePlaybackDataByQueueIndex = built.playbackData == null
-          ? const <int, PlaybackData>{}
-          : <int, PlaybackData>{targetIndex: built.playbackData!};
-      _crossfadeTriggeredForTrack = false;
-
-      final newDuration = incomingPlayer.duration;
-      if (newDuration != null) {
-        _applyDurationToCurrentTrack(newDuration);
-      }
-
-      _updateState(
-        currentTrack: _currentTrack,
-        currentIndex: _currentIndex,
-        currentPlaybackData: _currentPlaybackData,
-        queue: _queue,
-        queueRevision: _queueRevision,
-        duration: newDuration,
-        resetDuration: newDuration == null,
-        isLoading: false,
-      );
-      _saveQueueDebounced();
-      _prefetchNextTrack();
-      _scheduleLyricsPrefetchAroundCurrent();
-
-      AudioRoutingService.reapplyAudioRoute();
-      unawaited(incomingPlayer.play());
-      for (int i = 1; i <= 6; i++) {
-        Future.delayed(
-          Duration(milliseconds: i * 25),
-          AudioRoutingService.reapplyAudioRoute,
-        );
-      }
-
-      await Future.delayed(const Duration(milliseconds: 90));
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Crossfade started $sourceTrackId -> ${targetTrack.id} (${_crossfadeDurationMs}ms)',
-        );
-      }
-      await _runOverlapFade(
-        outgoing: outgoingPlayer,
-        incoming: incomingPlayer,
-        duration: _crossfadeDuration,
-      );
-
-      await outgoingPlayer.stop();
-      await _setVolumeSafely(
-        outgoingPlayer,
-        1.0,
-        context: 'crossfade-reset-outgoing',
-      );
-      await _setVolumeSafely(
-        incomingPlayer,
-        1.0,
-        context: 'crossfade-settle-incoming',
-      );
-      if (!incomingPlayer.playing) {
-        unawaited(incomingPlayer.play());
-      }
-      await _stabilizeIncomingAfterCrossfade(incomingPlayer);
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Crossfade completed on ${targetTrack.id}, incomingVolume=${incomingPlayer.volume.toStringAsFixed(2)}',
-        );
-      }
-      crossfadeSucceeded = true;
-    } catch (e) {
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Crossfade failed, fallback to hard switch: $e',
-        );
-      }
-      _player = outgoingPlayer;
-      _currentIndex = targetIndex;
-      _currentTrack = _queue[targetIndex];
-      // (The hard switch goes through the normal load, which upgrades.)
-      await _loadAndPlayCurrent();
-    } finally {
-      _isCrossfading = false;
-    }
-    // Most tracks start here (crossfade is on by default), so this is where
-    // the second look for a lossless copy matters most.
-    final arrived = _currentTrack;
-    if (crossfadeSucceeded &&
-        arrived != null &&
-        arrived.id == targetTrack.id &&
-        _currentPlaybackData?.isLive != true) {
-      unawaited(_upgradeToLosslessIfPossible(arrived));
-    }
+    _currentIndex = targetIndex;
+    _currentTrack = _queue[targetIndex];
+    await _loadAndPlayCurrent();
   }
 
   void _maybeTriggerAutoCrossfade(Duration currentPosition) {
-    if (_jamsModeEnabled) return;
-    // With Automix on, the engine plans and runs every transition.
-    if (_automixOn) return;
-    if (_crossfadeDurationMs <= 0) return;
-    if (_isCrossfading) return;
-    if (_crossfadeTriggeredForTrack) return;
-    if (_loopMode == LoopMode.one) return;
-    if (!_player.playing) return;
-    // Live streams have no real end — never crossfade/advance off them.
-    if (_currentPlaybackData?.isLive == true) return;
-
-    final duration = _player.duration;
-    if (duration == null || duration <= Duration.zero) return;
-    final remaining = duration - currentPosition;
-    if (remaining <= Duration.zero) return;
-
-    final triggerLeadMs = max(300, _crossfadeDurationMs + 120);
-    if (remaining.inMilliseconds > triggerLeadMs) return;
-
-    final nextIndex = _nextQueueIndexForTransition();
-    if (nextIndex == null) return;
-
-    _crossfadeTriggeredForTrack = true;
-    unawaited(_crossfadeToIndex(nextIndex));
+    // Automatic crossfade requires buffering the upcoming track. It is
+    // intentionally disabled so next-track audio is never fetched in advance.
+    return;
   }
 
   int _effectivePrecacheConcurrency() {
@@ -4474,7 +4279,9 @@ class AudioPlayerService {
   int _automixIncomingIndex = -1;
   bool _automixSyncScheduled = false;
 
-  bool get _automixOn => AutomixService.instance.enabled && !_jamsModeEnabled;
+  // Automix needs to load the incoming song before handoff, which violates
+  // the no-next-track-audio-preload rule.
+  bool get _automixOn => false;
 
   AudioPlayer _playerById(String id) =>
       _primaryPlayer.playerId == id ? _primaryPlayer : _secondaryPlayer;
@@ -4544,30 +4351,8 @@ class AudioPlayerService {
   /// The arm: queue entry [index] onto the spare player at [cueMs], silent
   /// and paused; the engine starts it at the blend.
   Future<void> _automixLoad(String playerId, int index, int cueMs) async {
-    if (index < 0 || index >= _queue.length) return;
-    final player = _playerById(playerId);
-    if (identical(player, _player)) return; // never load over the song
-    _automixMixing = true;
-    final track = _queue[index];
-    try {
-      final built = await _buildSourceForTrack(track);
-      await player.setLoopMode(_nativeLoopModeFor(_loopMode));
-      await _setVolumeSafely(player, 0.0, context: 'automix-arm');
-      await player.setAudioSource(
-        built.source,
-        initialPosition: Duration(milliseconds: cueMs),
-        preload: true,
-      );
-      _automixIncomingData = built.playbackData;
-      _automixIncomingIndex = index;
-      await AutomixService.instance.loaded(playerId, index);
-      if (kDebugMode) {
-        print('AudioPlayerService: Automix armed ${track.id} at ${cueMs}ms');
-      }
-    } catch (e) {
-      // The engine's arm deadline lapses and it carries on with no blend.
-      if (kDebugMode) print('AudioPlayerService: Automix arm failed: $e');
-    }
+    // Deliberately do not resolve or buffer audio for an upcoming track.
+    return;
   }
 
   /// The blend's midpoint: the incoming player is the song now.
