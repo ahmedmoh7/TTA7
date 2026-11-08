@@ -1873,7 +1873,17 @@ class AudioPlayerService {
           _precacheSourcesByTrack.remove(track.id);
           await _deleteAudioCacheArtifact(cacheFile);
           _precacheInProgress.remove(track.id);
-          await _precacheTrackAudioBytes(track, refreshed.data!, allowDnsRetry: false);
+          // Release this slot before recursively retrying; otherwise a
+          // single-download configuration would wait on its own slot.
+          if (slotAcquired) {
+            _releasePrecacheSlot();
+            slotAcquired = false;
+          }
+          await _precacheTrackAudioBytes(
+            track,
+            refreshed.data!,
+            allowDnsRetry: false,
+          );
           return;
         }
       }
