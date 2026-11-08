@@ -1957,6 +1957,8 @@ class AudioPlayerService {
 
       final candidates = <({Track track, PlaybackData playbackData})>[];
       for (int i = start; i < end; i++) {
+        if (_streamCachePrecacheTrackCount <= 0 ||
+            i >= start + _streamCachePrecacheTrackCount) break;
         final track = _queue[i];
         if (_precacheInProgress.contains(track.id)) continue;
 
@@ -2024,6 +2026,7 @@ class AudioPlayerService {
 
       if (maxConcurrent <= 1 || candidates.length == 1) {
         for (final candidate in candidates) {
+          if (_streamCachePrecacheTrackCount <= 0) break;
           await _precacheTrackAudioBytes(
             candidate.track,
             candidate.playbackData,
@@ -2036,7 +2039,9 @@ class AudioPlayerService {
       int cursor = 0;
       Future<void> worker(int workerId) async {
         while (true) {
-          if (cursor >= candidates.length) return;
+          if (_streamCachePrecacheTrackCount <= 0 ||
+              cursor >= candidates.length ||
+              cursor >= _streamCachePrecacheTrackCount) return;
           final next = candidates[cursor++];
           if (kDebugMode) {
             print(
@@ -4849,10 +4854,6 @@ class AudioPlayerService {
               _audioQuality == AudioQuality.max ||
               _audioQuality == AudioQuality.auto)) {
         unawaited(JioSaavnService.instance.getBestStreamForTrack(nextTrack));
-        if (_currentIndex < _queue.length - 2) {
-          final subsequentTrack = _queue[_currentIndex + 2];
-          unawaited(JioSaavnService.instance.getBestStreamForTrack(subsequentTrack));
-        }
       }
 
       // Pre-extract colors for upcoming tracks so song change is instant 0ms
