@@ -822,6 +822,20 @@ final streamCacheMaxConcurrentProvider = Provider<int>((ref) {
       player.kDefaultStreamCacheMaxConcurrent;
 });
 
+/// Number of upcoming tracks to download into the stream cache (0 disables it).
+final streamCachePrecacheTrackCountProvider = Provider<int>((ref) {
+  final state = ref.watch(playbackStateProvider);
+  return state.whenOrNull(data: (s) => s.streamCachePrecacheTrackCount) ??
+      player.kDefaultStreamCachePrecacheTrackCount;
+});
+
+/// Playback percentage at which upcoming-track audio pre-cache starts.
+final streamCachePrecacheStartPercentProvider = Provider<int>((ref) {
+  final state = ref.watch(playbackStateProvider);
+  return state.whenOrNull(data: (s) => s.streamCachePrecacheStartPercent) ??
+      player.kDefaultStreamCachePrecacheStartPercent;
+});
+
 /// Provider for crossfade duration in milliseconds
 final crossfadeDurationMsProvider = Provider<int>((ref) {
   final state = ref.watch(playbackStateProvider);
