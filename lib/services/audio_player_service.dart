@@ -411,6 +411,8 @@ class AudioPlayerService {
       'persisted_queue_duration_migrated_v1';
   final Connectivity _connectivity = Connectivity();
   final Set<String> _precacheInProgress = <String>{};
+  final Map<String, Set<HttpClient>> _precacheClientsByTrack = {};
+  final Map<String, Completer<void>> _precacheCompletionByTrack = {};
   final Queue<Completer<void>> _precacheSlotWaiters = Queue<Completer<void>>();
   int _activePrecacheDownloads = 0;
   bool _isPrecachingAhead = false;
@@ -1333,6 +1335,7 @@ class AudioPlayerService {
         try {
           partClient = HttpClient()
             ..connectionTimeout = const Duration(seconds: 20);
+          (_precacheClientsByTrack[track.id] ??= <HttpClient>{}).add(partClient);
           final request = await partClient.getUrl(streamUri);
           _applyPrecacheRequestHeaders(request);
           request.headers.set(
@@ -1369,7 +1372,10 @@ class AudioPlayerService {
           if (partSink != null) {
             await partSink.close();
           }
-          partClient?.close(force: true);
+          if (partClient != null) {
+            _precacheClientsByTrack[track.id]?.remove(partClient);
+            partClient.close(force: true);
+          }
         }
       }
 
@@ -1561,6 +1567,16 @@ class AudioPlayerService {
     return await _isConnectedToWifi();
   }
 
+  Future<void> _cancelPrecacheForPlayback(String trackId) async {
+    final clients =
+        _precacheClientsByTrack[trackId]?.toList() ?? const <HttpClient>[];
+    for (final client in clients) {
+      client.close(force: true);
+    }
+    final completion = _precacheCompletionByTrack[trackId];
+    if (completion != null) await completion.future;
+  }
+
   Future<void> _touchCacheFile(File file) async {
     try {
       if (await file.exists()) {
@@ -1701,15 +1717,10 @@ class AudioPlayerService {
       }
     }
 
-    // Avoid competing writers for the same cache file.
+    // If a future-track download is active, stop it before playback takes
+    // ownership of this track so the player does not start a duplicate GET.
     if (_precacheInProgress.contains(track.id)) {
-      _stopLiveCacheProgressLogger(cacheFile.path);
-      if (kDebugMode) {
-        print(
-          'AudioPlayerService: Pre-cache in progress for ${track.id}, using direct stream',
-        );
-      }
-      return AudioSource.uri(streamUri, headers: headers, tag: track);
+      await _cancelPrecacheForPlayback(track.id);
     }
 
     if (!_allowProxyCachingSource) {
@@ -2017,12 +2028,14 @@ class AudioPlayerService {
     }
 
     _precacheInProgress.add(track.id);
+    _precacheCompletionByTrack[track.id] = Completer<void>();
     final tempFile = File('${cacheFile.path}.precache.part');
     HttpClient? client;
     IOSink? sink;
     int downloadedBytes = 0;
     try {
       client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
+      (_precacheClientsByTrack[track.id] ??= <HttpClient>{}).add(client);
       final request = await client.getUrl(Uri.parse(playbackData.streamUrl));
       _applyPrecacheRequestHeaders(request);
       HttpClientResponse response = await request.close();
@@ -2054,6 +2067,7 @@ class AudioPlayerService {
         } else {
           client = HttpClient()
             ..connectionTimeout = const Duration(seconds: 20);
+          (_precacheClientsByTrack[track.id] ??= <HttpClient>{}).add(client);
           final fallbackRequest = await client.getUrl(
             Uri.parse(playbackData.streamUrl),
           );
@@ -2198,7 +2212,11 @@ class AudioPlayerService {
       }
     } finally {
       client?.close(force: true);
+      if (client != null) _precacheClientsByTrack[track.id]?.remove(client);
+      _precacheClientsByTrack.remove(track.id);
       _precacheInProgress.remove(track.id);
+      final completion = _precacheCompletionByTrack.remove(track.id);
+      if (completion != null && !completion.isCompleted) completion.complete();
       if (slotAcquired) {
         _releasePrecacheSlot();
       }
