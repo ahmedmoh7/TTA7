@@ -3,7 +3,7 @@ name: Build TTA7 APK
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches: [main, master, feature/precache-controls-from-nov5-baseline]
 
 jobs:
   build:
