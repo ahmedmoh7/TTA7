@@ -411,9 +411,8 @@ class AudioPlayerService {
       'persisted_queue_duration_migrated_v1';
   final Connectivity _connectivity = Connectivity();
   final Set<String> _precacheInProgress = <String>{};
-  final Map<String, Set<HttpClient>> _precacheClientsByTrack = {};
-  final Map<String, Completer<void>> _precacheCompletionByTrack = {};
-  final Set<String> _precacheCancellationRequested = <String>{};
+  // Reuse the same source instance from background pre-cache during playback.
+  final Map<String, LockCachingAudioSource> _precacheSourcesByTrack = {};
   final Queue<Completer<void>> _precacheSlotWaiters = Queue<Completer<void>>();
   int _activePrecacheDownloads = 0;
   bool _isPrecachingAhead = false;
@@ -1574,18 +1573,6 @@ class AudioPlayerService {
     return await _isConnectedToWifi();
   }
 
-  Future<void> _cancelPrecacheForPlayback(String trackId) async {
-    _precacheCancellationRequested.add(trackId);
-    final clients =
-        _precacheClientsByTrack[trackId]?.toList() ?? const <HttpClient>[];
-    for (final client in clients) {
-      client.close(force: true);
-    }
-    final completion = _precacheCompletionByTrack[trackId];
-    if (completion != null) await completion.future;
-    _precacheCancellationRequested.remove(trackId);
-  }
-
   Future<void> _touchCacheFile(File file) async {
     try {
       if (await file.exists()) {
@@ -1726,10 +1713,13 @@ class AudioPlayerService {
       }
     }
 
-    // If a future-track download is active, stop it before playback takes
-    // ownership of this track so the player does not start a duplicate GET.
-    if (_precacheInProgress.contains(track.id)) {
-      await _cancelPrecacheForPlayback(track.id);
+    // Reuse the exact source instance already downloading this track.
+    final precachingSource = _precacheSourcesByTrack[track.id];
+    if (precachingSource != null) {
+      if (kDebugMode) {
+        print('AudioPlayerService: Reusing in-flight pre-cache source for ' + track.id);
+      }
+      return precachingSource;
     }
 
     if (!_allowProxyCachingSource) {
@@ -1994,7 +1984,6 @@ class AudioPlayerService {
     bool allowDnsRetry = true,
   }) async {
     if (kIsWeb) return;
-    // Never try to download a live/manifest stream to a file — it's endless.
     if (playbackData.isLive || playbackData.isManifestStream) return;
     if (_precacheInProgress.contains(track.id)) return;
 
@@ -2003,33 +1992,18 @@ class AudioPlayerService {
       final existingSize = await cacheFile.length();
       if (existingSize >= kMinValidStreamCacheFileBytes) {
         _stopLiveCacheProgressLogger(cacheFile.path);
-        final expectedBytes = playbackData.format.contentLength;
-        if (kDebugMode) {
-          if (expectedBytes != null && expectedBytes > 0) {
-            final progress = ((existingSize / expectedBytes) * 100).clamp(
-              0.0,
-              100.0,
-            );
-            print(
-              'AudioPlayerService: Pre-cache skipped, already cached ${track.id} '
-              '(${_formatBytes(existingSize)} / ${_formatBytes(expectedBytes)}, ${progress.toStringAsFixed(1)}%)',
-            );
-          } else {
-            print(
-              'AudioPlayerService: Pre-cache skipped, already cached ${track.id} '
-              '(${_formatBytes(existingSize)})',
-            );
-          }
-        }
         await _touchCacheFile(cacheFile);
         _offerToAutomix(track, cacheFile.path);
+        if (kDebugMode) {
+          print('AudioPlayerService: Pre-cache skipped, already cached ' + track.id + ' (' + _formatBytes(existingSize) + ')');
+        }
         return;
       }
       await _deleteAudioCacheArtifact(cacheFile);
     }
 
     await _acquirePrecacheSlot();
-    bool slotAcquired = true;
+    var slotAcquired = true;
     if (_precacheInProgress.contains(track.id)) {
       _releasePrecacheSlot();
       slotAcquired = false;
@@ -2037,207 +2011,74 @@ class AudioPlayerService {
     }
 
     _precacheInProgress.add(track.id);
-    _precacheCancellationRequested.remove(track.id);
-    final completionSignal = Completer<void>();
-    _precacheCompletionByTrack[track.id] = completionSignal;
-    final tempFile = File('${cacheFile.path}.precache.part');
-    HttpClient? client;
-    IOSink? sink;
-    int downloadedBytes = 0;
+    final streamUri = Uri.parse(playbackData.streamUrl);
+    final streamHeaders = InnerTubeClient.streamHeadersFor(streamUri);
+    final headers = streamHeaders.isEmpty ? null : streamHeaders;
+    // The exact same source object is attached to the player if selected.
+    // ignore: experimental_member_use
+    final source = LockCachingAudioSource(
+      streamUri,
+      cacheFile: cacheFile,
+      headers: headers,
+      tag: track,
+    );
+    _precacheSourcesByTrack[track.id] = source;
+
     try {
-      client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
-      (_precacheClientsByTrack[track.id] ??= <HttpClient>{}).add(client);
-      final request = await client.getUrl(Uri.parse(playbackData.streamUrl));
-      _applyPrecacheRequestHeaders(request);
-      HttpClientResponse response = await request.close();
-      if (response.statusCode != 200 && response.statusCode != 206) {
-        throw HttpException('HTTP ${response.statusCode}');
-      }
-      final responseContentLength = response.contentLength;
-      int? expectedBytes = responseContentLength > 0
-          ? responseContentLength
-          : playbackData.format.contentLength;
-
-      if (await tempFile.exists()) {
-        await tempFile.delete();
+      if (kDebugMode) {
+        final expectedBytes = playbackData.format.contentLength;
+        final target = expectedBytes != null && expectedBytes > 0
+            ? ' (' + _formatBytes(expectedBytes) + ')'
+            : '';
+        print('AudioPlayerService: Shared pre-cache started for ' + track.id + target);
       }
 
-      bool usedParallelDownload = false;
-      if (expectedBytes != null && expectedBytes >= kParallelPrecacheMinBytes) {
-        client.close(force: true);
-        client = null;
-        final parallelBytes = await _downloadWithParallelRanges(
-          track: track,
-          streamUri: Uri.parse(playbackData.streamUrl),
-          tempFile: tempFile,
-          expectedBytes: expectedBytes,
-        );
-        if (parallelBytes != null) {
-          downloadedBytes = parallelBytes;
-          usedParallelDownload = true;
-        } else {
-          if (_precacheCancellationRequested.contains(track.id)) {
-            throw const HttpException('Pre-cache cancelled for playback');
-          }
-          client = HttpClient()
-            ..connectionTimeout = const Duration(seconds: 20);
-          (_precacheClientsByTrack[track.id] ??= <HttpClient>{}).add(client);
-          final fallbackRequest = await client.getUrl(
-            Uri.parse(playbackData.streamUrl),
-          );
-          _applyPrecacheRequestHeaders(fallbackRequest);
-          response = await fallbackRequest.close();
-          if (response.statusCode != 200 && response.statusCode != 206) {
-            throw HttpException('HTTP ${response.statusCode}');
-          }
-          if (response.contentLength > 0) {
-            expectedBytes = response.contentLength;
-          }
-        }
+      // This starts the source's one full GET. Draining the returned stream
+      // keeps the background pre-cache active while LockCachingAudioSource
+      // writes the same bytes that playback can consume concurrently.
+      final response = await source.request();
+      await for (final chunk in response.stream) {
+        if (chunk.isEmpty) continue;
       }
 
-      if (!usedParallelDownload) {
-        sink = tempFile.openWrite(mode: FileMode.writeOnly);
-
-        int nextProgressLogPercent = 10;
-        int nextProgressLogBytes = 2 * 1024 * 1024;
-        final downloadTimer = Stopwatch()..start();
-        int speedSampleBytes = 0;
-        int speedSampleMs = 0;
-
-        String sampleSpeed() {
-          final nowMs = downloadTimer.elapsedMilliseconds;
-          final elapsedMs = max(1, nowMs - speedSampleMs);
-          final deltaBytes = max(0, downloadedBytes - speedSampleBytes);
-          speedSampleBytes = downloadedBytes;
-          speedSampleMs = nowMs;
-          return _formatTransferRate(deltaBytes * 1000 / elapsedMs);
-        }
-
-        if (kDebugMode) {
-          if (expectedBytes != null && expectedBytes > 0) {
-            print(
-              'AudioPlayerService: Pre-cache started for ${track.id} '
-              '(target ${_formatBytes(expectedBytes)})',
-            );
-          } else {
-            print('AudioPlayerService: Pre-cache started for ${track.id}');
-          }
-        }
-
-        await for (final chunk in response) {
-          sink.add(chunk);
-          downloadedBytes += chunk.length;
-          if (kDebugMode) {
-            if (expectedBytes != null && expectedBytes > 0) {
-              final progress = ((downloadedBytes / expectedBytes) * 100).clamp(
-                0.0,
-                100.0,
-              );
-              if (progress >= nextProgressLogPercent) {
-                final speed = sampleSpeed();
-                print(
-                  'AudioPlayerService: Pre-cache progress ${track.id} '
-                  '${progress.toStringAsFixed(1)}% '
-                  '(${_formatBytes(downloadedBytes)} / ${_formatBytes(expectedBytes)} @ $speed)',
-                );
-                while (progress >= nextProgressLogPercent) {
-                  nextProgressLogPercent += 10;
-                }
-              }
-            } else if (downloadedBytes >= nextProgressLogBytes) {
-              final speed = sampleSpeed();
-              print(
-                'AudioPlayerService: Pre-cache progress ${track.id} '
-                '${_formatBytes(downloadedBytes)} (total size unknown @ $speed)',
-              );
-              nextProgressLogBytes += 2 * 1024 * 1024;
-            }
-          }
-        }
-        await sink.flush();
-        await sink.close();
-        sink = null;
+      final cached = await cacheFile.exists();
+      final cachedBytes = cached ? await cacheFile.length() : 0;
+      if (!cached || cachedBytes < kMinValidStreamCacheFileBytes) {
+        throw const FormatException('Shared pre-cache file too small or missing');
       }
-
-      if (downloadedBytes < kMinValidStreamCacheFileBytes) {
-        throw const FormatException('Pre-cache file too small');
-      }
-
-      if (await cacheFile.exists()) {
-        await cacheFile.delete();
-      }
-      await tempFile.rename(cacheFile.path);
       await _touchCacheFile(cacheFile);
-      // A whole YouTube file is what Automix analyses this track from.
       _offerToAutomix(track, cacheFile.path);
       _stopLiveCacheProgressLogger(cacheFile.path);
       if (kDebugMode) {
-        if (expectedBytes != null && expectedBytes > 0) {
-          final progress = ((downloadedBytes / expectedBytes) * 100).clamp(
-            0.0,
-            100.0,
-          );
-          print(
-            'AudioPlayerService: Pre-cached ${track.id} '
-            '(${_formatBytes(downloadedBytes)} / ${_formatBytes(expectedBytes)}, ${progress.toStringAsFixed(1)}%)',
-          );
-        } else {
-          print(
-            'AudioPlayerService: Pre-cached ${track.id} (${_formatBytes(downloadedBytes)})',
-          );
-        }
+        print('AudioPlayerService: Shared pre-cache complete ' + track.id + ' (' + _formatBytes(cachedBytes) + ')');
       }
     } catch (e) {
-      if (!_precacheCancellationRequested.contains(track.id) &&
-          allowDnsRetry &&
-          _isHostLookupError(e)) {
+      if (allowDnsRetry && _isHostLookupError(e)) {
         if (kDebugMode) {
-          print(
-            'AudioPlayerService: DNS lookup failed for ${track.id}, refreshing URL and retrying pre-cache once',
-          );
+          print('AudioPlayerService: DNS lookup failed for ' + track.id + ', refreshing URL and retrying shared pre-cache once');
         }
-
-        // Cached stream URL can become unreachable after network/DNS changes.
         _ytPlayerUtils.clearCache(track.id);
         final refreshed = await _ytPlayerUtils.playerResponseForPlayback(
           track.id,
           quality: _audioQuality,
           isMetered: false,
         );
-
         if (refreshed.isSuccess && refreshed.data != null) {
+          _precacheSourcesByTrack.remove(track.id);
+          await _deleteAudioCacheArtifact(cacheFile);
           _precacheInProgress.remove(track.id);
-          await _precacheTrackAudioBytes(
-            track,
-            refreshed.data!,
-            allowDnsRetry: false,
-          );
+          await _precacheTrackAudioBytes(track, refreshed.data!, allowDnsRetry: false);
           return;
         }
       }
-
-      if (!_precacheCancellationRequested.contains(track.id) && kDebugMode) {
-        print('AudioPlayerService: Failed to pre-cache ${track.id}: $e');
+      if (kDebugMode) {
+        print('AudioPlayerService: Failed shared pre-cache for ' + track.id + ': ' + e.toString());
       }
-      if (sink != null) {
-        await sink.close();
-      }
-      if (await tempFile.exists()) {
-        await tempFile.delete();
-      }
+      _precacheSourcesByTrack.remove(track.id);
+      await _deleteAudioCacheArtifact(cacheFile);
     } finally {
-      client?.close(force: true);
-      if (client != null) _precacheClientsByTrack[track.id]?.remove(client);
-      _precacheClientsByTrack.remove(track.id);
       _precacheInProgress.remove(track.id);
-      if (identical(_precacheCompletionByTrack[track.id], completionSignal)) {
-        _precacheCompletionByTrack.remove(track.id);
-      }
-      if (!completionSignal.isCompleted) completionSignal.complete();
-      if (slotAcquired) {
-        _releasePrecacheSlot();
-      }
+      if (slotAcquired) _releasePrecacheSlot();
     }
   }
 
