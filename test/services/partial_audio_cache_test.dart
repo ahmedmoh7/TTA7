@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -312,6 +313,31 @@ void main() {
       release();
     },
   );
+
+  test('does not mark a short physical file complete from metadata alone', () async {
+    final cacheFile = File('${tempDir.path}/short-cache.audio');
+    await cacheFile.writeAsBytes(List<int>.filled(4, 0));
+    await File('${cacheFile.path}.ranges.json').writeAsString(
+      jsonEncode(<String, dynamic>{
+        'version': 1,
+        'totalLength': 8,
+        'contentType': 'audio/mpeg',
+        'etag': null,
+        'lastModified': null,
+        'originFingerprint': null,
+        'rangeSupported': true,
+        'ranges': <List<int>>[
+          <int>[0, 8],
+        ],
+        'lastAccessMs': DateTime.now().millisecondsSinceEpoch,
+      }),
+    );
+
+    expect(
+      await PartialAudioCacheStore(cacheFile).isComplete(8),
+      isFalse,
+    );
+  });
 
   test('out-of-order seeks are written at the correct file offsets', () async {
     final bytes = List<int>.generate(16 * 1024, (i) => (i * 19) & 0xff);
