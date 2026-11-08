@@ -80,6 +80,9 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
+      - name: Test persistent partial audio cache
+        run: flutter test test/services/partial_audio_cache_test.dart
+
       - name: Generate TTA7 app icons and splash screen
         run: |
           dart run flutter_launcher_icons
