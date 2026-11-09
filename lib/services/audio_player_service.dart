@@ -1944,6 +1944,7 @@ class AudioPlayerService {
 
       final candidates = <({Track track, PlaybackData playbackData})>[];
       for (int i = start; i < end; i++) {
+        if (_streamCacheAheadTrackCount <= 0) break;
         final track = _queue[i];
         if (_precacheInProgress.contains(track.id)) continue;
 
@@ -2009,8 +2010,14 @@ class AudioPlayerService {
         );
       }
 
-      if (maxConcurrent <= 1 || candidates.length == 1) {
-        for (final candidate in candidates) {
+      final allowedCandidates = candidates
+          .take(_streamCacheAheadTrackCount)
+          .toList(growable: false);
+      if (allowedCandidates.isEmpty) return;
+
+      if (maxConcurrent <= 1 || allowedCandidates.length == 1) {
+        for (final candidate in allowedCandidates) {
+          if (_streamCacheAheadTrackCount <= 0) break;
           await _precacheTrackAudioBytes(
             candidate.track,
             candidate.playbackData,
@@ -2023,8 +2030,11 @@ class AudioPlayerService {
       int cursor = 0;
       Future<void> worker(int workerId) async {
         while (true) {
-          if (cursor >= candidates.length) return;
-          final next = candidates[cursor++];
+          if (cursor >= allowedCandidates.length ||
+              cursor >= _streamCacheAheadTrackCount) {
+            return;
+          }
+          final next = allowedCandidates[cursor++];
           if (kDebugMode) {
             print(
               'AudioPlayerService: Pre-cache worker#$workerId downloading ${next.track.id}',
@@ -2035,7 +2045,7 @@ class AudioPlayerService {
         }
       }
 
-      final workerCount = min(maxConcurrent, candidates.length);
+      final workerCount = min(maxConcurrent, allowedCandidates.length);
       await Future.wait(
         List.generate(workerCount, (index) => worker(index + 1)),
       );
