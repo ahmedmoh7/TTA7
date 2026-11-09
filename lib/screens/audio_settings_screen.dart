@@ -41,6 +41,9 @@ class AudioSettingsScreen extends ConsumerWidget {
     final streamCacheMaxConcurrent = ref.watch(
       streamCacheMaxConcurrentProvider,
     );
+    final streamCacheAheadTrackCount = ref.watch(
+      streamCacheAheadTrackCountProvider,
+    );
     final crossfadeDurationMs = ref.watch(crossfadeDurationMsProvider);
     final streamCacheUsageAsync = ref.watch(streamAudioCacheUsageBytesProvider);
     final jioSaavnEnabled = ref.watch(jioSaavnEnabledProvider);
@@ -349,6 +352,7 @@ class AudioSettingsScreen extends ConsumerWidget {
             wifiOnly: streamCacheWifiOnly,
             cacheLimitMb: streamCacheLimitMb,
             maxConcurrent: streamCacheMaxConcurrent,
+            aheadTrackCount: streamCacheAheadTrackCount,
             usageAsync: streamCacheUsageAsync,
             onWifiOnlyChanged: (enabled) async {
               await playerService.setStreamCacheWifiOnly(enabled);
@@ -360,6 +364,9 @@ class AudioSettingsScreen extends ConsumerWidget {
             },
             onMaxConcurrentChanged: (value) async {
               await playerService.setStreamCacheMaxConcurrent(value);
+            },
+            onAheadTrackCountChanged: (value) async {
+              await playerService.setStreamCacheAheadTrackCount(value);
             },
           ),
 
@@ -835,12 +842,15 @@ class AudioSettingsScreen extends ConsumerWidget {
     required bool wifiOnly,
     required int cacheLimitMb,
     required int maxConcurrent,
+    required int aheadTrackCount,
     required AsyncValue<int> usageAsync,
     required Future<void> Function(bool enabled) onWifiOnlyChanged,
     required Future<void> Function(int limitMb) onCacheLimitChanged,
     required Future<void> Function(int value) onMaxConcurrentChanged,
+    required Future<void> Function(int value) onAheadTrackCountChanged,
   }) {
     const cacheLimitOptions = [256, 512, 1024, 2048, 4096];
+    const aheadTrackCountOptions = [0, 1, 2, 3, 4];
     const concurrencyOptions = [1, 2, 3, 4];
 
     return Container(
@@ -959,6 +969,48 @@ class AudioSettingsScreen extends ConsumerWidget {
             wifiOnly
                 ? context.l10n.preCacheRunsWifiOnly
                 : context.l10n.preCacheRunsWifiAndMobile,
+            style: TextStyle(
+              fontSize: 12,
+              color: isDark ? Colors.white54 : InzxColors.textSecondary,
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            'Upcoming tracks to pre-cache',
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: isDark ? Colors.white : InzxColors.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: aheadTrackCountOptions.map((option) {
+              final selected = option == aheadTrackCount;
+              return ChoiceChip(
+                selected: selected,
+                label: Text(option.toString()),
+                selectedColor: accentColor,
+                labelStyle: TextStyle(
+                  color: selected
+                      ? InzxColors.contrastTextOn(accentColor)
+                      : (isDark ? Colors.white : InzxColors.textPrimary),
+                ),
+                onSelected: (picked) {
+                  if (picked) {
+                    onAheadTrackCountChanged(option);
+                  }
+                },
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            aheadTrackCount == 0
+                ? 'Disabled: no upcoming songs are downloaded.'
+                : 'Number of upcoming songs to download. Concurrency controls how many download at once.',
             style: TextStyle(
               fontSize: 12,
               color: isDark ? Colors.white54 : InzxColors.textSecondary,
