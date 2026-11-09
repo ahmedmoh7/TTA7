@@ -47,7 +47,6 @@ const int kDefaultCrossfadeDurationMs = 8000;
 const int kMinCrossfadeDurationMs = 0;
 const int kMaxCrossfadeDurationMs = 12000;
 const int kLyricsPrefetchAheadTrackCount = 4;
-const int kLyricsPrefetchAheadTrackCount = 4;
 const int kMinValidStreamCacheFileBytes = 50 * 1024;
 const int kParallelPrecacheMinBytes = 1024 * 1024;
 const int kParallelPrecachePartCount = 4;
@@ -509,7 +508,10 @@ class AudioPlayerService {
       _streamCachePrecacheTrackCount =
           (prefs.getInt(kStreamCachePrecacheTrackCountKey) ??
                   kDefaultStreamCachePrecacheTrackCount)
-              .clamp(kMinStreamCachePrecacheTrackCount, kMaxStreamCachePrecacheTrackCount);
+              .clamp(
+                kMinStreamCachePrecacheTrackCount,
+                kMaxStreamCachePrecacheTrackCount,
+              );
       _crossfadeDurationMs =
           prefs.getInt(kCrossfadeDurationMsKey) ?? kDefaultCrossfadeDurationMs;
       _crossfadeDurationMs = _crossfadeDurationMs.clamp(
