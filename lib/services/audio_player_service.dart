@@ -1893,6 +1893,24 @@ class AudioPlayerService {
         }
         return;
       }
+
+      // Zero means URL/source metadata warm-up only: no audio bytes.
+      if (_streamCachePrecacheTrackCount == 0) {
+        final nextTrack = _queue[start];
+        if (!_isLocalTrack(nextTrack)) {
+          unawaited(
+            _ytPlayerUtils.prefetchNext(
+              nextTrack.id,
+              quality: _audioQuality,
+            ),
+          );
+        }
+        if (kDebugMode) {
+          print('AudioPlayerService: Pre-cache count is zero; warmed next URL only');
+        }
+        return;
+      }
+
       final maxConcurrent = _effectivePrecacheConcurrency();
       final candidateLimit = _streamCachePrecacheTrackCount;
       final end = min(_queue.length, start + candidateLimit);
