@@ -1641,22 +1641,65 @@ class AudioPlayerService {
     } catch (_) {}
   }
 
+  /// A playable offline cache must have a completion sidecar written only
+  /// after the download has ended and the final file length has been checked.
+  /// A large .audio file by itself is not proof that it is complete.
+  Future<bool> _isCompleteAudioCacheFile(
+    File cacheFile, {
+    int? expectedBytes,
+  }) async {
+    try {
+      if (!await cacheFile.exists()) return false;
+      final marker = File('${cacheFile.path}.complete');
+      if (!await marker.exists()) return false;
+      final recordedBytes = int.tryParse((await marker.readAsString()).trim());
+      if (recordedBytes == null || recordedBytes < kMinValidStreamCacheFileBytes) {
+        return false;
+      }
+      final actualBytes = await cacheFile.length();
+      if (actualBytes != recordedBytes) return false;
+      if (expectedBytes != null &&
+          expectedBytes > 0 &&
+          actualBytes != expectedBytes) {
+        return false;
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _markAudioCacheComplete(File cacheFile, int actualBytes) async {
+    if (actualBytes < kMinValidStreamCacheFileBytes ||
+        !await cacheFile.exists() ||
+        await cacheFile.length() != actualBytes) {
+      throw const FormatException('Refusing to mark an incomplete audio cache');
+    }
+    final marker = File('${cacheFile.path}.complete');
+    final temporaryMarker = File('${marker.path}.tmp');
+    await temporaryMarker.writeAsString('$actualBytes', flush: true);
+    if (await marker.exists()) await marker.delete();
+    await temporaryMarker.rename(marker.path);
+  }
+
   Future<void> _deleteAudioCacheArtifact(File file) async {
     _stopLiveCacheProgressLogger(file.path);
     final mimeFile = File('${file.path}.mime');
     final partialFile = File('${file.path}.part');
     final precachePartFile = File('${file.path}.precache.part');
+    final completeMarker = File('${file.path}.complete');
+    final temporaryMarker = File('${completeMarker.path}.tmp');
     if (await file.exists()) {
       await file.delete();
     }
-    if (await mimeFile.exists()) {
-      await mimeFile.delete();
-    }
-    if (await partialFile.exists()) {
-      await partialFile.delete();
-    }
-    if (await precachePartFile.exists()) {
-      await precachePartFile.delete();
+    for (final artifact in [
+      mimeFile,
+      partialFile,
+      precachePartFile,
+      completeMarker,
+      temporaryMarker,
+    ]) {
+      if (await artifact.exists()) await artifact.delete();
     }
   }
 
@@ -1748,26 +1791,28 @@ class AudioPlayerService {
 
     final cacheFile = await _cacheFileForTrack(track, playbackData);
     if (await cacheFile.exists()) {
-      final size = await cacheFile.length();
-      if (size < kMinValidStreamCacheFileBytes) {
+      final expectedBytes = playbackData.format.contentLength;
+      final isComplete = await _isCompleteAudioCacheFile(
+        cacheFile,
+        expectedBytes: expectedBytes,
+      );
+      if (!isComplete) {
+        if (kDebugMode) {
+          print(
+            'AudioPlayerService: Rejecting incomplete/unverified cache for ${track.id}; '
+            'will stream and rebuild it',
+          );
+        }
         await _deleteAudioCacheArtifact(cacheFile);
       } else {
+        final size = await cacheFile.length();
         _stopLiveCacheProgressLogger(cacheFile.path);
         unawaited(_touchCacheFile(cacheFile));
-        final expectedBytes = playbackData.format.contentLength;
         if (kDebugMode) {
-          if (expectedBytes != null && expectedBytes > 0) {
-            final progress = ((size / expectedBytes) * 100).clamp(0.0, 100.0);
-            print(
-              'AudioPlayerService: Using cached audio bytes for ${track.id} '
-              '(${_formatBytes(size)} / ${_formatBytes(expectedBytes)}, ${progress.toStringAsFixed(1)}%)',
-            );
-          } else {
-            print(
-              'AudioPlayerService: Using cached audio bytes for ${track.id} '
-              '(${_formatBytes(size)})',
-            );
-          }
+          print(
+            'AudioPlayerService: Using verified complete cache for ${track.id} '
+            '(${_formatBytes(size)})',
+          );
         }
         return AudioSource.uri(Uri.file(cacheFile.path), tag: track);
       }
@@ -1897,6 +1942,10 @@ class AudioPlayerService {
   }
 
   void _schedulePrecacheAhead() {
+    // Upcoming tracks must never download audio bytes before the user selects
+    // them. Stream URL/metadata prefetch remains handled separately.
+    return;
+    /* Disabled by design: no audio pre-cache for upcoming queue entries.
     if (_streamCachePrecacheTrackCount <= 0 ||
         !_hasReachedPrecacheStartThreshold() ||
         _isPrecachingAhead ||
@@ -2062,6 +2111,7 @@ class AudioPlayerService {
     } finally {
       _isPrecachingAhead = false;
     }
+    */
   }
 
   Future<void> _precacheTrackAudioBytes(
@@ -2076,17 +2126,17 @@ class AudioPlayerService {
     final cacheFile = await _cacheFileForTrack(track, playbackData);
     final expectedFromFormat = playbackData.format.contentLength;
     if (await cacheFile.exists()) {
-      final existingSize = await cacheFile.length();
-      final hasExpectedSize = expectedFromFormat == null ||
-          expectedFromFormat <= 0 ||
-          existingSize == expectedFromFormat;
-      if (existingSize >= kMinValidStreamCacheFileBytes && hasExpectedSize) {
+      final isComplete = await _isCompleteAudioCacheFile(
+        cacheFile,
+        expectedBytes: expectedFromFormat,
+      );
+      if (isComplete) {
+        final existingSize = await cacheFile.length();
         _stopLiveCacheProgressLogger(cacheFile.path);
         if (kDebugMode) {
           print(
-            'AudioPlayerService: Pre-cache skipped, already cached ${track.id} '
-            '(${_formatBytes(existingSize)}'
-            '${expectedFromFormat != null && expectedFromFormat > 0 ? ' / ' + _formatBytes(expectedFromFormat) : ''})',
+            'AudioPlayerService: Pre-cache skipped, verified complete cache for ${track.id} '
+            '(${_formatBytes(existingSize)})',
           );
         }
         await _touchCacheFile(cacheFile);
@@ -2126,6 +2176,7 @@ class AudioPlayerService {
       int? expectedBytes;
       var appendToPartial = false;
       var writeOffset = 0;
+      var responseCanProveWholeFile = false;
 
       if (response.statusCode == 416) {
         final completeMatch = contentRange == null
@@ -2143,6 +2194,7 @@ class AudioPlayerService {
           client = null;
           if (await cacheFile.exists()) await cacheFile.delete();
           await tempFile.rename(cacheFile.path);
+          await _markAudioCacheComplete(cacheFile, savedBytes);
           await _touchCacheFile(cacheFile);
           _offerToAutomix(track, cacheFile.path);
           if (kDebugMode) {
@@ -2176,6 +2228,9 @@ class AudioPlayerService {
             (response.contentLength > 0
                 ? savedBytes + response.contentLength
                 : expectedFromFormat);
+        responseCanProveWholeFile =
+            (totalBytes != null && totalBytes > 0) ||
+            (expectedFromFormat != null && expectedFromFormat > 0);
         appendToPartial = savedBytes > 0;
         writeOffset = savedBytes;
       } else if (response.statusCode == 200) {
@@ -2187,6 +2242,8 @@ class AudioPlayerService {
         expectedBytes = response.contentLength > 0
             ? response.contentLength
             : expectedFromFormat;
+        // HTTP 200 starts at byte zero and the normal stream end marks EOF.
+        responseCanProveWholeFile = true;
       } else {
         throw HttpException('HTTP ${response.statusCode}');
       }
@@ -2271,9 +2328,15 @@ class AudioPlayerService {
           'Pre-cache incomplete: ${_formatBytes(downloadedBytes)} of ${_formatBytes(expectedBytes)}',
         );
       }
+      if (!responseCanProveWholeFile) {
+        throw const FormatException(
+          'Cannot verify that the partial response contains the complete audio file',
+        );
+      }
 
       if (await cacheFile.exists()) await cacheFile.delete();
       await tempFile.rename(cacheFile.path);
+      await _markAudioCacheComplete(cacheFile, downloadedBytes);
       await _touchCacheFile(cacheFile);
       _offerToAutomix(track, cacheFile.path);
       _stopLiveCacheProgressLogger(cacheFile.path);
