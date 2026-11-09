@@ -157,7 +157,7 @@ object InzxWidgets {
         } else {
             context.getString(R.string.widget_inzx_not_playing)
         }
-        val artist = if (hasTrack) prefs.getString(KEY_ARTIST, null).orEmpty() else "Inzx"
+        val artist = if (hasTrack) prefs.getString(KEY_ARTIST, null).orEmpty() else "TTA7"
         val isPlaying = prefs.getBoolean(KEY_IS_PLAYING, false)
         val trackKey = prefs.getString(KEY_TRACK_ID, null) ?: "none"
         val artwork = prefs.getString(KEY_ARTWORK_PATH, null)

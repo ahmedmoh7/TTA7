@@ -176,10 +176,10 @@ class _SignalPathSheetState extends ConsumerState<SignalPathSheet> {
           'at ${_khz(output.trackSampleRate ?? source ?? 0)}, '
           '${output.trackEncoding ?? 'PCM'} — Android\'s mixer is bypassed';
       good = true;
-    } else if (tier != null && !resampled && mixer != null) {
+    } else if (tier != null && source != null && mixer != null && !resampled) {
       badge = tier.toUpperCase();
       line = 'Lossless all the way to Android\'s mixer, at the track\'s own '
-          '${_khz(source!)}';
+          '${_khz(source)}';
       good = true;
     } else if (tier != null && resampled) {
       badge = '$tier · RESAMPLED'.toUpperCase();
@@ -386,10 +386,12 @@ class _SignalPathSheetState extends ConsumerState<SignalPathSheet> {
     bool isDark,
   ) {
     final ahead = player.bufferedAhead;
+    final autoNote = player.autoQualityNote;
     final rows = <(String, String)>[
       ('Buffered ahead', '${ahead.inSeconds} s'),
       ('Network', player.isOnUnmeteredNetwork ? 'Wi-Fi' : 'Mobile data'),
       ('Quality setting', _qualityName(quality)),
+      if (autoNote != null) ('Auto', autoNote),
     ];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -420,14 +422,17 @@ class _SignalPathSheetState extends ConsumerState<SignalPathSheet> {
                   child: Row(
                     children: [
                       Text(label, style: TextStyle(color: secondary, fontSize: 13.5)),
-                      const Spacer(),
-                      Text(
-                        value,
-                        style: TextStyle(
-                          color: primary,
-                          fontSize: 13.5,
-                          fontWeight: FontWeight.w600,
-                          fontFeatures: const [FontFeature.tabularFigures()],
+                      const SizedBox(width: 16),
+                      Expanded(
+                        child: Text(
+                          value,
+                          textAlign: TextAlign.end,
+                          style: TextStyle(
+                            color: primary,
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w600,
+                            fontFeatures: const [FontFeature.tabularFigures()],
+                          ),
                         ),
                       ),
                     ],

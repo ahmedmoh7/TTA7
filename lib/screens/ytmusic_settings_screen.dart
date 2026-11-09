@@ -350,6 +350,8 @@ class _YTMusicSettingsScreenState extends ConsumerState<YTMusicSettingsScreen> {
           'offline quality',
           'download bitrate',
           'download quality',
+          'lossless',
+          'flac',
         ],
         title: l10n.downloadQuality,
         subtitle: l10n.downloadQualitySubtitle,
@@ -1026,27 +1028,6 @@ class _YTMusicSettingsScreenState extends ConsumerState<YTMusicSettingsScreen> {
           ref.read(audioPlayerServiceProvider).setShowNerdStats(!current);
         },
       ),
-      _SearchableItem(
-        tags: [
-          'share links',
-          'share youtube music links',
-          'share',
-          'native links',
-          'youtube music link format',
-          'music.youtube.com',
-          'copy link',
-          'share track',
-        ],
-        title: l10n.shareYoutubeMusicLinks,
-        subtitle: ref.watch(shareNativeLinksProvider)
-            ? 'Sharing YouTube Music links'
-            : 'Sharing standard YouTube links',
-        icon: Iconsax.share,
-        onTap: () {
-          final current = ref.read(shareNativeLinksProvider);
-          ref.read(shareNativeLinksProvider.notifier).setEnabled(!current);
-        },
-      ),
       if (!authState.isLoggedIn)
         _SearchableItem(
           tags: [
@@ -1127,7 +1108,7 @@ class _YTMusicSettingsScreenState extends ConsumerState<YTMusicSettingsScreen> {
           'version',
           'build number',
           'credits',
-          'about inzx',
+          'about tta7',
           'about',
           'patch number',
           'app version',
@@ -1593,7 +1574,6 @@ class _YTMusicSettingsScreenState extends ConsumerState<YTMusicSettingsScreen> {
     _TaggedSection([
       context.l10n.appInfo,
       context.l10n.settings,
-      context.l10n.shareYoutubeMusicLinks,
       'app',
       'info',
       'ota',
@@ -1607,9 +1587,6 @@ class _YTMusicSettingsScreenState extends ConsumerState<YTMusicSettingsScreen> {
       'crash diagnostics',
       'sponsor',
       'donate',
-      'share',
-      'youtube music links',
-      'native links',
       'github',
       'support',
       'shorebird',
@@ -1745,7 +1722,6 @@ class _YTMusicSettingsScreenState extends ConsumerState<YTMusicSettingsScreen> {
     _TaggedSection([
       context.l10n.appInfo,
       context.l10n.settings,
-      context.l10n.shareYoutubeMusicLinks,
       'app',
       'info',
       'ota',
@@ -1759,9 +1735,6 @@ class _YTMusicSettingsScreenState extends ConsumerState<YTMusicSettingsScreen> {
       'crash diagnostics',
       'sponsor',
       'donate',
-      'share',
-      'youtube music links',
-      'native links',
       'github',
       'support',
       'shorebird',
@@ -3501,17 +3474,6 @@ class _YTMusicSettingsScreenState extends ConsumerState<YTMusicSettingsScreen> {
       children: [
         _sectionHeader(l10n.appInfo, Iconsax.info_circle),
         const SizedBox(height: 12),
-        // Share behavior
-        _switchTile(
-          icon: Iconsax.share,
-          iconBg: _accentColor,
-          title: l10n.shareYoutubeMusicLinks,
-          subtitle: l10n.shareYoutubeMusicLinksSubtitle,
-          value: ref.watch(shareNativeLinksProvider),
-          onChanged: (val) =>
-              ref.read(shareNativeLinksProvider.notifier).setEnabled(val),
-        ),
-        Divider(color: _isDark ? Colors.white10 : Colors.black12, height: 16),
         // Check for App Updates
         ListTile(
           contentPadding: EdgeInsets.zero,
@@ -3878,7 +3840,7 @@ class _YTMusicSettingsScreenState extends ConsumerState<YTMusicSettingsScreen> {
                           child: OutlinedButton.icon(
                             onPressed: () {
                               launchUrl(
-                                Uri.parse('https://github.com/ahmedmoh7'),
+                                Uri.parse('https://github.com/ahmedmoh7/TTA7'),
                                 mode: LaunchMode.externalApplication,
                               );
                             },
