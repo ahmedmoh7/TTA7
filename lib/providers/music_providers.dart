@@ -815,6 +815,13 @@ final streamCacheSizeLimitMbProvider = Provider<int>((ref) {
       kDefaultStreamCacheSizeLimitMb;
 });
 
+/// Provider for the number of upcoming tracks whose audio may be cached.
+final streamCachePrecacheTrackCountProvider = Provider<int>((ref) {
+  final state = ref.watch(playbackStateProvider);
+  return state.whenOrNull(data: (s) => s.streamCachePrecacheTrackCount) ??
+      player.kDefaultStreamCachePrecacheTrackCount;
+});
+
 /// Provider for max concurrent stream pre-cache downloads
 final streamCacheMaxConcurrentProvider = Provider<int>((ref) {
   final state = ref.watch(playbackStateProvider);
