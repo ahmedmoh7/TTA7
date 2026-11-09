@@ -822,6 +822,13 @@ final streamCacheMaxConcurrentProvider = Provider<int>((ref) {
       player.kDefaultStreamCacheMaxConcurrent;
 });
 
+/// Provider for the number of upcoming tracks to pre-cache.
+final streamCacheAheadTrackCountProvider = Provider<int>((ref) {
+  final state = ref.watch(playbackStateProvider);
+  return state.whenOrNull(data: (s) => s.streamCacheAheadTrackCount) ??
+      player.kDefaultStreamCacheAheadTrackCount;
+});
+
 /// Provider for crossfade duration in milliseconds
 final crossfadeDurationMsProvider = Provider<int>((ref) {
   final state = ref.watch(playbackStateProvider);
