@@ -32,19 +32,23 @@ const String kStreamingQualityKey = 'streaming_quality';
 const String kStreamCacheWifiOnlyKey = 'stream_cache_wifi_only';
 const String kStreamCacheSizeLimitMbKey = 'stream_cache_size_limit_mb';
 const String kStreamCacheMaxConcurrentKey = 'stream_cache_max_concurrent';
+const String kStreamCacheAheadTrackCountKey = 'stream_cache_ahead_track_count';
 const String kCrossfadeDurationMsKey = 'crossfade_duration_ms';
 const String kShowNerdStatsKey = 'show_nerd_stats';
 const String kJioSaavnEnabledKey = 'jiosaavn_enabled';
 const int kDefaultStreamCacheSizeLimitMb = 1024;
 const int kMinStreamCacheSizeLimitMb = 128;
 const int kMaxStreamCacheSizeLimitMb = 4096;
-const int kDefaultStreamCacheMaxConcurrent = 2;
+const int kDefaultStreamCacheMaxConcurrent = 1;
+const int kDefaultStreamCacheAheadTrackCount = 1;
+const int kMinStreamCacheAheadTrackCount = 0;
+const int kMaxStreamCacheAheadTrackCount = 4;
 const int kMinStreamCacheMaxConcurrent = 1;
 const int kMaxStreamCacheMaxConcurrent = 4;
 const int kDefaultCrossfadeDurationMs = 8000;
 const int kMinCrossfadeDurationMs = 0;
 const int kMaxCrossfadeDurationMs = 12000;
-const int kPrecacheAheadTrackCount = 3;
+
 const int kLyricsPrefetchAheadTrackCount = 4;
 const int kMinValidStreamCacheFileBytes = 50 * 1024;
 const int kParallelPrecacheMinBytes = 1024 * 1024;
@@ -79,6 +83,7 @@ class PlaybackState {
   final bool streamCacheWifiOnly;
   final int streamCacheSizeLimitMb;
   final int streamCacheMaxConcurrent;
+  final int streamCacheAheadTrackCount;
   final int crossfadeDurationMs;
   final bool showNerdStats;
   final bool jioSaavnEnabled;
@@ -107,6 +112,7 @@ class PlaybackState {
     this.streamCacheWifiOnly = false,
     this.streamCacheSizeLimitMb = kDefaultStreamCacheSizeLimitMb,
     this.streamCacheMaxConcurrent = kDefaultStreamCacheMaxConcurrent,
+    this.streamCacheAheadTrackCount = kDefaultStreamCacheAheadTrackCount,
     this.crossfadeDurationMs = kDefaultCrossfadeDurationMs,
     this.showNerdStats = false,
     this.jioSaavnEnabled = true,
@@ -140,6 +146,7 @@ class PlaybackState {
     bool? streamCacheWifiOnly,
     int? streamCacheSizeLimitMb,
     int? streamCacheMaxConcurrent,
+    int? streamCacheAheadTrackCount,
     int? crossfadeDurationMs,
     bool? showNerdStats,
     bool? jioSaavnEnabled,
@@ -172,6 +179,8 @@ class PlaybackState {
           streamCacheSizeLimitMb ?? this.streamCacheSizeLimitMb,
       streamCacheMaxConcurrent:
           streamCacheMaxConcurrent ?? this.streamCacheMaxConcurrent,
+      streamCacheAheadTrackCount:
+          streamCacheAheadTrackCount ?? this.streamCacheAheadTrackCount,
       crossfadeDurationMs: crossfadeDurationMs ?? this.crossfadeDurationMs,
       showNerdStats: showNerdStats ?? this.showNerdStats,
       jioSaavnEnabled: jioSaavnEnabled ?? this.jioSaavnEnabled,
@@ -227,6 +236,7 @@ class PlaybackState {
         other.streamCacheWifiOnly == streamCacheWifiOnly &&
         other.streamCacheSizeLimitMb == streamCacheSizeLimitMb &&
         other.streamCacheMaxConcurrent == streamCacheMaxConcurrent &&
+        other.streamCacheAheadTrackCount == streamCacheAheadTrackCount &&
         other.crossfadeDurationMs == crossfadeDurationMs &&
         other.showNerdStats == showNerdStats &&
         other.jioSaavnEnabled == jioSaavnEnabled &&
@@ -256,6 +266,7 @@ class PlaybackState {
     streamCacheWifiOnly,
     streamCacheSizeLimitMb,
     streamCacheMaxConcurrent,
+    streamCacheAheadTrackCount,
     crossfadeDurationMs,
     showNerdStats,
     jioSaavnEnabled,
@@ -392,6 +403,7 @@ class AudioPlayerService {
   bool _streamCacheWifiOnly = false;
   int _streamCacheSizeLimitMb = kDefaultStreamCacheSizeLimitMb;
   int _streamCacheMaxConcurrent = kDefaultStreamCacheMaxConcurrent;
+  int _streamCacheAheadTrackCount = kDefaultStreamCacheAheadTrackCount;
   int _crossfadeDurationMs = kDefaultCrossfadeDurationMs;
   bool _showNerdStats = false;
   bool get showNerdStats => _showNerdStats;
@@ -496,6 +508,13 @@ class AudioPlayerService {
         kMinStreamCacheMaxConcurrent,
         kMaxStreamCacheMaxConcurrent,
       );
+      _streamCacheAheadTrackCount =
+          prefs.getInt(kStreamCacheAheadTrackCountKey) ??
+          kDefaultStreamCacheAheadTrackCount;
+      _streamCacheAheadTrackCount = _streamCacheAheadTrackCount.clamp(
+        kMinStreamCacheAheadTrackCount,
+        kMaxStreamCacheAheadTrackCount,
+      );
       _crossfadeDurationMs =
           prefs.getInt(kCrossfadeDurationMsKey) ?? kDefaultCrossfadeDurationMs;
       _crossfadeDurationMs = _crossfadeDurationMs.clamp(
@@ -514,6 +533,7 @@ class AudioPlayerService {
         streamCacheWifiOnly: _streamCacheWifiOnly,
         streamCacheSizeLimitMb: _streamCacheSizeLimitMb,
         streamCacheMaxConcurrent: _streamCacheMaxConcurrent,
+        streamCacheAheadTrackCount: _streamCacheAheadTrackCount,
         crossfadeDurationMs: _crossfadeDurationMs,
       );
 
@@ -529,6 +549,7 @@ class AudioPlayerService {
   bool get streamCacheWifiOnly => _streamCacheWifiOnly;
   int get streamCacheSizeLimitMb => _streamCacheSizeLimitMb;
   int get streamCacheMaxConcurrent => _streamCacheMaxConcurrent;
+  int get streamCacheAheadTrackCount => _streamCacheAheadTrackCount;
   int get crossfadeDurationMs => _crossfadeDurationMs;
   AudioPlayer get _inactivePlayer =>
       identical(_player, _primaryPlayer) ? _secondaryPlayer : _primaryPlayer;
@@ -607,6 +628,24 @@ class AudioPlayerService {
       }
     }
     _schedulePrecacheAhead();
+  }
+
+  Future<void> setStreamCacheAheadTrackCount(int value) async {
+    final clamped = value.clamp(
+      kMinStreamCacheAheadTrackCount,
+      kMaxStreamCacheAheadTrackCount,
+    );
+    _streamCacheAheadTrackCount = clamped;
+    _updateState(streamCacheAheadTrackCount: clamped);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(kStreamCacheAheadTrackCountKey, clamped);
+    } catch (e) {
+      if (kDebugMode) {
+        print('AudioPlayerService: Failed to persist pre-cache ahead count: $e');
+      }
+    }
+    if (clamped > 0) _schedulePrecacheAhead();
   }
 
   Future<void> setCrossfadeDurationMs(int value) async {
@@ -1877,6 +1916,13 @@ class AudioPlayerService {
         return;
       }
 
+      if (_streamCacheAheadTrackCount <= 0) {
+        if (kDebugMode) {
+          print('AudioPlayerService: Upcoming-track pre-cache is disabled');
+        }
+        return;
+      }
+
       final start = _currentIndex + 1;
       if (start >= _queue.length) {
         if (kDebugMode) {
@@ -1885,7 +1931,10 @@ class AudioPlayerService {
         return;
       }
       final maxConcurrent = _effectivePrecacheConcurrency();
-      final candidateLimit = min(kPrecacheAheadTrackCount, maxConcurrent);
+      final candidateLimit = _streamCacheAheadTrackCount.clamp(
+        kMinStreamCacheAheadTrackCount,
+        kMaxStreamCacheAheadTrackCount,
+      );
       final end = min(_queue.length, start + candidateLimit);
       if (kDebugMode) {
         print(
@@ -3060,6 +3109,7 @@ class AudioPlayerService {
     bool? streamCacheWifiOnly,
     int? streamCacheSizeLimitMb,
     int? streamCacheMaxConcurrent,
+    int? streamCacheAheadTrackCount,
     int? crossfadeDurationMs,
     bool? showNerdStats,
     bool? jioSaavnEnabled,
@@ -3102,6 +3152,8 @@ class AudioPlayerService {
       streamCacheSizeLimitMb: streamCacheSizeLimitMb ?? _streamCacheSizeLimitMb,
       streamCacheMaxConcurrent:
           streamCacheMaxConcurrent ?? _streamCacheMaxConcurrent,
+      streamCacheAheadTrackCount:
+          streamCacheAheadTrackCount ?? _streamCacheAheadTrackCount,
       crossfadeDurationMs: crossfadeDurationMs ?? _crossfadeDurationMs,
       showNerdStats: showNerdStats ?? _showNerdStats,
       jioSaavnEnabled: jioSaavnEnabled ?? _jioSaavnEnabled,
