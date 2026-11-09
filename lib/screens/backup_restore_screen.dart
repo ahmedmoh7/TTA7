@@ -30,6 +30,7 @@ const Set<String> _backupSettingsKeys = <String>{
   kStreamCacheWifiOnlyKey,
   kStreamCacheSizeLimitMbKey,
   kStreamCacheMaxConcurrentKey,
+  kStreamCacheAheadTrackCountKey,
   kCrossfadeDurationMsKey,
   kDownloadQualityKey,
   kDownloadParallelPartCountKey,
@@ -756,6 +757,11 @@ class _BackupRestoreScreenState extends ConsumerState<BackupRestoreScreen> {
     final cacheConcurrent = settings[kStreamCacheMaxConcurrentKey];
     if (cacheConcurrent is int) {
       await playerService.setStreamCacheMaxConcurrent(cacheConcurrent);
+    }
+
+    final cacheAheadCount = settings[kStreamCacheAheadTrackCountKey];
+    if (cacheAheadCount is int) {
+      await playerService.setStreamCacheAheadTrackCount(cacheAheadCount);
     }
 
     final crossfadeMs = settings[kCrossfadeDurationMsKey];
