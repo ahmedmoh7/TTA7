@@ -1922,6 +1922,7 @@ class AudioPlayerService {
 
       final candidates = <({Track track, PlaybackData playbackData})>[];
       for (int i = start; i < end; i++) {
+        if (i >= start + _streamCachePrecacheTrackCount) break;
         final track = _queue[i];
         if (_precacheInProgress.contains(track.id)) continue;
 
@@ -1988,7 +1989,9 @@ class AudioPlayerService {
       }
 
       if (maxConcurrent <= 1 || candidates.length == 1) {
-        for (final candidate in candidates) {
+        for (var i = 0; i < candidates.length; i++) {
+          if (i >= _streamCachePrecacheTrackCount) break;
+          final candidate = candidates[i];
           await _precacheTrackAudioBytes(
             candidate.track,
             candidate.playbackData,
@@ -2001,7 +2004,10 @@ class AudioPlayerService {
       int cursor = 0;
       Future<void> worker(int workerId) async {
         while (true) {
-          if (cursor >= candidates.length) return;
+          if (cursor >= candidates.length ||
+              cursor >= _streamCachePrecacheTrackCount) {
+            return;
+          }
           final next = candidates[cursor++];
           if (kDebugMode) {
             print(
